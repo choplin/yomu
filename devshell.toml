@@ -1,0 +1,11 @@
+[devshell]
+name = "raden"
+packages = ["cargo-sweep"]
+
+[[env]]
+name = "CARGO_HOME"
+eval = "${CARGO_HOME:-$HOME/.cargo}"
+
+[[env]]
+name = "PATH"
+prefix = "${CARGO_HOME}/bin"
