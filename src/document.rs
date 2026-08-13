@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// A half-open UTF-8 byte range in the original Markdown source.
 pub type SourceSpan = Range<usize>;
@@ -27,6 +27,41 @@ pub struct ImageElement {
 pub struct HeadingElement {
     pub level: u8,
     pub text: String,
+    pub source: SourceSpan,
+    pub style: TextStyle,
+}
+
+/// Horizontal alignment declared for one GFM table column.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TableAlignment {
+    #[default]
+    Default,
+    Left,
+    Center,
+    Right,
+}
+
+/// One source-ranged cell in a parsed GFM table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableCell {
+    pub text: String,
+    pub source: SourceSpan,
+    pub style: TextStyle,
+}
+
+/// One source-ranged row in a parsed GFM table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableRow {
+    pub header: bool,
+    pub cells: Vec<TableCell>,
+    pub source: SourceSpan,
+}
+
+/// A parsed GFM table that can be projected as terminal text or a raster.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableElement {
+    pub alignments: Vec<TableAlignment>,
+    pub rows: Vec<TableRow>,
     pub source: SourceSpan,
     pub style: TextStyle,
 }
@@ -62,6 +97,9 @@ pub(crate) enum Segment {
     Heading {
         index: usize,
     },
+    Table {
+        index: usize,
+    },
 }
 
 /// Parsed Markdown content with source identity attached to every fragment.
@@ -72,6 +110,7 @@ pub struct Document {
     pub(crate) segments: Vec<Segment>,
     images: Vec<ImageElement>,
     headings: Vec<HeadingElement>,
+    tables: Vec<TableElement>,
 }
 
 impl Document {
@@ -119,6 +158,11 @@ impl Document {
     pub fn headings(&self) -> &[HeadingElement] {
         &self.headings
     }
+
+    #[must_use]
+    pub fn tables(&self) -> &[TableElement] {
+        &self.tables
+    }
 }
 
 #[derive(Debug)]
@@ -131,7 +175,8 @@ struct Builder {
     segments: Vec<Segment>,
     style: TextStyle,
     lists: Vec<ListState>,
-    table_cell: usize,
+    table: Option<TableBuilder>,
+    tables: Vec<TableElement>,
     image: Option<ImageBuilder>,
     images: Vec<ImageElement>,
     heading: Option<HeadingBuilder>,
@@ -150,6 +195,30 @@ struct ImageBuilder {
 #[derive(Debug)]
 struct HeadingBuilder {
     level: u8,
+    text: String,
+    source: SourceSpan,
+    style: TextStyle,
+}
+
+#[derive(Debug)]
+struct TableBuilder {
+    alignments: Vec<TableAlignment>,
+    rows: Vec<TableRow>,
+    row: Option<TableRowBuilder>,
+    cell: Option<TableCellBuilder>,
+    source: SourceSpan,
+    style: TextStyle,
+}
+
+#[derive(Debug)]
+struct TableRowBuilder {
+    header: bool,
+    cells: Vec<TableCell>,
+    source: SourceSpan,
+}
+
+#[derive(Debug)]
+struct TableCellBuilder {
     text: String,
     source: SourceSpan,
     style: TextStyle,
@@ -259,6 +328,10 @@ impl Builder {
             }
             return;
         }
+        if self.table.is_some() {
+            self.table_event(event, range);
+            return;
+        }
 
         match event {
             Event::Start(tag) => self.start(tag, range),
@@ -354,20 +427,18 @@ impl Builder {
                     .unwrap_or_else(|| "• ".to_owned());
                 self.synthetic_text(&marker, range.start, self.style);
             }
-            Tag::Table(_) => {
+            Tag::Table(alignments) => {
                 self.line_break(range.start, false);
-                self.table_cell = 0;
+                self.table = Some(TableBuilder {
+                    alignments: alignments.into_iter().map(TableAlignment::from).collect(),
+                    rows: Vec::new(),
+                    row: None,
+                    cell: None,
+                    source: range,
+                    style: self.style,
+                });
             }
-            Tag::TableHead | Tag::TableRow => {
-                self.line_break(range.start, false);
-                self.table_cell = 0;
-            }
-            Tag::TableCell => {
-                if self.table_cell > 0 {
-                    self.synthetic_text(" │ ", range.start, self.style);
-                }
-                self.table_cell = self.table_cell.saturating_add(1);
-            }
+            Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
             Tag::Emphasis => self.style.emphasis = true,
             Tag::Strong => self.style.strong = true,
             Tag::Strikethrough => self.style.strikethrough = true,
@@ -420,9 +491,7 @@ impl Builder {
                 self.line_break(range.end, true);
             }
             TagEnd::Item => self.line_break(range.end, false),
-            TagEnd::Table => self.line_break(range.end, true),
-            TagEnd::TableHead | TagEnd::TableRow => self.line_break(range.end, false),
-            TagEnd::TableCell => {}
+            TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell => {}
             TagEnd::Emphasis => self.style.emphasis = false,
             TagEnd::Strong => self.style.strong = false,
             TagEnd::Strikethrough => self.style.strikethrough = false,
@@ -501,6 +570,55 @@ impl Builder {
         self.line_break(range.end, true);
     }
 
+    fn table_event(&mut self, event: Event<'_>, range: SourceSpan) {
+        let Some(table) = self.table.as_mut() else {
+            return;
+        };
+        table.source.end = table.source.end.max(range.end);
+        match event {
+            Event::Start(Tag::TableHead) => table.start_row(true, range),
+            Event::Start(Tag::TableRow) => table.start_row(false, range),
+            Event::Start(Tag::TableCell) => table.start_cell(range),
+            Event::End(TagEnd::TableCell) => table.finish_cell(range),
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => table.finish_row(range),
+            Event::End(TagEnd::Table) => self.finish_table(range),
+            Event::Text(text) => table.push_text(text.as_ref(), range),
+            Event::Code(text) => table.push_wrapped("`", text.as_ref(), "`", range),
+            Event::InlineMath(text) => table.push_wrapped("$", text.as_ref(), "$", range),
+            Event::DisplayMath(text) => table.push_wrapped("$$", text.as_ref(), "$$", range),
+            Event::SoftBreak | Event::HardBreak => table.push_text(" ", range),
+            Event::FootnoteReference(label) => {
+                table.push_wrapped("[^", label.as_ref(), "]", range);
+            }
+            Event::Html(text) | Event::InlineHtml(text) => table.push_text(text.as_ref(), range),
+            Event::TaskListMarker(checked) => {
+                table.push_text(if checked { "[x] " } else { "[ ] " }, range);
+            }
+            Event::Start(Tag::Image { .. }) => table.push_text("[image: ", range),
+            Event::End(TagEnd::Image) => table.push_text("]", range),
+            Event::Rule => table.push_text("---", range),
+            Event::Start(_) | Event::End(_) => {}
+        }
+    }
+
+    fn finish_table(&mut self, range: SourceSpan) {
+        let Some(mut table) = self.table.take() else {
+            return;
+        };
+        table.finish_cell(range.clone());
+        table.finish_row(range.clone());
+        table.source.end = table.source.end.max(range.end);
+        let index = self.tables.len();
+        self.tables.push(TableElement {
+            alignments: table.alignments,
+            rows: table.rows,
+            source: table.source,
+            style: table.style,
+        });
+        self.segments.push(Segment::Table { index });
+        self.line_break(range.end, true);
+    }
+
     fn finish(mut self, source: String, events: Vec<SourceEvent>) -> Document {
         if self.segments.is_empty() {
             self.segments.push(Segment::Break {
@@ -514,6 +632,86 @@ impl Builder {
             segments: self.segments,
             images: self.images,
             headings: self.headings,
+            tables: self.tables,
+        }
+    }
+}
+
+impl TableBuilder {
+    fn start_row(&mut self, header: bool, range: SourceSpan) {
+        self.finish_cell(range.clone());
+        self.finish_row(range.clone());
+        self.row = Some(TableRowBuilder {
+            header,
+            cells: Vec::new(),
+            source: range,
+        });
+    }
+
+    fn start_cell(&mut self, range: SourceSpan) {
+        self.finish_cell(range.clone());
+        if self.row.is_none() {
+            self.start_row(false, range.clone());
+        }
+        self.cell = Some(TableCellBuilder {
+            text: String::new(),
+            source: range,
+            style: self.style,
+        });
+    }
+
+    fn push_text(&mut self, text: &str, range: SourceSpan) {
+        if self.cell.is_none() {
+            self.start_cell(range.clone());
+        }
+        if let Some(cell) = self.cell.as_mut() {
+            cell.text.push_str(text);
+            cell.source.end = cell.source.end.max(range.end);
+        }
+    }
+
+    fn push_wrapped(&mut self, prefix: &str, text: &str, suffix: &str, range: SourceSpan) {
+        self.push_text(&format!("{prefix}{text}{suffix}"), range);
+    }
+
+    fn finish_cell(&mut self, range: SourceSpan) {
+        let Some(mut cell) = self.cell.take() else {
+            return;
+        };
+        cell.source.end = cell.source.end.max(range.end);
+        if let Some(row) = self.row.as_mut() {
+            row.source.end = row.source.end.max(cell.source.end);
+            row.cells.push(TableCell {
+                text: cell.text,
+                source: cell.source,
+                style: cell.style,
+            });
+        }
+    }
+
+    fn finish_row(&mut self, range: SourceSpan) {
+        self.finish_cell(range.clone());
+        let Some(mut row) = self.row.take() else {
+            return;
+        };
+        row.source.end = row.source.end.max(range.end);
+        if !row.cells.is_empty() {
+            self.rows.push(TableRow {
+                header: row.header,
+                cells: row.cells,
+                source: row.source,
+            });
+        }
+    }
+}
+
+impl From<Alignment> for TableAlignment {
+    fn from(value: Alignment) -> Self {
+        match value {
+            Alignment::None => Self::Default,
+            Alignment::Left => Self::Left,
+            Alignment::Center => Self::Center,
+            Alignment::Right => Self::Right,
         }
     }
 }
@@ -544,13 +742,17 @@ mod tests {
             .iter()
             .filter_map(|segment| match segment {
                 Segment::Text { text, source, .. } => Some((text, source)),
-                Segment::Break { .. } | Segment::Image { .. } | Segment::Heading { .. } => None,
+                Segment::Break { .. }
+                | Segment::Image { .. }
+                | Segment::Heading { .. }
+                | Segment::Table { .. } => None,
             })
             .collect();
 
         assert!(text_segments.iter().any(|(text, _)| text == &"[x]"));
         assert!(text_segments.iter().any(|(text, _)| text == &"$x$"));
-        assert!(text_segments.iter().any(|(text, _)| text == &" │ "));
+        assert_eq!(document.tables()[0].rows[0].cells[0].text, "a");
+        assert_eq!(document.tables()[0].rows[1].cells[1].text, "2");
         assert!(
             text_segments.iter().all(|(_, range)| {
                 range.start <= range.end && range.end <= document.source_len()
@@ -560,6 +762,59 @@ mod tests {
         assert!(document.events().iter().all(|event| {
             event.source.start <= event.source.end && event.source.end <= document.source_len()
         }));
+    }
+
+    #[test]
+    fn tables_retain_alignment_rows_cells_and_source_ranges() {
+        let source = "| **名前** | Value |\n| :--- | ---: |\n| 螺鈿 | `42` |\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.tables().len(), 1);
+        let table = &document.tables()[0];
+        assert_eq!(
+            table.alignments,
+            [TableAlignment::Left, TableAlignment::Right]
+        );
+        assert_eq!(table.rows.len(), 2);
+        assert!(table.rows[0].header);
+        assert!(!table.rows[1].header);
+        assert_eq!(table.rows[0].cells[0].text, "名前");
+        assert_eq!(table.rows[1].cells[0].text, "螺鈿");
+        assert_eq!(table.rows[1].cells[1].text, "`42`");
+        assert_eq!(&source[table.source.clone()], source);
+        for row in &table.rows {
+            assert!(table.source.start <= row.source.start);
+            assert!(row.source.end <= table.source.end);
+            for cell in &row.cells {
+                assert!(row.source.start <= cell.source.start);
+                assert!(cell.source.end <= row.source.end);
+                assert!(source[cell.source.clone()].contains(cell.text.trim_matches('`')));
+            }
+        }
+        assert!(
+            document
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::Table { index: 0 }))
+        );
+    }
+
+    #[test]
+    fn malformed_table_syntax_remains_reviewable_source_text() {
+        let source = "| name | value |\n| missing delimiter row |\n";
+        let document = Document::parse(source.to_owned());
+        let rendered = document
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert!(document.tables().is_empty());
+        assert!(rendered.contains("name"));
+        assert!(rendered.contains("missing delimiter row"));
     }
 
     #[test]

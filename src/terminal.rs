@@ -61,8 +61,7 @@ fn run_loop(
     document: &Document,
     heading_fonts: HeadingFonts,
 ) -> Result<()> {
-    let use_kitty = kitty_environment_hint()
-        && (!document.images().is_empty() || !document.headings().is_empty());
+    let use_kitty = kitty_environment_hint() && needs_graphics(document);
     let images = ImageCatalog::load(document, path);
     let diagnostic_count = images.diagnostics().len();
     let mut logical_renderer =
@@ -89,6 +88,12 @@ fn run_loop(
         GraphicsMode::Text => Ok(()),
     };
     combine_run_and_graphics_cleanup(run_result, clear_result)
+}
+
+fn needs_graphics(document: &Document) -> bool {
+    !document.images().is_empty()
+        || !document.headings().is_empty()
+        || !document.tables().is_empty()
 }
 
 fn drive_loop(
@@ -575,6 +580,15 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_only_documents_require_the_graphics_pipeline() {
+        let table = Document::parse("| a | b |\n| --- | --- |\n| 1 | 2 |\n".to_owned());
+        let plain = Document::parse("plain text".to_owned());
+
+        assert!(needs_graphics(&table));
+        assert!(!needs_graphics(&plain));
+    }
 
     #[test]
     fn reports_both_run_and_cleanup_failures() {

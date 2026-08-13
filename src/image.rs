@@ -8,10 +8,11 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use percent_encoding::percent_decode_str;
 
-use crate::{Document, ImageElement, SourceSpan, TextStyle};
+use crate::{Document, ImageElement, SourceSpan, TableElement, TextStyle};
 use crate::{
     HeadingElement,
     heading::{HeadingFonts, HeadingPlan},
+    table::TablePlan,
 };
 
 const MAX_ENCODED_BYTES: u64 = 32 * 1024 * 1024;
@@ -56,6 +57,15 @@ pub(crate) struct HeadingRaster {
     pub element_key: ElementKey,
     pub columns: u16,
     pub rows: u16,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TableRaster {
+    pub asset: Arc<RasterAsset>,
+    pub element_key: ElementKey,
+    pub columns: u16,
+    pub rows: u16,
+    pub source_regions: Vec<crate::scene::GraphicSourceRegion>,
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +360,7 @@ struct CacheEntry {
 pub struct RasterCache {
     entries: HashMap<RasterAssetKey, CacheEntry>,
     heading_keys: HashMap<[u8; 32], RasterAssetKey>,
+    table_keys: HashMap<[u8; 32], RasterAssetKey>,
     failures: HashMap<[u8; 32], String>,
     capacity: usize,
     used: usize,
@@ -377,6 +388,7 @@ impl RasterCache {
         Self {
             entries: HashMap::new(),
             heading_keys: HashMap::new(),
+            table_keys: HashMap::new(),
             failures: HashMap::new(),
             capacity,
             used: 0,
@@ -551,6 +563,86 @@ impl RasterCache {
         }))
     }
 
+    pub(crate) fn rasterize_table(
+        &mut self,
+        index: usize,
+        table: &TableElement,
+        available_columns: u16,
+        cell_pixels: PixelSize,
+    ) -> Result<Option<TableRaster>, String> {
+        let identity = TablePlan::cache_identity(table, available_columns, cell_pixels);
+        self.clock = self.clock.saturating_add(1);
+        if let Some(key) = self.table_keys.get(&identity).copied()
+            && let Some(entry) = self.entries.get_mut(&key)
+        {
+            entry.last_used = self.clock;
+            let columns = cells_for(key.pixels.width, cell_pixels.width);
+            return Ok(Some(TableRaster {
+                asset: Arc::clone(&entry.asset),
+                element_key: TablePlan::element_key(index),
+                columns,
+                rows: cells_for(key.pixels.height, cell_pixels.height),
+                source_regions: TablePlan::source_regions(
+                    table,
+                    columns,
+                    cells_for(key.pixels.height, cell_pixels.height),
+                    cell_pixels,
+                ),
+            }));
+        }
+        if let Some(error) = self.failures.get(&identity) {
+            return Err(error.clone());
+        }
+        let plan = match TablePlan::build(index, table, available_columns, cell_pixels) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.failures.insert(identity, error.clone());
+                return Err(error);
+            }
+        };
+        let (plan, rendered) = match plan.render(cell_pixels) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.failures.insert(identity, error.clone());
+                return Err(error);
+            }
+        };
+        let rgba: Arc<[u8]> = Arc::from(rendered.into_raw());
+        let bytes = rgba.len();
+        if bytes > self.capacity {
+            return Err(format!(
+                "table raster needs {bytes} bytes but cache capacity is {} bytes",
+                self.capacity
+            ));
+        }
+        self.evict_for(bytes);
+        let asset = Arc::new(RasterAsset {
+            key: plan.key,
+            rgba,
+        });
+        let replaced = self.entries.insert(
+            plan.key,
+            CacheEntry {
+                asset: Arc::clone(&asset),
+                bytes,
+                last_used: self.clock,
+            },
+        );
+        if let Some(replaced) = replaced {
+            self.used = self.used.saturating_sub(replaced.bytes);
+        }
+        self.table_keys.insert(identity, plan.key);
+        self.used = self.used.saturating_add(bytes);
+        let source_regions = TablePlan::source_regions(table, plan.columns, plan.rows, cell_pixels);
+        Ok(Some(TableRaster {
+            asset,
+            element_key: plan.element_key,
+            columns: plan.columns,
+            rows: plan.rows,
+            source_regions,
+        }))
+    }
+
     fn evict_for(&mut self, incoming: usize) {
         while self.used.saturating_add(incoming) > self.capacity {
             let Some(key) = self
@@ -565,6 +657,7 @@ impl RasterCache {
                 self.used = self.used.saturating_sub(entry.bytes);
             }
             self.heading_keys.retain(|_, mapped| *mapped != key);
+            self.table_keys.retain(|_, mapped| *mapped != key);
         }
     }
 
@@ -911,5 +1004,43 @@ mod tests {
         assert_eq!(cached_error, first_error);
         assert_eq!(cache.failures.len(), 1);
         fs::remove_dir(root).expect("fixture directory should be removable");
+    }
+
+    #[test]
+    fn table_cache_separates_content_sized_rasters_by_cell_height() {
+        let document =
+            Document::parse("| a | b |\n| --- | --- |\n| wrapped value | 2 |\n".to_owned());
+        let table = &document.tables()[0];
+        let mut cache = RasterCache::default();
+        let first = cache
+            .rasterize_table(
+                0,
+                table,
+                40,
+                PixelSize {
+                    width: 8,
+                    height: 16,
+                },
+            )
+            .expect("first table should rasterize")
+            .expect("table raster exists");
+        let first_bytes = first.asset.rgba.len();
+        assert_eq!(cache.used, first_bytes);
+
+        let second = cache
+            .rasterize_table(
+                0,
+                table,
+                40,
+                PixelSize {
+                    width: 8,
+                    height: 20,
+                },
+            )
+            .expect("same-width table should rasterize at new cell height")
+            .expect("table raster exists");
+        assert_ne!(second.asset.key, first.asset.key);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.used, first.asset.rgba.len() + second.asset.rgba.len());
     }
 }

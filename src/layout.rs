@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::document::{Document, Segment};
 use crate::image::{ImageCatalog, MAX_IMAGE_ROWS};
+use crate::scene::GraphicSourceRegion;
 use crate::{
     CellRect, DesiredFrame, ElementKey, GraphicPlacement, PixelSize, RasterAsset, RasterCache,
     SourceSpan, TextStyle,
@@ -13,6 +14,8 @@ use crate::{
 
 const MAX_RASTERIZED_HEADINGS: usize = 8;
 const MAX_LAYOUT_HEADING_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RASTERIZED_TABLES: usize = 4;
+const MAX_LAYOUT_TABLE_BYTES: usize = 64 * 1024 * 1024;
 
 /// A displayed text fragment that retains its original source identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +41,7 @@ struct LayoutGraphic {
     columns: u16,
     rows: u16,
     asset: Arc<RasterAsset>,
+    source_regions: Vec<GraphicSourceRegion>,
 }
 
 /// Width-dependent terminal layout derived from a source-ranged document.
@@ -95,7 +99,20 @@ impl Layout {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
+        let selected_tables = graphics
+            .as_ref()
+            .map(|(_, _, _, focus_source)| {
+                let mut indices = document.tables().iter().enumerate().collect::<Vec<_>>();
+                indices.sort_by_key(|(_, table)| table.source.start.abs_diff(*focus_source));
+                indices
+                    .into_iter()
+                    .take(MAX_RASTERIZED_TABLES)
+                    .map(|(index, _)| index)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         let mut heading_bytes = 0usize;
+        let mut table_bytes = 0usize;
         for segment in &document.segments {
             match segment {
                 Segment::Text {
@@ -127,6 +144,7 @@ impl Layout {
                                         columns,
                                         rows,
                                         asset,
+                                        Vec::new(),
                                     );
                                     true
                                 }
@@ -214,6 +232,7 @@ impl Layout {
                             rendered.columns,
                             rendered.rows,
                             rendered.asset,
+                            Vec::new(),
                         );
                     } else {
                         let fallback = raster_error.map_or_else(
@@ -223,6 +242,51 @@ impl Layout {
                             },
                         );
                         builder.text(&fallback, heading.source.clone(), heading.style, false);
+                    }
+                }
+                Segment::Table { index } => {
+                    let Some(table) = document.tables().get(*index) else {
+                        continue;
+                    };
+                    let mut raster_error = None;
+                    let rendered = match graphics.as_mut() {
+                        Some((cache, cell_pixels, _, _)) if selected_tables.contains(index) => {
+                            match cache.rasterize_table(
+                                *index,
+                                table,
+                                u16::try_from(width).unwrap_or(u16::MAX),
+                                *cell_pixels,
+                            ) {
+                                Ok(rendered) => rendered,
+                                Err(error) => {
+                                    raster_error = Some(error);
+                                    None
+                                }
+                            }
+                        }
+                        Some(_) | None => None,
+                    };
+                    let rendered = rendered.filter(|rendered| {
+                        let bytes = rendered.asset.rgba.len();
+                        match reserve_table_bytes(&mut table_bytes, bytes) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                raster_error = Some(error);
+                                false
+                            }
+                        }
+                    });
+                    if let Some(rendered) = rendered {
+                        builder.image(
+                            rendered.element_key,
+                            table.source.clone(),
+                            rendered.columns,
+                            rendered.rows,
+                            rendered.asset,
+                            rendered.source_regions,
+                        );
+                    } else {
+                        builder.table_text(table, raster_error.as_deref());
                     }
                 }
             }
@@ -285,6 +349,26 @@ impl Layout {
                     clip,
                     source_y: u32::from(row_offset).saturating_mul(cell_pixels.height),
                     source: graphic.source.clone(),
+                    source_regions: graphic
+                        .source_regions
+                        .iter()
+                        .filter_map(|region| {
+                            let bottom = region.target.y.saturating_add(region.target.height);
+                            if bottom <= row_offset {
+                                return None;
+                            }
+                            let top = region.target.y.max(row_offset);
+                            Some(GraphicSourceRegion {
+                                target: CellRect {
+                                    x: region.target.x,
+                                    y: top.saturating_sub(row_offset),
+                                    width: region.target.width,
+                                    height: bottom.saturating_sub(top),
+                                },
+                                source: region.source.clone(),
+                            })
+                        })
+                        .collect(),
                 });
                 assets.insert(graphic.asset.key, Arc::clone(&graphic.asset));
             }
@@ -308,6 +392,17 @@ impl Layout {
             })
             .unwrap_or_else(|| self.rows.len().saturating_sub(1))
     }
+}
+
+fn reserve_table_bytes(used: &mut usize, incoming: usize) -> Result<(), String> {
+    if used.saturating_add(incoming) > MAX_LAYOUT_TABLE_BYTES {
+        return Err(format!(
+            "table raster needs {incoming} bytes but the layout budget has {} of {MAX_LAYOUT_TABLE_BYTES} bytes remaining",
+            MAX_LAYOUT_TABLE_BYTES.saturating_sub(*used)
+        ));
+    }
+    *used = used.saturating_add(incoming);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -464,6 +559,7 @@ impl Builder {
         columns: u16,
         rows: u16,
         asset: Arc<RasterAsset>,
+        source_regions: Vec<GraphicSourceRegion>,
     ) {
         if !self.current.is_empty() {
             self.push_row(source.start);
@@ -475,6 +571,7 @@ impl Builder {
             columns,
             rows,
             asset,
+            source_regions,
         });
         self.rows.push(LayoutRow {
             fragments: Vec::new(),
@@ -483,6 +580,37 @@ impl Builder {
             graphic: Some(graphic),
         });
         self.cell_width = 0;
+    }
+
+    fn table_text(&mut self, table: &crate::TableElement, raster_error: Option<&str>) {
+        self.line_break(table.source.start, false);
+        if let Some(error) = raster_error {
+            let mut style = table.style;
+            style.muted = true;
+            self.text(
+                &format!("[table raster unavailable: {error}]"),
+                table.source.clone(),
+                style,
+                false,
+            );
+            self.push_row(table.source.start);
+        }
+        for row in &table.rows {
+            self.synthetic_text("│ ", row.source.start..row.source.start, table.style);
+            for (column, cell) in row.cells.iter().enumerate() {
+                if column > 0 {
+                    self.synthetic_text(" │ ", cell.source.start..cell.source.start, table.style);
+                }
+                let mut style = cell.style;
+                if row.header {
+                    style.strong = true;
+                }
+                self.text(&cell.text, cell.source.clone(), style, false);
+            }
+            self.synthetic_text(" │", row.source.end..row.source.end, table.style);
+            self.push_row(row.source.end);
+        }
+        self.line_break(table.source.end, true);
     }
 
     fn push_row(&mut self, fallback: usize) {
@@ -629,6 +757,184 @@ mod tests {
         assert!(rendered.contains("image unavailable: diagram"));
         assert!(rendered.contains("could not open"));
         fs::remove_dir(root).expect("fixture directory should be removable");
+    }
+
+    #[test]
+    fn narrow_table_fallback_keeps_every_cell_and_its_source_span() {
+        let markdown = "| Name | 説明 |\n| --- | --- |\n| raden | very long Unicode 内容 |\n";
+        let document = Document::parse(markdown.to_owned());
+        let layout = Layout::new(&document, 12);
+        let fragments = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .collect::<Vec<_>>();
+        let rendered = fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        for cell in document.tables()[0]
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+        {
+            assert!(rendered.contains(&cell.text));
+            assert!(fragments.iter().any(|fragment| {
+                !fragment.source.is_empty()
+                    && cell.source.start <= fragment.source.start
+                    && fragment.source.end <= cell.source.end
+            }));
+        }
+    }
+
+    #[test]
+    fn table_raster_uses_the_scene_cache_and_changes_on_resize() {
+        let markdown = "before\n\n| Name | 説明 | Value |\n| :--- | :---: | ---: |\n| raden | Unicode 螺鈿 with wrapped content | 42 |\n\nafter";
+        let document = Document::parse(markdown.to_owned());
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let mut cache = RasterCache::default();
+        let cell = PixelSize {
+            width: 8,
+            height: 16,
+        };
+        let layout = Layout::with_graphics(&document, 48, 20, &catalog, &mut cache, cell, 0);
+        let table_source = document.tables()[0].source.clone();
+        let frame = layout.desired_frame(
+            layout.row_for_source(table_source.start),
+            0,
+            CellRect {
+                x: 0,
+                y: 0,
+                width: 48,
+                height: 20,
+            },
+            1,
+            cell,
+        );
+        assert_eq!(frame.placements.len(), 1);
+        assert_eq!(frame.placements[0].source, table_source);
+        assert_eq!(frame.placements[0].source_regions.len(), 6);
+        assert_eq!(
+            frame.placements[0].source_at(1, 0),
+            document.tables()[0].rows[0].cells[0].source
+        );
+        let last_region = frame.placements[0]
+            .source_regions
+            .last()
+            .expect("body cell region exists");
+        assert_eq!(
+            frame.placements[0].source_at(last_region.target.x, last_region.target.y),
+            document.tables()[0].rows[1].cells[2].source
+        );
+        let body_region = frame.placements[0].source_regions[3].clone();
+        let scrolled = layout.desired_frame(
+            layout.row_for_source(table_source.start),
+            body_region.target.y,
+            CellRect {
+                x: 0,
+                y: 0,
+                width: 48,
+                height: 20,
+            },
+            2,
+            cell,
+        );
+        assert_eq!(
+            scrolled.placements[0].source_at(body_region.target.x, 0),
+            document.tables()[0].rows[1].cells[0].source
+        );
+        assert!(frame.placements[0].target.height > 1);
+        assert!(
+            frame.assets[&frame.placements[0].asset_key]
+                .rgba
+                .iter()
+                .any(|channel| *channel != 255)
+        );
+
+        let cached = Layout::with_graphics(&document, 48, 20, &catalog, &mut cache, cell, 0)
+            .desired_frame(
+                layout.row_for_source(table_source.start),
+                0,
+                CellRect {
+                    x: 0,
+                    y: 0,
+                    width: 48,
+                    height: 20,
+                },
+                2,
+                cell,
+            );
+        assert_eq!(
+            cached.placements[0].asset_key,
+            frame.placements[0].asset_key
+        );
+
+        let resized = Layout::with_graphics(&document, 64, 20, &catalog, &mut cache, cell, 0)
+            .desired_frame(
+                layout.row_for_source(table_source.start),
+                0,
+                CellRect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 20,
+                },
+                3,
+                cell,
+            );
+        assert_eq!(
+            resized.placements[0].asset_key,
+            frame.placements[0].asset_key
+        );
+
+        let narrowed = Layout::with_graphics(&document, 40, 20, &catalog, &mut cache, cell, 0)
+            .desired_frame(
+                layout.row_for_source(table_source.start),
+                0,
+                CellRect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 20,
+                },
+                4,
+                cell,
+            );
+        assert_ne!(
+            narrowed.placements[0].asset_key,
+            frame.placements[0].asset_key
+        );
+    }
+
+    #[test]
+    fn table_raster_failure_falls_back_without_losing_content() {
+        let markdown = "| Name | Value |\n| --- | ---: |\n| raden | 42 |\n";
+        let document = Document::parse(markdown.to_owned());
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let mut cache = RasterCache::new(1);
+        let layout = Layout::with_graphics(
+            &document,
+            40,
+            20,
+            &catalog,
+            &mut cache,
+            PixelSize::FALLBACK,
+            0,
+        );
+        let rendered = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert!(layout.graphics.is_empty());
+        assert!(rendered.contains("table raster unavailable"));
+        assert!(rendered.contains("cache capacity"));
+        assert!(rendered.contains("Name"));
+        assert!(rendered.contains("raden"));
+        assert!(rendered.contains("42"));
     }
 
     #[test]
@@ -835,5 +1141,14 @@ mod tests {
                 .sum::<usize>()
                 <= MAX_LAYOUT_HEADING_BYTES
         );
+    }
+
+    #[test]
+    fn table_layout_budget_accepts_the_boundary_and_rejects_the_next_byte() {
+        let mut used = 0;
+        assert!(reserve_table_bytes(&mut used, MAX_LAYOUT_TABLE_BYTES).is_ok());
+        assert_eq!(used, MAX_LAYOUT_TABLE_BYTES);
+        assert!(reserve_table_bytes(&mut used, 1).is_err());
+        assert_eq!(used, MAX_LAYOUT_TABLE_BYTES);
     }
 }

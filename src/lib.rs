@@ -8,6 +8,7 @@ mod heading;
 mod image;
 mod layout;
 mod scene;
+mod table;
 mod terminal;
 mod ui;
 
@@ -17,10 +18,13 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub use app::{App, Command};
-pub use document::{Document, HeadingElement, ImageElement, SourceEvent, SourceSpan, TextStyle};
+pub use document::{
+    Document, HeadingElement, ImageElement, SourceEvent, SourceSpan, TableAlignment, TableCell,
+    TableElement, TableRow, TextStyle,
+};
 pub(crate) use image::{ElementKey, PixelSize, RasterAsset, RasterAssetKey, RasterCache};
 pub use layout::{Layout, LayoutFragment, LayoutRow};
-pub(crate) use scene::{CellRect, DesiredFrame, GraphicPlacement};
+pub(crate) use scene::{CellRect, DesiredFrame, GraphicPlacement, GraphicSourceRegion};
 
 /// Load and parse a UTF-8 Markdown document from disk.
 pub fn load_document(path: &Path) -> Result<Document> {

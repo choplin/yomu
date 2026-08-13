@@ -360,6 +360,7 @@ mod tests {
             clip: rect,
             source_y: 0,
             source: 10..20,
+            source_regions: Vec::new(),
         }
     }
 

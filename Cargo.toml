@@ -17,6 +17,10 @@ image = { version = "=0.25.10", default-features = false, features = ["gif", "jp
 percent-encoding = "2.3"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
+resvg = { version = "=0.47.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
+typst = "=0.15.0"
+typst-as-lib = "=0.16.0"
+typst-svg = "=0.15.0"
 unicode-width = "0.2"

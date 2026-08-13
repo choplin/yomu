@@ -61,6 +61,32 @@ JP fallback. Unavailable families are skipped unless none of the configured
 families can be resolved. Use a Nerd Font `Mono` family when its glyphs should
 retain terminal-like spacing.
 
+GFM tables render through an embedded Typst-to-SVG-to-RGBA pipeline in Kitty
+and WezTerm. Their canvas is transparent so the terminal background remains
+visible. Column widths fit parsed cell content up to a deterministic cap and
+only expand as far as needed, bounded by the viewport; wide cells wrap instead
+of shrinking the text. Raden determines the terminal height from the original
+table rows and their precomputed cell wrapping, with one extra row of breathing
+room. That logical height is converted through the terminal's measured cell
+pixels, and the SVG is scaled uniformly to it; width follows from the SVG aspect
+ratio. If the
+viewport cannot give every column a readable minimum width, or if
+table compilation or rasterization fails, raden re-lays out every cell as
+source-mapped terminal text. The renderer embeds its font and exposes no Typst
+package, network, or filesystem resolver.
+
+Tables use a booktabs-like paper style: no vertical grid or left/right border,
+with strong top and bottom rules plus a lighter rule separating the bold header
+from the body.
+
+To keep hostile or accidental input bounded, a rasterized table may contain at
+most 32 columns and 2,048 cells, occupy at most 256 terminal rows, and consume
+at most 128 MiB. A layout rasterizes the four tables nearest the current source
+anchor and allows at most 64 MiB of table pixels at once; other tables retain
+their complete text projection until they approach the viewport. Exceeding a
+per-table or layout limit also produces that readable projection with a concise
+diagnostic instead of clipping or omitting source content.
+
 The initial Reading mode uses these deliberately reversible bindings:
 
 - `j` / `k` or arrow keys: scroll one rendered row
@@ -93,11 +119,15 @@ Check the backend label in the footer and verify this lifecycle:
 5. Quit with `q`, then confirm the shell has no image placement left behind.
 6. Verify H1 and H2 are visually distinct, Japanese text is intact, and narrow
    terminal widths wrap headings without clipping them.
+7. Inspect the tables in both showcase files: headers, alignment, borders,
+   Unicode, and wrapped cells remain legible; narrowing below the readable
+   column minimum switches to text without dropping a cell.
 
 The automated tests separately cover desired-frame reconciliation, upload and
 placement replacement, stale deletion, cache ownership, path escape rejection,
-decode fallback, and source ranges. Real-terminal checks remain necessary
-because terminal graphics behavior cannot be observed through a test backend.
+decode fallback, table layout and overflow, Unicode, cache keys, failure
+projection, and source ranges. Real-terminal checks remain necessary because
+terminal graphics behavior cannot be observed through a test backend.
 
 ## Motivation
 
@@ -116,7 +146,7 @@ because terminal graphics behavior cannot be observed through a test backend.
     Its image layer is extracted as
     [ratatui-image](https://github.com/benjajaja/ratatui-image).
   - Gaps observed in mdfried (as of 2026-08): live reload, math rendering,
-    high-quality tables, and any review-oriented workflow.
+    and any review-oriented workflow.
 - Differentiation: build for the AI-review use case — inline comments, math
   and tables as first-class citizens — rather than competing as a
   general-purpose viewer.
