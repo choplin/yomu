@@ -1,13 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use icy_sixel::{EncodeOptions, QuantizeMethod, sixel_encode};
+use image::RgbaImage;
+use ratatui::layout::Size;
 
 use crate::{DesiredFrame, ElementKey, GraphicPlacement, RasterAsset, RasterAssetKey};
 
 const RAW_CHUNK_BYTES: usize = 3_072;
 const MAX_UPLOADED_IMAGES: usize = 64;
+const MAX_ENCODED_SIXELS: usize = 64;
+const SIXEL_MAX_COLORS: u16 = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Uploaded {
@@ -265,6 +271,203 @@ impl KittyBackend {
         self.next_image_id = self.next_image_id.max(candidate.next_image_id);
         self.next_placement_id = self.next_placement_id.max(candidate.next_placement_id);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SixelCacheKey {
+    asset_key: RasterAssetKey,
+    source_y: u32,
+    visible_width: u32,
+    visible_height: u32,
+    cells: Size,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EncodedSixel {
+    data: Arc<str>,
+    last_used: u64,
+}
+
+/// Immediate-mode sixel renderer. Encoded pixels are reusable, but terminal
+/// placement state is deliberately not retained across frames.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SixelBackend {
+    encoded: HashMap<SixelCacheKey, EncodedSixel>,
+}
+
+impl SixelBackend {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn render<W: Write>(
+        &mut self,
+        frame: &DesiredFrame,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        for placement in &frame.placements {
+            for band in 0..placement.clip.height {
+                let encoded = self.encoded_band(frame, placement, band)?;
+                write!(
+                    writer,
+                    "\x1b7\x1b[{};{}H{}\x1b8",
+                    placement.clip.y.saturating_add(band).saturating_add(1),
+                    placement.clip.x.saturating_add(1),
+                    encoded
+                )?;
+            }
+        }
+        writer.flush()
+    }
+
+    /// Sixel has no reliable portable partial-delete operation. Clearing the
+    /// alternate screen makes the caller redraw text and every desired image.
+    pub(crate) fn clear<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        write!(writer, "\x1b[2J\x1b[H")?;
+        writer.flush()
+    }
+
+    fn encoded_band(
+        &mut self,
+        frame: &DesiredFrame,
+        placement: &GraphicPlacement,
+        band: u16,
+    ) -> io::Result<Arc<str>> {
+        let asset = frame.assets.get(&placement.asset_key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "desired raster asset is missing",
+            )
+        })?;
+        let key = sixel_cache_key(frame, placement, band).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "desired sixel asset is missing")
+        })?;
+        if let Some(encoded) = self.encoded.get_mut(&key) {
+            encoded.last_used = frame.generation;
+            return Ok(Arc::clone(&encoded.data));
+        }
+
+        let image = visible_image(asset, key.source_y, key.visible_width, key.visible_height)?;
+        let options = EncodeOptions {
+            max_colors: SIXEL_MAX_COLORS,
+            diffusion: 0.0,
+            quantize_method: QuantizeMethod::Wu,
+        };
+        let data = sixel_encode(
+            image.as_raw(),
+            image.width() as usize,
+            image.height() as usize,
+            &options,
+        )
+        .map_err(|error| io::Error::other(format!("could not encode sixel: {error}")))?;
+        let data = Arc::<str>::from(data);
+        self.encoded.insert(
+            key,
+            EncodedSixel {
+                data: Arc::clone(&data),
+                last_used: frame.generation,
+            },
+        );
+        self.evict_unused(frame, key);
+        Ok(data)
+    }
+
+    fn evict_unused(&mut self, frame: &DesiredFrame, inserted: SixelCacheKey) {
+        let excess = self.encoded.len().saturating_sub(MAX_ENCODED_SIXELS);
+        if excess == 0 {
+            return;
+        }
+        let live = frame
+            .placements
+            .iter()
+            .flat_map(|placement| {
+                (0..placement.clip.height)
+                    .filter_map(|band| sixel_cache_key(frame, placement, band))
+            })
+            .chain(std::iter::once(inserted))
+            .collect::<HashSet<_>>();
+        let mut unused = self
+            .encoded
+            .iter()
+            .filter(|(key, _)| !live.contains(key))
+            .map(|(key, encoded)| (*key, encoded.last_used))
+            .collect::<Vec<_>>();
+        unused.sort_by_key(|(_, last_used)| *last_used);
+        for (key, _) in unused.into_iter().take(excess) {
+            self.encoded.remove(&key);
+        }
+    }
+}
+
+fn sixel_cache_key(
+    frame: &DesiredFrame,
+    placement: &GraphicPlacement,
+    band: u16,
+) -> Option<SixelCacheKey> {
+    let asset = frame.assets.get(&placement.asset_key)?;
+    let source_y = placement
+        .source_y
+        .saturating_add(u32::from(band).saturating_mul(frame.cell_pixels.height));
+    let visible_height = frame
+        .cell_pixels
+        .height
+        .min(asset.key.pixels.height.saturating_sub(source_y));
+    let visible_width = u32::from(placement.clip.width)
+        .saturating_mul(frame.cell_pixels.width)
+        .min(asset.key.pixels.width);
+    Some(SixelCacheKey {
+        asset_key: placement.asset_key,
+        source_y,
+        visible_width,
+        visible_height,
+        cells: Size::new(placement.clip.width, 1),
+    })
+}
+
+fn visible_image(
+    asset: &RasterAsset,
+    source_y: u32,
+    visible_width: u32,
+    visible_height: u32,
+) -> io::Result<RgbaImage> {
+    let width = asset.key.pixels.width;
+    if width == 0 || visible_width == 0 || visible_height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "visible sixel raster has zero size",
+        ));
+    }
+    let row_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "sixel width overflow"))?;
+    let start = usize::try_from(source_y)
+        .ok()
+        .and_then(|row| row.checked_mul(row_bytes))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "sixel offset overflow"))?;
+    let source_length = usize::try_from(visible_height)
+        .ok()
+        .and_then(|height| height.checked_mul(row_bytes))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "sixel source size overflow"))?;
+    let end = start
+        .checked_add(source_length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "sixel range overflow"))?;
+    let source = asset.rgba.get(start..end).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "sixel raster slice is missing")
+    })?;
+    let visible_row_bytes = usize::try_from(visible_width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "sixel clip overflow"))?;
+    let rgba = source
+        .chunks_exact(row_bytes)
+        .flat_map(|row| row[..visible_row_bytes].iter().copied())
+        .collect::<Vec<_>>();
+    let image = RgbaImage::from_raw(visible_width, visible_height, rgba).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "sixel raster shape is invalid")
+    })?;
+    Ok(image)
 }
 
 fn write_upload<W: Write>(writer: &mut W, image_id: u32, asset: &RasterAsset) -> io::Result<()> {
@@ -555,5 +758,140 @@ mod tests {
             backend.reconcile(&desired).as_slice(),
             [KittyOperation::Upload { .. }, KittyOperation::Place { .. }]
         ));
+    }
+
+    #[test]
+    fn sixel_repaints_the_complete_scene_and_reuses_encoded_pixels() {
+        let image = asset(1, 16, 16);
+        let desired = frame(Arc::clone(&image), Some(placement(&image, 0)));
+        let mut backend = SixelBackend::new();
+        let mut first = Vec::new();
+        backend
+            .render(&desired, &mut first)
+            .expect("initial sixel frame should render");
+        let cache_size = backend.encoded.len();
+        let mut second = Vec::new();
+        backend
+            .render(&desired, &mut second)
+            .expect("unchanged sixel frame should repaint");
+
+        assert_eq!(cache_size, 1);
+        assert_eq!(backend.encoded.len(), 1);
+        assert_eq!(first, second, "sixel must repaint the complete scene");
+        assert!(first.windows(2).any(|bytes| bytes == b"\x1bP"));
+    }
+
+    #[test]
+    fn sixel_clear_forces_a_full_alternate_screen_redraw_without_dropping_cache() {
+        let image = asset(1, 16, 16);
+        let desired = frame(Arc::clone(&image), Some(placement(&image, 0)));
+        let mut backend = SixelBackend::new();
+        backend
+            .render(&desired, &mut Vec::new())
+            .expect("initial sixel frame should render");
+        let mut output = Vec::new();
+
+        backend
+            .clear(&mut output)
+            .expect("sixel clear should encode");
+
+        assert_eq!(output, b"\x1b[2J\x1b[H");
+        assert_eq!(backend.encoded.len(), 1);
+    }
+
+    #[test]
+    fn shared_desired_frame_keeps_protocol_differences_inside_backends() {
+        let image = asset(1, 16, 16);
+        let desired = frame(Arc::clone(&image), Some(placement(&image, 0)));
+        let original_placements = desired.placements.clone();
+        let mut kitty = KittyBackend::new();
+        let mut sixel = SixelBackend::new();
+        let mut kitty_output = Vec::new();
+        let mut sixel_output = Vec::new();
+
+        kitty
+            .render(&desired, &mut kitty_output)
+            .expect("Kitty should consume the shared frame");
+        sixel
+            .render(&desired, &mut sixel_output)
+            .expect("sixel should consume the shared frame");
+
+        assert_eq!(desired.placements, original_placements);
+        assert!(kitty_output.windows(4).any(|bytes| bytes == b"a=t,"));
+        assert!(sixel_output.windows(2).any(|bytes| bytes == b"\x1bP"));
+        assert_ne!(kitty_output, sixel_output);
+    }
+
+    #[test]
+    fn sixel_cache_evicts_old_scroll_slices_of_the_same_asset() {
+        let image = asset(1, 16, 96);
+        let mut backend = SixelBackend::new();
+
+        for source_y in 0..70 {
+            let mut visible = placement(&image, 0);
+            visible.source_y = source_y;
+            let mut desired = frame(Arc::clone(&image), Some(visible));
+            desired.generation = u64::from(source_y) + 1;
+            backend
+                .render(&desired, &mut Vec::new())
+                .expect("scroll slice should encode");
+        }
+
+        assert_eq!(backend.encoded.len(), MAX_ENCODED_SIXELS);
+        assert!(backend.encoded.keys().all(|key| key.source_y >= 6));
+    }
+
+    #[test]
+    fn sixel_scroll_reuses_overlapping_cell_bands() {
+        let image = asset(1, 16, 80);
+        let mut visible = placement(&image, 0);
+        visible.target.height = 3;
+        visible.clip.height = 3;
+        let mut backend = SixelBackend::new();
+        backend
+            .render(
+                &frame(Arc::clone(&image), Some(visible.clone())),
+                &mut Vec::new(),
+            )
+            .expect("initial bands should encode");
+
+        visible.source_y = 16;
+        let mut scrolled = frame(image, Some(visible));
+        scrolled.generation = 2;
+        backend
+            .render(&scrolled, &mut Vec::new())
+            .expect("scrolled bands should encode");
+
+        assert_eq!(backend.encoded.len(), 4);
+        assert_eq!(
+            backend
+                .encoded
+                .keys()
+                .filter(|key| matches!(key.source_y, 16 | 32))
+                .count(),
+            2,
+            "overlapping bands should be shared between adjacent frames"
+        );
+    }
+
+    #[test]
+    fn sixel_encoding_honors_the_horizontal_clip() {
+        let image = asset(1, 16, 16);
+        let mut clipped = placement(&image, 0);
+        clipped.clip.width = 1;
+        let desired = frame(Arc::clone(&image), Some(clipped));
+        let mut backend = SixelBackend::new();
+
+        backend
+            .render(&desired, &mut Vec::new())
+            .expect("clipped sixel should encode");
+
+        let key = backend
+            .encoded
+            .keys()
+            .next()
+            .expect("encoded clip should be cached");
+        assert_eq!(key.visible_width, desired.cell_pixels.width);
+        assert_eq!(key.cells.width, 1);
     }
 }

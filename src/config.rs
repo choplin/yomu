@@ -15,6 +15,8 @@ const CONFIG_FILE: &str = "config.toml";
 pub(crate) struct Config {
     #[serde(default)]
     heading: HeadingConfig,
+    #[serde(default)]
+    graphics: GraphicsConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -22,6 +24,13 @@ pub(crate) struct Config {
 struct HeadingConfig {
     #[serde(default)]
     families: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphicsConfig {
+    #[serde(default)]
+    experimental_sixel: bool,
 }
 
 impl Config {
@@ -48,6 +57,10 @@ impl Config {
 
     pub(crate) fn heading_families(&self) -> &[String] {
         &self.heading.families
+    }
+
+    pub(crate) fn experimental_sixel(&self) -> bool {
+        self.graphics.experimental_sixel
     }
 }
 
@@ -106,5 +119,20 @@ mod tests {
             config.heading_families(),
             &["UDEV Gothic NF", "HackGen35 Console NF"]
         );
+    }
+
+    #[test]
+    fn experimental_sixel_switch_is_loaded() {
+        let config = toml::from_str::<Config>("[graphics]\nexperimental_sixel = true\n")
+            .expect("sixel override should parse");
+
+        assert!(config.experimental_sixel());
+    }
+
+    #[test]
+    fn experimental_sixel_defaults_to_disabled() {
+        let config = toml::from_str::<Config>("").expect("empty config should parse");
+
+        assert!(!config.experimental_sixel());
     }
 }

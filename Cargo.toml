@@ -14,6 +14,7 @@ crossterm = "0.29"
 fontdue = { version = "=0.9.3", default-features = false, features = ["std"] }
 fontdb = "0.23"
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+icy_sixel = "=0.5.1"
 percent-encoding = "2.3"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }

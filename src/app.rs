@@ -36,6 +36,7 @@ impl Command {
 #[derive(Clone, Debug, Default)]
 pub struct App {
     top_source: usize,
+    top_source_end: usize,
     top_row_offset: u16,
     quit: bool,
 }
@@ -53,7 +54,7 @@ impl App {
 
     #[must_use]
     pub fn viewport_position(&self, layout: &Layout) -> (usize, u16) {
-        let row = layout.row_for_source(self.top_source);
+        let row = layout.row_for_anchor(&(self.top_source..self.top_source_end));
         let offset = self
             .top_row_offset
             .min(layout.rows()[row].height.saturating_sub(1));
@@ -91,6 +92,7 @@ impl App {
         };
         if let Some(row) = rows.get(target) {
             self.top_source = row.source.start;
+            self.top_source_end = row.source.end;
             self.top_row_offset = target_offset;
         }
     }
@@ -211,6 +213,141 @@ mod tests {
 
         fs::remove_file(image_path).expect("fixture should be removable");
         fs::remove_dir(root).expect("fixture directory should be removable");
+    }
+
+    #[test]
+    fn navigation_leaves_a_graphic_followed_by_a_blank_line() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("raden-app-image-exit-{suffix}"));
+        fs::create_dir(&root).expect("fixture directory should be created");
+        let image_path = root.join("image.png");
+        ImageBuffer::<Rgba<u8>, _>::from_pixel(4, 4, Rgba([1, 2, 3, 255]))
+            .save(&image_path)
+            .expect("fixture should be saved");
+        let source = "before\n\n![image](image.png)\n\nafter the image";
+        let document = Document::parse(source.to_owned());
+        let catalog = ImageCatalog::load(&document, &root.join("doc.md"));
+        let mut cache = RasterCache::new(1_024);
+        let layout = Layout::with_graphics(
+            &document,
+            10,
+            10,
+            &catalog,
+            &mut cache,
+            PixelSize {
+                width: 1,
+                height: 1,
+            },
+            0,
+        );
+        let after = source
+            .find("after")
+            .expect("fixture contains trailing text");
+        let mut app = App::default();
+
+        for _ in 0..32 {
+            app.apply(Command::Down, &layout, 10);
+        }
+
+        fs::remove_file(image_path).expect("fixture should be removable");
+        fs::remove_dir(root).expect("fixture directory should be removable");
+        assert!(
+            app.top_source() >= after,
+            "navigation stopped at source {} before trailing source {after}; rows: {:?}",
+            app.top_source(),
+            layout
+                .rows()
+                .iter()
+                .map(|row| (row.source.clone(), row.height))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn navigation_progresses_when_graphics_layout_is_rebuilt_around_the_anchor() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/showcase.md");
+        let source = fs::read_to_string(&path).expect("showcase fixture should be readable");
+        let document = Document::parse(source.clone());
+        let catalog = ImageCatalog::load(&document, &path);
+        let cell = PixelSize {
+            width: 8,
+            height: 16,
+        };
+        let mut cache = RasterCache::default();
+        let mut layout = Layout::with_graphics(&document, 80, 22, &catalog, &mut cache, cell, 0);
+        let target = source
+            .find("## Navigation checkpoint")
+            .expect("showcase contains the navigation checkpoint");
+        let mut app = App::default();
+
+        for _ in 0..1_000 {
+            app.apply(Command::Down, &layout, 22);
+            layout = Layout::with_graphics(
+                &document,
+                80,
+                22,
+                &catalog,
+                &mut cache,
+                cell,
+                app.top_source(),
+            );
+            if app.top_source() >= target {
+                break;
+            }
+        }
+
+        assert!(
+            app.top_source() >= target,
+            "navigation stopped at source {} before checkpoint {target}; nearby rows: {:?}",
+            app.top_source(),
+            layout
+                .rows()
+                .iter()
+                .filter(|row| row.source.end >= 1_450 && row.source.start <= 1_600)
+                .map(|row| (row.source.clone(), row.height))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn upward_navigation_progresses_when_graphics_layout_is_rebuilt_around_the_anchor() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/showcase.md");
+        let source = fs::read_to_string(&path).expect("showcase fixture should be readable");
+        let document = Document::parse(source);
+        let catalog = ImageCatalog::load(&document, &path);
+        let cell = PixelSize {
+            width: 8,
+            height: 16,
+        };
+        let mut cache = RasterCache::default();
+        let mut layout = Layout::with_graphics(&document, 80, 22, &catalog, &mut cache, cell, 0);
+        let mut app = App::default();
+        app.apply(Command::End, &layout, 22);
+
+        for _ in 0..1_000 {
+            app.apply(Command::Up, &layout, 22);
+            layout = Layout::with_graphics(
+                &document,
+                80,
+                22,
+                &catalog,
+                &mut cache,
+                cell,
+                app.top_source(),
+            );
+            if app.top_source() == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            app.top_source(),
+            0,
+            "upward navigation stopped before the start of the showcase"
+        );
     }
 
     #[test]

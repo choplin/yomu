@@ -386,11 +386,16 @@ impl Layout {
     pub fn row_for_source(&self, offset: usize) -> usize {
         self.rows
             .iter()
-            .position(|row| {
-                (row.source.start <= offset && offset < row.source.end)
-                    || row.source.start >= offset
-            })
+            .position(|row| row.source.start <= offset && offset < row.source.end)
+            .or_else(|| self.rows.iter().position(|row| row.source.start >= offset))
             .unwrap_or_else(|| self.rows.len().saturating_sub(1))
+    }
+
+    pub(crate) fn row_for_anchor(&self, source: &SourceSpan) -> usize {
+        self.rows
+            .iter()
+            .position(|row| row.source == *source)
+            .unwrap_or_else(|| self.row_for_source(source.start))
     }
 }
 

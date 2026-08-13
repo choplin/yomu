@@ -14,7 +14,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
-use crate::graphics::{KittyBackend, kitty_environment_hint};
+use crate::graphics::{KittyBackend, SixelBackend, kitty_environment_hint};
 use crate::heading::HeadingFonts;
 use crate::image::ImageCatalog;
 use crate::{
@@ -39,7 +39,13 @@ pub(crate) fn run(path: &Path, document: &Document, config: &Config) -> Result<(
         HeadingFonts::load(config.heading_families()).map_err(anyhow::Error::msg)?
     };
     let mut session = TerminalSession::enter()?;
-    let run_result = run_loop(session.terminal_mut(), path, document, heading_fonts);
+    let run_result = run_loop(
+        session.terminal_mut(),
+        path,
+        document,
+        heading_fonts,
+        config.experimental_sixel(),
+    );
     let restore_result = session.restore();
     combine_run_and_restore(run_result, restore_result)
 }
@@ -60,17 +66,14 @@ fn run_loop(
     path: &Path,
     document: &Document,
     heading_fonts: HeadingFonts,
+    experimental_sixel: bool,
 ) -> Result<()> {
-    let use_kitty = kitty_environment_hint() && needs_graphics(document);
+    let mut graphics = GraphicsMode::select(experimental_sixel, needs_graphics(document));
     let images = ImageCatalog::load(document, path);
     let diagnostic_count = images.diagnostics().len();
-    let mut logical_renderer =
-        use_kitty.then(|| LogicalRenderer::spawn(document.clone(), images.clone(), heading_fonts));
-    let mut graphics = if use_kitty {
-        GraphicsMode::Kitty(KittyBackend::new())
-    } else {
-        GraphicsMode::Text
-    };
+    let mut logical_renderer = graphics
+        .uses_rasters()
+        .then(|| LogicalRenderer::spawn(document.clone(), images.clone(), heading_fonts));
     let run_result = drive_loop(
         terminal,
         path,
@@ -81,12 +84,12 @@ fn run_loop(
         &mut graphics,
     );
     drop(logical_renderer);
-    let clear_result = match &mut graphics {
-        GraphicsMode::Kitty(backend) => backend
-            .clear(&mut io::stdout())
-            .context("could not clear Kitty images during shutdown"),
-        GraphicsMode::Text => Ok(()),
-    };
+    let clear_result = graphics.clear(&mut io::stdout()).with_context(|| {
+        format!(
+            "could not clear {} graphics during shutdown",
+            graphics.name()
+        )
+    });
     combine_run_and_graphics_cleanup(run_result, clear_result)
 }
 
@@ -125,25 +128,26 @@ fn drive_loop(
         }
 
         if dirty {
+            if graphics.requires_full_redraw() {
+                terminal
+                    .clear()
+                    .context("could not clear the alternate screen for sixel redraw")?;
+            }
             let graphics_status = graphics.status(graphics_error.as_deref(), diagnostic_count);
             terminal
                 .draw(|frame| ui::render(frame, path, &app, &layout, &graphics_status))
                 .context("could not draw the Markdown document")?;
             dirty = false;
             if let Some(frame) = pending_frame.take() {
-                let render_error = match graphics {
-                    GraphicsMode::Kitty(backend) => backend.render(&frame, &mut io::stdout()).err(),
-                    GraphicsMode::Text => None,
-                };
+                let backend_name = graphics.name();
+                let render_error = graphics.render(&frame, &mut io::stdout()).err();
                 if let Some(error) = render_error {
-                    if let GraphicsMode::Kitty(backend) = graphics {
-                        backend.clear(&mut io::stdout()).with_context(|| {
-                            format!(
-                                "Kitty rendering failed: {error}; immediate cleanup also failed"
-                            )
-                        })?;
-                    }
-                    graphics_error = Some(format!("Kitty failed: {error}"));
+                    let cleanup_error = graphics.clear(&mut io::stdout()).err();
+                    graphics_error = Some(graphics_failure_diagnostic(
+                        backend_name,
+                        &error,
+                        cleanup_error.as_ref(),
+                    ));
                     let size = terminal
                         .size()
                         .context("could not read terminal size after graphics failure")?;
@@ -167,12 +171,10 @@ fn drive_loop(
         if app.should_quit() || !batch.changed {
             continue;
         }
-        if batch.resized
-            && let GraphicsMode::Kitty(backend) = graphics
-        {
-            backend
-                .clear(&mut io::stdout())
-                .context("could not clear Kitty images before resize redraw")?;
+        if batch.resized {
+            graphics.clear(&mut io::stdout()).with_context(|| {
+                format!("could not clear {} before resize redraw", graphics.name())
+            })?;
         }
         generation = generation.saturating_add(1);
         let size = batch.size;
@@ -441,10 +443,56 @@ fn combine_run_and_graphics_cleanup(
 #[derive(Debug)]
 enum GraphicsMode {
     Kitty(KittyBackend),
+    Sixel(SixelBackend),
     Text,
 }
 
 impl GraphicsMode {
+    fn select(experimental_sixel: bool, needs_graphics: bool) -> Self {
+        if !needs_graphics {
+            return Self::Text;
+        }
+        if experimental_sixel {
+            Self::Sixel(SixelBackend::new())
+        } else if kitty_environment_hint() {
+            Self::Kitty(KittyBackend::new())
+        } else {
+            Self::Text
+        }
+    }
+
+    fn uses_rasters(&self) -> bool {
+        !matches!(self, Self::Text)
+    }
+
+    fn requires_full_redraw(&self) -> bool {
+        matches!(self, Self::Sixel(_))
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Kitty(_) => "kitty",
+            Self::Sixel(_) => "sixel",
+            Self::Text => "text",
+        }
+    }
+
+    fn render<W: io::Write>(&mut self, frame: &DesiredFrame, writer: &mut W) -> io::Result<()> {
+        match self {
+            Self::Kitty(backend) => backend.render(frame, writer),
+            Self::Sixel(backend) => backend.render(frame, writer),
+            Self::Text => Ok(()),
+        }
+    }
+
+    fn clear<W: io::Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        match self {
+            Self::Kitty(backend) => backend.clear(writer),
+            Self::Sixel(backend) => backend.clear(writer),
+            Self::Text => Ok(()),
+        }
+    }
+
     fn status(&self, error: Option<&str>, diagnostic_count: usize) -> String {
         if let Some(error) = error {
             return format!("text ({error})");
@@ -454,11 +502,28 @@ impl GraphicsMode {
                 format!("kitty ({diagnostic_count} image warning(s))")
             }
             Self::Kitty(_) => "kitty".to_owned(),
+            Self::Sixel(_) if diagnostic_count > 0 => {
+                format!("sixel experimental ({diagnostic_count} image warning(s))")
+            }
+            Self::Sixel(_) => "sixel experimental".to_owned(),
             Self::Text if diagnostic_count > 0 => {
                 format!("text ({diagnostic_count} image warning(s))")
             }
             Self::Text => "text".to_owned(),
         }
+    }
+}
+
+fn graphics_failure_diagnostic(
+    backend: &str,
+    render_error: &io::Error,
+    cleanup_error: Option<&io::Error>,
+) -> String {
+    match cleanup_error {
+        Some(cleanup_error) => {
+            format!("{backend} failed: {render_error}; cleanup also failed: {cleanup_error}")
+        }
+        None => format!("{backend} failed: {render_error}"),
     }
 }
 
@@ -588,6 +653,34 @@ mod tests {
 
         assert!(needs_graphics(&table));
         assert!(!needs_graphics(&plain));
+    }
+
+    #[test]
+    fn explicit_sixel_override_is_experimental_and_uses_rasters() {
+        let graphics = GraphicsMode::select(true, true);
+
+        assert!(matches!(graphics, GraphicsMode::Sixel(_)));
+        assert!(graphics.uses_rasters());
+        assert!(graphics.requires_full_redraw());
+        assert_eq!(graphics.status(None, 0), "sixel experimental");
+    }
+
+    #[test]
+    fn plain_documents_do_not_start_an_explicit_graphics_backend() {
+        let graphics = GraphicsMode::select(true, false);
+
+        assert!(matches!(graphics, GraphicsMode::Text));
+    }
+
+    #[test]
+    fn graphics_cleanup_failure_is_reported_without_hiding_render_failure() {
+        let render = io::Error::other("render broke");
+        let cleanup = io::Error::other("clear broke");
+
+        let diagnostic = graphics_failure_diagnostic("sixel", &render, Some(&cleanup));
+
+        assert!(diagnostic.contains("sixel failed: render broke"));
+        assert!(diagnostic.contains("cleanup also failed: clear broke"));
     }
 
     #[test]

@@ -33,18 +33,21 @@ image diagnostic. You can also replace it with any local Markdown path.
 Use `examples/showcase-ja.md` for a focused Japanese typography, wrapping, and
 fallback check.
 
-Local PNG, JPEG, WebP, and GIF images render through Kitty Graphics when raden
-runs in Kitty or WezTerm. GIFs use their first frame. Image paths are resolved
+Local PNG, JPEG, WebP, and GIF images render automatically through Kitty
+Graphics when raden runs in Kitty or WezTerm, and through sixel when its
+experimental switch is enabled in a supported terminal. GIFs use their first
+frame. Image paths are resolved
 relative to the Markdown file's directory; remote URLs, absolute paths, paths
 that escape that directory, unsupported formats, oversized images, and decode
-failures stay readable as an inline diagnostic. In other terminals, the same
-elements use their alt-text projection.
+failures stay readable as an inline diagnostic. Without a selected graphics
+backend, the same elements use their alt-text projection.
 
 Level-one and level-two headings also render as larger rasterized typography in
-Kitty and WezTerm. They use an embedded Noto Sans JP font so Japanese and Latin
-text render consistently; level-three through level-six headings remain terminal
-text. Unsupported terminals and rasterization failures retain readable heading
-text. The bundled font is licensed under the SIL Open Font License 1.1; see
+Kitty and WezTerm, or through the explicitly enabled experimental sixel
+backend. They use an embedded Noto Sans JP font so Japanese and Latin text render
+consistently; level-three through level-six headings remain terminal text.
+Unsupported terminals and rasterization failures retain readable heading text.
+The bundled font is licensed under the SIL Open Font License 1.1; see
 `assets/fonts/OFL-NotoSansJP.txt`.
 
 To use the same monospace or Nerd Font as the terminal, create
@@ -61,9 +64,10 @@ JP fallback. Unavailable families are skipped unless none of the configured
 families can be resolved. Use a Nerd Font `Mono` family when its glyphs should
 retain terminal-like spacing.
 
-GFM tables render through an embedded Typst-to-SVG-to-RGBA pipeline in Kitty
-and WezTerm. Their canvas is transparent so the terminal background remains
-visible. Column widths fit parsed cell content up to a deterministic cap and
+GFM tables render through an embedded Typst-to-SVG-to-RGBA pipeline in Kitty,
+WezTerm, and the explicitly enabled experimental sixel backend. Their canvas is
+transparent so the terminal background remains visible. Column widths fit
+parsed cell content up to a deterministic cap and
 only expand as far as needed, bounded by the viewport; wide cells wrap instead
 of shrinking the text. Raden determines the terminal height from the original
 table rows and their precomputed cell wrapping, with one extra row of breathing
@@ -78,6 +82,18 @@ package, network, or filesystem resolver.
 Tables use a booktabs-like paper style: no vertical grid or left/right border,
 with strong top and bottom rules plus a lighter rule separating the bold header
 from the body.
+
+Sixel is available as an experimental second graphics backend. Capability
+detection is not enabled yet, so select it explicitly in the same config file:
+
+```toml
+[graphics]
+experimental_sixel = true
+```
+
+This is a temporary, sixel-only opt-in rather than the final backend override
+contract. Automatic capability probing and fallback remain deferred. The footer
+always labels the sixel backend `experimental`.
 
 To keep hostile or accidental input bounded, a rasterized table may contain at
 most 32 columns and 2,048 cells, occupy at most 256 terminal rows, and consume
@@ -129,6 +145,20 @@ decode fallback, table layout and overflow, Unicode, cache keys, failure
 projection, and source ranges. Real-terminal checks remain necessary because
 terminal graphics behavior cannot be observed through a test backend.
 
+## Experimental sixel graphics check
+
+Enable the experimental sixel switch above and run the same representative Markdown
+fixture in a sixel terminal, such as xterm with sixel enabled, foot, or mlterm.
+Do not enable this switch in a terminal without sixel support because the
+capability probe and automatic fallback are intentionally deferred.
+
+Verify the initial render and the same scroll, resize, invalid-image, and quit
+lifecycle listed for Kitty. In addition, confirm that every changed frame
+clears the previous graphics occupancy and repaints the complete visible scene,
+with no stale fragments after scrolling away and back. A brief full-screen
+redraw is expected: portable partial sixel deletion is not reliable across the
+target terminals.
+
 ## Motivation
 
 - Reviewing AI-written markdown happens in the terminal, but web rendering is
@@ -150,8 +180,8 @@ terminal graphics behavior cannot be observed through a test backend.
 - Differentiation: build for the AI-review use case — inline comments, math
   and tables as first-class citizens — rather than competing as a
   general-purpose viewer.
-- Not finalized: whether later graphics support builds on ratatui-image,
-  inline comment design, and live mode design.
+- Not finalized: automatic graphics capability selection, inline comment
+  design, and live mode design.
 - Naming: rejected candidates — makie (collides with Makie.jl), galley
   (collides with an AI-coding CLI and a macOS PDF previewer), inlay ("inlay
   hints" association), tipin (obscure), focal (generic, Ubuntu Focal Fossa).
