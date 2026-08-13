@@ -1,8 +1,13 @@
 //! Core document, layout, and application state for raden.
 
 mod app;
+mod config;
 mod document;
+mod graphics;
+mod heading;
+mod image;
 mod layout;
+mod scene;
 mod terminal;
 mod ui;
 
@@ -12,8 +17,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub use app::{App, Command};
-pub use document::{Document, SourceEvent, SourceSpan, TextStyle};
+pub use document::{Document, HeadingElement, ImageElement, SourceEvent, SourceSpan, TextStyle};
+pub(crate) use image::{ElementKey, PixelSize, RasterAsset, RasterAssetKey, RasterCache};
 pub use layout::{Layout, LayoutFragment, LayoutRow};
+pub(crate) use scene::{CellRect, DesiredFrame, GraphicPlacement};
 
 /// Load and parse a UTF-8 Markdown document from disk.
 pub fn load_document(path: &Path) -> Result<Document> {
@@ -24,8 +31,9 @@ pub fn load_document(path: &Path) -> Result<Document> {
 
 /// Open one Markdown document in the interactive terminal viewer.
 pub fn run(path: &Path) -> Result<()> {
+    let config = config::Config::load()?;
     let document = load_document(path)?;
-    terminal::run(path, &document)
+    terminal::run(path, &document, &config)
 }
 
 #[cfg(test)]

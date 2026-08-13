@@ -28,8 +28,38 @@ nix develop -c cargo run -- examples/showcase.md
 ```
 
 The showcase covers headings, inline styles, nested and ordered lists, task
-lists, quotations, code, tables, math events, a horizontal rule, HTML, and the
-current image fallback. You can also replace it with any local Markdown path.
+lists, quotations, code, tables, math events, a horizontal rule, HTML, and an
+image diagnostic. You can also replace it with any local Markdown path.
+Use `examples/showcase-ja.md` for a focused Japanese typography, wrapping, and
+fallback check.
+
+Local PNG, JPEG, WebP, and GIF images render through Kitty Graphics when raden
+runs in Kitty or WezTerm. GIFs use their first frame. Image paths are resolved
+relative to the Markdown file's directory; remote URLs, absolute paths, paths
+that escape that directory, unsupported formats, oversized images, and decode
+failures stay readable as an inline diagnostic. In other terminals, the same
+elements use their alt-text projection.
+
+Level-one and level-two headings also render as larger rasterized typography in
+Kitty and WezTerm. They use an embedded Noto Sans JP font so Japanese and Latin
+text render consistently; level-three through level-six headings remain terminal
+text. Unsupported terminals and rasterization failures retain readable heading
+text. The bundled font is licensed under the SIL Open Font License 1.1; see
+`assets/fonts/OFL-NotoSansJP.txt`.
+
+To use the same monospace or Nerd Font as the terminal, create
+`$XDG_CONFIG_HOME/raden/config.toml` (or `~/.config/raden/config.toml` when
+`XDG_CONFIG_HOME` is unset):
+
+```toml
+[heading]
+families = ["JetBrainsMono Nerd Font Mono"]
+```
+
+Installed font families are tried in order, followed by the embedded Noto Sans
+JP fallback. Unavailable families are skipped unless none of the configured
+families can be resolved. Use a Nerd Font `Mono` family when its glyphs should
+retain terminal-like spacing.
 
 The initial Reading mode uses these deliberately reversible bindings:
 
@@ -41,6 +71,33 @@ The initial Reading mode uses these deliberately reversible bindings:
 The viewport is anchored to source byte positions rather than terminal cells,
 so resizing reflows the document while keeping the same logical content in
 view.
+
+## Kitty graphics check
+
+Use a Markdown fixture with level-one or level-two headings, or one that
+references a local PNG, JPEG, WebP, or GIF, then run the viewer in Kitty or
+WezTerm:
+
+```console
+nix develop -c cargo run -- /path/to/fixture.md
+```
+
+Check the backend label in the footer and verify this lifecycle:
+
+1. The image appears at its Markdown position with its original aspect ratio.
+2. Scroll it completely off screen and back; no stale placement remains.
+3. Resize narrower and wider; the image is replaced at the new size and the
+   same source content remains near the viewport anchor.
+4. Add missing, remote, unsupported, and corrupt image references; each becomes
+   readable diagnostic text while valid images continue rendering.
+5. Quit with `q`, then confirm the shell has no image placement left behind.
+6. Verify H1 and H2 are visually distinct, Japanese text is intact, and narrow
+   terminal widths wrap headings without clipping them.
+
+The automated tests separately cover desired-frame reconciliation, upload and
+placement replacement, stale deletion, cache ownership, path escape rejection,
+decode fallback, and source ranges. Real-terminal checks remain necessary
+because terminal graphics behavior cannot be observed through a test backend.
 
 ## Motivation
 

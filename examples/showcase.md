@@ -48,7 +48,7 @@ fn main() {
 | --- | --- | --- |
 | Markdown text | Available | Refine styling |
 | Source ranges | Available | Selection anchors |
-| Images | Text fallback | Kitty and sixel |
+| Images | Kitty or text fallback | Sixel |
 | Math | Source fallback | Raster rendering |
 
 ## Math events
@@ -65,13 +65,20 @@ $$
 
 ---
 
+## Local image
+
+This bundled PNG exercises successful Kitty rendering without any setup:
+
+![A shell inlay detail](fixtures/shell-inlay.png)
+
 ## Error and fallback samples
 
 Raw inline HTML remains visible but muted: <kbd>q</kbd> exits the viewer.
 
-An image is currently represented as text fallback:
+This separate missing image intentionally demonstrates a readable diagnostic
+without interrupting review:
 
-![A shell inlay detail](fixtures/shell-inlay.png)
+![An intentionally missing image](fixtures/missing-image.png)
 
 ## Navigation checkpoint
 

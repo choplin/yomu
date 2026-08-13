@@ -36,6 +36,7 @@ impl Command {
 #[derive(Clone, Debug, Default)]
 pub struct App {
     top_source: usize,
+    top_row_offset: u16,
     quit: bool,
 }
 
@@ -46,23 +47,43 @@ impl App {
     }
 
     #[must_use]
+    pub fn top_row_offset(&self) -> u16 {
+        self.top_row_offset
+    }
+
+    #[must_use]
+    pub fn viewport_position(&self, layout: &Layout) -> (usize, u16) {
+        let row = layout.row_for_source(self.top_source);
+        let offset = self
+            .top_row_offset
+            .min(layout.rows()[row].height.saturating_sub(1));
+        (row, offset)
+    }
+
+    #[must_use]
     pub fn should_quit(&self) -> bool {
         self.quit
     }
 
     pub fn apply(&mut self, command: Command, layout: &Layout, viewport_height: u16) {
         let rows = layout.rows();
-        let current = layout.row_for_source(self.top_source);
+        let (current, offset) = self.viewport_position(layout);
         let page = usize::from(viewport_height.max(1));
         let last = rows.len().saturating_sub(1);
-        let target = match command {
+        let (target, target_offset) = match command {
             Command::None => return,
-            Command::Up => current.saturating_sub(1),
-            Command::Down => current.saturating_add(1).min(last),
-            Command::PageUp => current.saturating_sub(page),
-            Command::PageDown => current.saturating_add(page).min(last),
-            Command::Home => 0,
-            Command::End => last,
+            Command::Up if offset > 0 => (current, offset - 1),
+            Command::Up if current > 0 => {
+                let previous = current - 1;
+                (previous, rows[previous].height.saturating_sub(1))
+            }
+            Command::Up => (0, 0),
+            Command::Down if offset + 1 < rows[current].height => (current, offset + 1),
+            Command::Down => (current.saturating_add(1).min(last), 0),
+            Command::PageUp => move_up_cells(rows, current, offset, page),
+            Command::PageDown => move_down_cells(rows, current, offset, page),
+            Command::Home => (0, 0),
+            Command::End => (last, 0),
             Command::Quit => {
                 self.quit = true;
                 return;
@@ -70,13 +91,60 @@ impl App {
         };
         if let Some(row) = rows.get(target) {
             self.top_source = row.source.start;
+            self.top_row_offset = target_offset;
         }
     }
 }
 
+fn move_down_cells(
+    rows: &[crate::LayoutRow],
+    mut row: usize,
+    mut offset: u16,
+    mut cells: usize,
+) -> (usize, u16) {
+    while cells > 0 {
+        if offset + 1 < rows[row].height {
+            offset += 1;
+        } else if row + 1 < rows.len() {
+            row += 1;
+            offset = 0;
+        } else {
+            break;
+        }
+        cells -= 1;
+    }
+    (row, offset)
+}
+
+fn move_up_cells(
+    rows: &[crate::LayoutRow],
+    mut row: usize,
+    mut offset: u16,
+    mut cells: usize,
+) -> (usize, u16) {
+    while cells > 0 {
+        if offset > 0 {
+            offset -= 1;
+        } else if row > 0 {
+            row -= 1;
+            offset = rows[row].height.saturating_sub(1);
+        } else {
+            break;
+        }
+        cells -= 1;
+    }
+    (row, offset)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::Document;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use image::{ImageBuffer, Rgba};
+
+    use crate::image::{ImageCatalog, RasterCache};
+    use crate::{Document, PixelSize};
 
     use super::*;
 
@@ -94,6 +162,55 @@ mod tests {
 
         assert!(anchor > 0);
         assert!(wide.rows()[restored].source.end >= anchor);
+    }
+
+    #[test]
+    fn image_rows_scroll_one_cell_in_both_directions() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("raden-app-image-{suffix}"));
+        fs::create_dir(&root).expect("fixture directory should be created");
+        let image_path = root.join("image.png");
+        ImageBuffer::<Rgba<u8>, _>::from_pixel(4, 4, Rgba([1, 2, 3, 255]))
+            .save(&image_path)
+            .expect("fixture should be saved");
+        let document = Document::parse("before\n\n![image](image.png)\n\nafter".to_owned());
+        let catalog = ImageCatalog::load(&document, &root.join("doc.md"));
+        let mut cache = RasterCache::new(1_024);
+        let layout = Layout::with_graphics(
+            &document,
+            10,
+            10,
+            &catalog,
+            &mut cache,
+            PixelSize {
+                width: 1,
+                height: 1,
+            },
+            0,
+        );
+        let graphic_row = layout
+            .rows()
+            .iter()
+            .position(|row| row.height == 4)
+            .expect("fixture should contain a four-cell image row");
+        let mut app = App::default();
+        while app.viewport_position(&layout).0 < graphic_row {
+            app.apply(Command::Down, &layout, 10);
+        }
+
+        assert_eq!(app.viewport_position(&layout), (graphic_row, 0));
+        app.apply(Command::Down, &layout, 10);
+        assert_eq!(app.viewport_position(&layout), (graphic_row, 1));
+        app.apply(Command::Down, &layout, 10);
+        assert_eq!(app.viewport_position(&layout), (graphic_row, 2));
+        app.apply(Command::Up, &layout, 10);
+        assert_eq!(app.viewport_position(&layout), (graphic_row, 1));
+
+        fs::remove_file(image_path).expect("fixture should be removable");
+        fs::remove_dir(root).expect("fixture directory should be removable");
     }
 
     #[test]
