@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::GraphicsPreference;
+
 const APP_DIRECTORY: &str = "raden";
 const CONFIG_FILE: &str = "config.toml";
 
@@ -29,6 +31,8 @@ struct HeadingConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphicsConfig {
+    #[serde(default)]
+    backend: Option<GraphicsPreference>,
     #[serde(default)]
     experimental_sixel: bool,
 }
@@ -59,8 +63,12 @@ impl Config {
         &self.heading.families
     }
 
-    pub(crate) fn experimental_sixel(&self) -> bool {
-        self.graphics.experimental_sixel
+    pub(crate) fn graphics_preference(&self) -> GraphicsPreference {
+        match self.graphics.backend {
+            Some(backend) => backend,
+            None if self.graphics.experimental_sixel => GraphicsPreference::Sixel,
+            None => GraphicsPreference::Auto,
+        }
     }
 }
 
@@ -122,17 +130,34 @@ mod tests {
     }
 
     #[test]
-    fn experimental_sixel_switch_is_loaded() {
-        let config = toml::from_str::<Config>("[graphics]\nexperimental_sixel = true\n")
-            .expect("sixel override should parse");
+    fn graphics_backend_is_loaded() {
+        let config = toml::from_str::<Config>("[graphics]\nbackend = \"text\"\n")
+            .expect("graphics backend should parse");
 
-        assert!(config.experimental_sixel());
+        assert_eq!(config.graphics_preference(), GraphicsPreference::Text);
     }
 
     #[test]
-    fn experimental_sixel_defaults_to_disabled() {
+    fn legacy_experimental_sixel_switch_remains_compatible() {
+        let config = toml::from_str::<Config>("[graphics]\nexperimental_sixel = true\n")
+            .expect("sixel override should parse");
+
+        assert_eq!(config.graphics_preference(), GraphicsPreference::Sixel);
+    }
+
+    #[test]
+    fn explicit_auto_takes_precedence_over_legacy_sixel_switch() {
+        let config =
+            toml::from_str::<Config>("[graphics]\nbackend = \"auto\"\nexperimental_sixel = true\n")
+                .expect("combined graphics settings should parse");
+
+        assert_eq!(config.graphics_preference(), GraphicsPreference::Auto);
+    }
+
+    #[test]
+    fn graphics_backend_defaults_to_auto() {
         let config = toml::from_str::<Config>("").expect("empty config should parse");
 
-        assert!(!config.experimental_sixel());
+        assert_eq!(config.graphics_preference(), GraphicsPreference::Auto);
     }
 }

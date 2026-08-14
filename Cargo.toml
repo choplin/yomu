@@ -18,6 +18,7 @@ icy_sixel = "=0.5.1"
 percent-encoding = "2.3"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }
 resvg = { version = "=0.47.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 tex2typst-rs = "=0.4.1"
@@ -27,3 +28,9 @@ typst-as-lib = "=0.16.0"
 typst-assets = { version = "=0.15.1", features = ["fonts"] }
 typst-svg = "=0.15.0"
 unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["poll"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }

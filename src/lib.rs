@@ -23,6 +23,7 @@ pub use document::{
     Document, HeadingElement, ImageElement, MathElement, MathForm, SourceEvent, SourceSpan,
     TableAlignment, TableCell, TableElement, TableRow, TextStyle,
 };
+pub use graphics::GraphicsPreference;
 pub(crate) use image::{ElementKey, PixelSize, RasterAsset, RasterAssetKey, RasterCache};
 pub use layout::{Layout, LayoutFragment, LayoutRow};
 pub(crate) use scene::{CellRect, DesiredFrame, GraphicPlacement, GraphicSourceRegion};
@@ -36,9 +37,19 @@ pub fn load_document(path: &Path) -> Result<Document> {
 
 /// Open one Markdown document in the interactive terminal viewer.
 pub fn run(path: &Path) -> Result<()> {
+    run_with_graphics(path, None)
+}
+
+/// Open one Markdown document with an optional graphics-backend override.
+pub fn run_with_graphics(path: &Path, graphics: Option<GraphicsPreference>) -> Result<()> {
     let config = config::Config::load()?;
     let document = load_document(path)?;
-    terminal::run(path, &document, &config)
+    terminal::run(
+        path,
+        &document,
+        &config,
+        graphics.unwrap_or_else(|| config.graphics_preference()),
+    )
 }
 
 #[cfg(test)]

@@ -11,10 +11,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;
 
-use crate::graphics::{KittyBackend, SixelBackend, kitty_environment_hint};
+use crate::graphics::{
+    CapabilityEvidence, GraphicsBackendKind, GraphicsPreference, GraphicsSelection, KittyBackend,
+    SixelBackend, select_graphics_backend,
+};
 use crate::heading::HeadingFonts;
 use crate::image::ImageCatalog;
 use crate::{
@@ -26,7 +29,12 @@ const INPUT_WAIT: Duration = Duration::from_millis(8);
 const INPUT_BATCH_WINDOW: Duration = Duration::from_millis(2);
 const MAX_INPUT_BATCH: usize = 64;
 
-pub(crate) fn run(path: &Path, document: &Document, config: &Config) -> Result<()> {
+pub(crate) fn run(
+    path: &Path,
+    document: &Document,
+    config: &Config,
+    preference: GraphicsPreference,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(anyhow!(
             "an interactive terminal is required (stdin and stdout must both be terminals)"
@@ -39,12 +47,44 @@ pub(crate) fn run(path: &Path, document: &Document, config: &Config) -> Result<(
         HeadingFonts::load(config.heading_families()).map_err(anyhow::Error::msg)?
     };
     let mut session = TerminalSession::enter()?;
+    let needs_graphics = needs_graphics(document);
+    let should_probe = preference != GraphicsPreference::Text
+        && (needs_graphics || preference != GraphicsPreference::Auto);
+    let (evidence, probe_error) = if should_probe {
+        match CapabilityEvidence::query_stdio() {
+            Ok(evidence) => (evidence, None),
+            Err(error) if preference == GraphicsPreference::Auto => (
+                CapabilityEvidence::environment_fallback(),
+                Some(format!("capability query failed: {error}")),
+            ),
+            Err(error) => {
+                let restore_result = session.restore();
+                let selection_error = anyhow!("could not query graphics capabilities: {error}");
+                return combine_run_and_restore(Err(selection_error), restore_result);
+            }
+        }
+    } else {
+        (CapabilityEvidence::default(), None)
+    };
+    let GraphicsSelection {
+        backend,
+        reason: selection_reason,
+    } = match select_graphics_backend(preference, evidence, needs_graphics) {
+        Ok(selection) => selection,
+        Err(error) => {
+            let restore_result = session.restore();
+            return combine_run_and_restore(Err(anyhow!(error)), restore_result);
+        }
+    };
+    let initial_diagnostic = combine_diagnostics(selection_reason, probe_error);
     let run_result = run_loop(
         session.terminal_mut(),
         path,
         document,
         heading_fonts,
-        config.experimental_sixel(),
+        backend,
+        evidence.cell_pixels,
+        initial_diagnostic,
     );
     let restore_result = session.restore();
     combine_run_and_restore(run_result, restore_result)
@@ -61,28 +101,38 @@ fn combine_run_and_restore(run_result: Result<()>, restore_result: Result<()>) -
     }
 }
 
+fn combine_diagnostics(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(diagnostic), None) | (None, Some(diagnostic)) => Some(diagnostic),
+        (None, None) => None,
+    }
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     path: &Path,
     document: &Document,
     heading_fonts: HeadingFonts,
-    experimental_sixel: bool,
+    backend: GraphicsBackendKind,
+    queried_cell_pixels: Option<PixelSize>,
+    initial_diagnostic: Option<String>,
 ) -> Result<()> {
-    let mut graphics = GraphicsMode::select(experimental_sixel, needs_graphics(document));
+    let mut graphics = GraphicsMode::from_kind(backend);
     let images = ImageCatalog::load(document, path);
     let diagnostic_count = images.diagnostics().len();
     let mut logical_renderer = graphics
         .uses_rasters()
         .then(|| LogicalRenderer::spawn(document.clone(), images.clone(), heading_fonts));
-    let run_result = drive_loop(
-        terminal,
+    let context = DriveContext {
         path,
         document,
-        &images,
+        images: &images,
         diagnostic_count,
-        &mut logical_renderer,
-        &mut graphics,
-    );
+        queried_cell_pixels,
+        initial_diagnostic,
+    };
+    let run_result = drive_loop(terminal, context, &mut logical_renderer, &mut graphics);
     drop(logical_renderer);
     let clear_result = graphics.clear(&mut io::stdout()).with_context(|| {
         format!(
@@ -100,21 +150,41 @@ fn needs_graphics(document: &Document) -> bool {
         || !document.math().is_empty()
 }
 
+struct DriveContext<'a> {
+    path: &'a Path,
+    document: &'a Document,
+    images: &'a ImageCatalog,
+    diagnostic_count: usize,
+    queried_cell_pixels: Option<PixelSize>,
+    initial_diagnostic: Option<String>,
+}
+
 fn drive_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    path: &Path,
-    document: &Document,
-    images: &ImageCatalog,
-    diagnostic_count: usize,
+    context: DriveContext<'_>,
     logical_renderer: &mut Option<LogicalRenderer>,
     graphics: &mut GraphicsMode,
 ) -> Result<()> {
+    let DriveContext {
+        path,
+        document,
+        images,
+        diagnostic_count,
+        queried_cell_pixels,
+        initial_diagnostic,
+    } = context;
     let mut app = App::default();
     let mut generation = 1u64;
-    let mut graphics_error = None;
+    let mut graphics_diagnostic = initial_diagnostic;
     let initial_size = terminal.size().context("could not read terminal size")?;
     let mut layout = Layout::with_text(document, initial_size.width, images);
-    submit_logical_render(logical_renderer, generation, &app, initial_size);
+    submit_logical_render(
+        logical_renderer,
+        generation,
+        &app,
+        initial_size,
+        queried_cell_pixels,
+    );
     let mut dirty = true;
     let mut pending_frame = None;
     while !app.should_quit() {
@@ -134,7 +204,7 @@ fn drive_loop(
                     .clear()
                     .context("could not clear the alternate screen for sixel redraw")?;
             }
-            let graphics_status = graphics.status(graphics_error.as_deref(), diagnostic_count);
+            let graphics_status = graphics.status(graphics_diagnostic.as_deref(), diagnostic_count);
             terminal
                 .draw(|frame| ui::render(frame, path, &app, &layout, &graphics_status))
                 .context("could not draw the Markdown document")?;
@@ -143,22 +213,30 @@ fn drive_loop(
                 let backend_name = graphics.name();
                 let render_error = graphics.render(&frame, &mut io::stdout()).err();
                 if let Some(error) = render_error {
-                    let cleanup_error = graphics.clear(&mut io::stdout()).err();
-                    graphics_error = Some(graphics_failure_diagnostic(
-                        backend_name,
-                        &error,
-                        cleanup_error.as_ref(),
-                    ));
                     let size = terminal
                         .size()
                         .context("could not read terminal size after graphics failure")?;
-                    layout =
-                        fall_back_to_text(graphics, logical_renderer, document, size.width, images);
+                    let failure = GraphicsFailureContext {
+                        path,
+                        app: &app,
+                        document,
+                        images,
+                        width: size.width,
+                        diagnostic_count,
+                        backend_name,
+                        render_error: &error,
+                    };
+                    let fallback = handle_graphics_failure(
+                        terminal,
+                        graphics,
+                        logical_renderer,
+                        &mut io::stdout(),
+                        failure,
+                    )?;
+                    graphics_diagnostic = Some(fallback.diagnostic);
+                    layout = fallback.layout;
                     pending_frame = None;
-                    terminal
-                        .clear()
-                        .context("could not redraw after graphics failure")?;
-                    dirty = true;
+                    dirty = false;
                 }
             }
         }
@@ -186,9 +264,15 @@ fn drive_loop(
             &layout,
             CellRect::from(body),
             generation,
-            cell_pixel_size(size.width, size.height),
+            cell_pixel_size(size.width, size.height, queried_cell_pixels),
         );
-        submit_logical_render(logical_renderer, generation, &app, size);
+        submit_logical_render(
+            logical_renderer,
+            generation,
+            &app,
+            size,
+            queried_cell_pixels,
+        );
         dirty = true;
     }
     Ok(())
@@ -269,16 +353,47 @@ fn apply_input_batch(
     result
 }
 
-fn fall_back_to_text(
+struct GraphicsFailureContext<'a> {
+    path: &'a Path,
+    app: &'a App,
+    document: &'a Document,
+    images: &'a ImageCatalog,
+    width: u16,
+    diagnostic_count: usize,
+    backend_name: &'static str,
+    render_error: &'a io::Error,
+}
+
+fn handle_graphics_failure<B: Backend>(
+    terminal: &mut Terminal<B>,
     graphics: &mut GraphicsMode,
     logical_renderer: &mut Option<LogicalRenderer>,
-    document: &Document,
-    width: u16,
-    images: &ImageCatalog,
-) -> Layout {
+    writer: &mut impl io::Write,
+    context: GraphicsFailureContext<'_>,
+) -> Result<TextFallback> {
+    let cleanup_error = graphics.clear(writer).err();
     *graphics = GraphicsMode::Text;
     *logical_renderer = None;
-    Layout::with_text(document, width, images)
+    let layout = Layout::with_text(context.document, context.width, context.images);
+    let diagnostic = graphics_failure_diagnostic(
+        context.backend_name,
+        context.render_error,
+        cleanup_error.as_ref(),
+    );
+    terminal
+        .clear()
+        .map_err(|error| anyhow!("could not clear before text fallback: {error}"))?;
+    let status = graphics.status(Some(&diagnostic), context.diagnostic_count);
+    terminal
+        .draw(|frame| ui::render(frame, context.path, context.app, &layout, &status))
+        .map_err(|error| anyhow!("could not redraw text fallback: {error}"))?;
+    Ok(TextFallback { layout, diagnostic })
+}
+
+#[derive(Debug)]
+struct TextFallback {
+    layout: Layout,
+    diagnostic: String,
 }
 
 fn submit_logical_render(
@@ -286,6 +401,7 @@ fn submit_logical_render(
     generation: u64,
     app: &App,
     size: ratatui::layout::Size,
+    queried_cell_pixels: Option<PixelSize>,
 ) {
     let Some(renderer) = renderer else { return };
     let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height));
@@ -295,7 +411,7 @@ fn submit_logical_render(
         top_row_offset: app.top_row_offset(),
         size,
         body: CellRect::from(body),
-        cell_pixels: cell_pixel_size(size.width, size.height),
+        cell_pixels: cell_pixel_size(size.width, size.height, queried_cell_pixels),
     });
 }
 
@@ -467,16 +583,11 @@ enum GraphicsMode {
 }
 
 impl GraphicsMode {
-    fn select(experimental_sixel: bool, needs_graphics: bool) -> Self {
-        if !needs_graphics {
-            return Self::Text;
-        }
-        if experimental_sixel {
-            Self::Sixel(SixelBackend::new())
-        } else if kitty_environment_hint() {
-            Self::Kitty(KittyBackend::new())
-        } else {
-            Self::Text
+    fn from_kind(kind: GraphicsBackendKind) -> Self {
+        match kind {
+            GraphicsBackendKind::Kitty => Self::Kitty(KittyBackend::new()),
+            GraphicsBackendKind::Sixel => Self::Sixel(SixelBackend::new()),
+            GraphicsBackendKind::Text => Self::Text,
         }
     }
 
@@ -514,7 +625,7 @@ impl GraphicsMode {
 
     fn status(&self, error: Option<&str>, diagnostic_count: usize) -> String {
         if let Some(error) = error {
-            return format!("text ({error})");
+            return format!("{} ({error})", self.name());
         }
         match self {
             Self::Kitty(_) if diagnostic_count > 0 => {
@@ -546,7 +657,10 @@ fn graphics_failure_diagnostic(
     }
 }
 
-fn cell_pixel_size(columns: u16, rows: u16) -> PixelSize {
+fn cell_pixel_size(columns: u16, rows: u16, queried_cell_pixels: Option<PixelSize>) -> PixelSize {
+    if let Some(cell_pixels) = queried_cell_pixels {
+        return cell_pixels;
+    }
     crossterm::terminal::window_size()
         .ok()
         .and_then(|window| {
@@ -676,7 +790,7 @@ mod tests {
 
     #[test]
     fn explicit_sixel_override_is_experimental_and_uses_rasters() {
-        let graphics = GraphicsMode::select(true, true);
+        let graphics = GraphicsMode::from_kind(GraphicsBackendKind::Sixel);
 
         assert!(matches!(graphics, GraphicsMode::Sixel(_)));
         assert!(graphics.uses_rasters());
@@ -685,10 +799,20 @@ mod tests {
     }
 
     #[test]
-    fn plain_documents_do_not_start_an_explicit_graphics_backend() {
-        let graphics = GraphicsMode::select(true, false);
+    fn text_selection_does_not_start_an_explicit_graphics_backend() {
+        let graphics = GraphicsMode::from_kind(GraphicsBackendKind::Text);
 
         assert!(matches!(graphics, GraphicsMode::Text));
+    }
+
+    #[test]
+    fn status_keeps_the_active_backend_when_reporting_probe_failure() {
+        let graphics = GraphicsMode::from_kind(GraphicsBackendKind::Kitty);
+
+        assert_eq!(
+            graphics.status(Some("capability query failed: injected"), 0),
+            "kitty (capability query failed: injected)"
+        );
     }
 
     #[test]
@@ -839,9 +963,30 @@ mod tests {
         let images = ImageCatalog::load(&document, Path::new("doc.md"));
         let mut graphics = GraphicsMode::Kitty(KittyBackend::new());
         let mut renderer = None;
-
-        let layout = fall_back_to_text(&mut graphics, &mut renderer, &document, 80, &images);
-        let rendered = layout
+        let mut cleanup = Vec::new();
+        let app = App::default();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("test terminal should be created");
+        let render_error = io::Error::other("render broke");
+        let fallback = handle_graphics_failure(
+            &mut terminal,
+            &mut graphics,
+            &mut renderer,
+            &mut cleanup,
+            GraphicsFailureContext {
+                path: Path::new("doc.md"),
+                app: &app,
+                document: &document,
+                images: &images,
+                width: 80,
+                diagnostic_count: 0,
+                backend_name: "kitty",
+                render_error: &render_error,
+            },
+        )
+        .expect("text fallback should be redrawn");
+        let rendered = fallback
+            .layout
             .rows()
             .iter()
             .flat_map(|row| row.fragments.iter())
@@ -850,6 +995,78 @@ mod tests {
 
         assert!(matches!(graphics, GraphicsMode::Text));
         assert!(renderer.is_none());
+        assert!(fallback.diagnostic.contains("kitty failed: render broke"));
         assert!(rendered.contains("Readable heading"));
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("Readable heading"));
+    }
+
+    #[test]
+    fn sixel_failure_clears_before_resetting_and_relayout_to_text() {
+        let document = Document::parse(
+            "before the heading\n\n# Readable heading\n\nafter the heading\n".to_owned(),
+        );
+        let images = ImageCatalog::load(&document, Path::new("doc.md"));
+        let graphics_layout = Layout::with_text(&document, 24, &images);
+        let mut app = App::default();
+        app.apply(Command::Down, &graphics_layout, 10);
+        let source_anchor = app.top_source();
+        let mut graphics = GraphicsMode::Sixel(SixelBackend::new());
+        let mut renderer = None;
+        let mut cleanup = Vec::new();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(24, 12))
+            .expect("test terminal should be created");
+        let render_error = io::Error::other("render broke");
+        let fallback = handle_graphics_failure(
+            &mut terminal,
+            &mut graphics,
+            &mut renderer,
+            &mut cleanup,
+            GraphicsFailureContext {
+                path: Path::new("doc.md"),
+                app: &app,
+                document: &document,
+                images: &images,
+                width: 24,
+                diagnostic_count: 0,
+                backend_name: "sixel",
+                render_error: &render_error,
+            },
+        )
+        .expect("text fallback should be redrawn");
+
+        assert_eq!(cleanup, b"\x1b[2J\x1b[H");
+        assert!(matches!(graphics, GraphicsMode::Text));
+        assert!(renderer.is_none());
+        assert_eq!(app.top_source(), source_anchor);
+        assert_eq!(
+            fallback.layout.rows()[fallback.layout.row_for_source(source_anchor)]
+                .source
+                .start,
+            source_anchor
+        );
+        assert!(fallback.diagnostic.contains("sixel failed: render broke"));
+        assert!(
+            fallback
+                .layout
+                .rows()
+                .iter()
+                .flat_map(|row| &row.fragments)
+                .any(|fragment| fragment.text.contains("Readable heading"))
+        );
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("Readable heading"));
     }
 }

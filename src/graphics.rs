@@ -1,19 +1,212 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use clap::ValueEnum;
 use icy_sixel::{EncodeOptions, QuantizeMethod, sixel_encode};
 use image::RgbaImage;
 use ratatui::layout::Size;
+use ratatui_image::picker::cap_parser::{Parser, QueryStdioOptions, Response};
+use serde::Deserialize;
 
-use crate::{DesiredFrame, ElementKey, GraphicPlacement, RasterAsset, RasterAssetKey};
+use crate::{DesiredFrame, ElementKey, GraphicPlacement, PixelSize, RasterAsset, RasterAssetKey};
 
 const RAW_CHUNK_BYTES: usize = 3_072;
 const MAX_UPLOADED_IMAGES: usize = 64;
 const MAX_ENCODED_SIXELS: usize = 64;
 const SIXEL_MAX_COLORS: u16 = 16;
+
+/// User-selected graphics policy. Automatic selection prefers Kitty, then sixel,
+/// and finally the complete text projection.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphicsPreference {
+    #[default]
+    Auto,
+    Kitty,
+    Sixel,
+    Text,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphicsBackendKind {
+    Kitty,
+    Sixel,
+    Text,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphicsSelection {
+    pub(crate) backend: GraphicsBackendKind,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CapabilityEvidence {
+    graphics_query_authoritative: bool,
+    kitty: bool,
+    sixel: bool,
+    kitty_hint: bool,
+    sixel_hint: bool,
+    pub(crate) cell_pixels: Option<PixelSize>,
+}
+
+impl CapabilityEvidence {
+    pub(crate) fn environment_fallback() -> Self {
+        Self {
+            kitty_hint: kitty_environment_hint(),
+            sixel_hint: sixel_environment_hint(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn query_stdio() -> io::Result<Self> {
+        let options = QueryStdioOptions::default();
+        let deadline = Instant::now() + options.timeout;
+        let query = Parser::query(inside_tmux(), options);
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(query.as_bytes())?;
+        stdout.flush()?;
+        drop(stdout);
+
+        let mut parser = Parser::new();
+        let mut input = io::stdin().lock();
+        let mut evidence = Self::environment_fallback();
+        let mut buffer = [0u8; 256];
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            if !stdin_ready(&input, remaining)? {
+                return Ok(evidence);
+            }
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(evidence);
+            }
+            for byte in &buffer[..read] {
+                for response in parser.push(char::from(*byte)) {
+                    match response {
+                        Response::Kitty => evidence.kitty = true,
+                        Response::Sixel => evidence.sixel = true,
+                        Response::CellSize(Some((width, height))) if width > 0 && height > 0 => {
+                            evidence.cell_pixels = Some(PixelSize {
+                                width: u32::from(width),
+                                height: u32::from(height),
+                            });
+                        }
+                        Response::Status => {
+                            evidence.graphics_query_authoritative = true;
+                            return Ok(evidence);
+                        }
+                        Response::RectangularOps
+                        | Response::CellSize(None)
+                        | Response::CellSize(Some(_))
+                        | Response::CursorPositionReport(_, _)
+                        | Response::Background(_, _, _) => {}
+                    }
+                }
+            }
+        }
+        Ok(evidence)
+    }
+
+    fn supports(&self, backend: GraphicsBackendKind) -> bool {
+        match backend {
+            GraphicsBackendKind::Text => true,
+            GraphicsBackendKind::Kitty if self.kitty => true,
+            GraphicsBackendKind::Sixel if self.sixel => true,
+            GraphicsBackendKind::Kitty if !self.graphics_query_authoritative => self.kitty_hint,
+            GraphicsBackendKind::Sixel if !self.graphics_query_authoritative => self.sixel_hint,
+            GraphicsBackendKind::Kitty | GraphicsBackendKind::Sixel => false,
+        }
+    }
+
+    fn unavailable_reason(&self) -> &'static str {
+        if self.graphics_query_authoritative {
+            "the terminal capability response did not report support"
+        } else {
+            "the terminal capability query returned no usable response or fallback hint"
+        }
+    }
+
+    fn selection_reason(&self, backend: GraphicsBackendKind) -> Option<String> {
+        let selected_from_hint = !self.graphics_query_authoritative
+            && match backend {
+                GraphicsBackendKind::Kitty => !self.kitty && self.kitty_hint,
+                GraphicsBackendKind::Sixel => !self.sixel && self.sixel_hint,
+                GraphicsBackendKind::Text => false,
+            };
+        selected_from_hint.then(|| {
+            "selected from an environment fallback hint after no authoritative graphics response"
+                .to_owned()
+        })
+    }
+}
+
+pub(crate) fn select_graphics_backend(
+    preference: GraphicsPreference,
+    evidence: CapabilityEvidence,
+    needs_graphics: bool,
+) -> Result<GraphicsSelection, String> {
+    if preference == GraphicsPreference::Text {
+        return Ok(GraphicsSelection {
+            backend: GraphicsBackendKind::Text,
+            reason: None,
+        });
+    }
+
+    let explicit = match preference {
+        GraphicsPreference::Kitty => Some(GraphicsBackendKind::Kitty),
+        GraphicsPreference::Sixel => Some(GraphicsBackendKind::Sixel),
+        GraphicsPreference::Auto | GraphicsPreference::Text => None,
+    };
+    if let Some(backend) = explicit {
+        if evidence.supports(backend) {
+            return Ok(GraphicsSelection {
+                backend,
+                reason: evidence.selection_reason(backend),
+            });
+        }
+        let name = match backend {
+            GraphicsBackendKind::Kitty => "kitty",
+            GraphicsBackendKind::Sixel => "sixel",
+            GraphicsBackendKind::Text => "text",
+        };
+        return Err(format!(
+            "requested graphics backend '{name}' is unavailable: {}; use --graphics auto or --graphics text",
+            evidence.unavailable_reason()
+        ));
+    }
+
+    if !needs_graphics {
+        return Ok(GraphicsSelection {
+            backend: GraphicsBackendKind::Text,
+            reason: None,
+        });
+    }
+
+    if evidence.supports(GraphicsBackendKind::Kitty) {
+        return Ok(GraphicsSelection {
+            backend: GraphicsBackendKind::Kitty,
+            reason: evidence.selection_reason(GraphicsBackendKind::Kitty),
+        });
+    }
+    if evidence.supports(GraphicsBackendKind::Sixel) {
+        return Ok(GraphicsSelection {
+            backend: GraphicsBackendKind::Sixel,
+            reason: evidence.selection_reason(GraphicsBackendKind::Sixel),
+        });
+    }
+    Ok(GraphicsSelection {
+        backend: GraphicsBackendKind::Text,
+        reason: Some(if evidence.graphics_query_authoritative {
+            "terminal reported no Kitty or sixel support".to_owned()
+        } else {
+            "capability query returned no usable graphics response".to_owned()
+        }),
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Uploaded {
@@ -526,8 +719,52 @@ fn write_placement<W: Write>(
 #[must_use]
 pub(crate) fn kitty_environment_hint() -> bool {
     std::env::var_os("KITTY_WINDOW_ID").is_some()
-        || std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
         || std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "WezTerm")
+}
+
+#[must_use]
+fn sixel_environment_hint() -> bool {
+    std::env::var_os("SIXEL").is_some()
+}
+
+fn inside_tmux() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term.starts_with("tmux"))
+        || std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "tmux")
+}
+
+#[cfg(unix)]
+fn stdin_ready(input: &impl std::os::fd::AsFd, timeout: Duration) -> io::Result<bool> {
+    use nix::sys::select::{FdSet, select};
+    use nix::sys::time::{TimeVal, TimeValLike};
+
+    let mut read_fds = FdSet::new();
+    read_fds.insert(input.as_fd());
+    let milliseconds = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
+    let mut timeout = TimeVal::milliseconds(milliseconds);
+    select(None, &mut read_fds, None, None, &mut timeout)
+        .map(|ready| ready > 0)
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(windows)]
+fn stdin_ready<T>(_input: &T, timeout: Duration) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: GetStdHandle returns a process-owned handle that remains valid for
+    // the duration of this synchronous wait; the function does not take ownership.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `handle` was validated above and is only observed, never closed.
+    match unsafe { WaitForSingleObject(handle, milliseconds) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +773,136 @@ mod tests {
 
     use super::*;
     use crate::{CellRect, DesiredFrame, PixelSize};
+
+    fn evidence(
+        graphics_query_authoritative: bool,
+        kitty: bool,
+        sixel: bool,
+        kitty_hint: bool,
+        sixel_hint: bool,
+    ) -> CapabilityEvidence {
+        CapabilityEvidence {
+            graphics_query_authoritative,
+            kitty,
+            sixel,
+            kitty_hint,
+            sixel_hint,
+            cell_pixels: None,
+        }
+    }
+
+    #[test]
+    fn capability_fixtures_select_kitty_then_sixel_then_text() {
+        let selected = |evidence| {
+            select_graphics_backend(GraphicsPreference::Auto, evidence, true)
+                .expect("automatic selection should not fail")
+                .backend
+        };
+
+        assert_eq!(
+            selected(evidence(true, true, true, false, false)),
+            GraphicsBackendKind::Kitty,
+            "Kitty wins when both protocols are reported"
+        );
+        assert_eq!(
+            selected(evidence(true, false, true, false, false)),
+            GraphicsBackendKind::Sixel
+        );
+        assert_eq!(
+            selected(evidence(false, false, false, false, false)),
+            GraphicsBackendKind::Text,
+            "no response and no hint must preserve review through text"
+        );
+        assert_eq!(
+            selected(evidence(true, false, false, true, false)),
+            GraphicsBackendKind::Text,
+            "a capability response must overrule a stale environment hint"
+        );
+        assert_eq!(
+            selected(evidence(true, false, false, false, false)),
+            GraphicsBackendKind::Text
+        );
+
+        assert_eq!(
+            select_graphics_backend(
+                GraphicsPreference::Auto,
+                evidence(true, true, true, false, false),
+                false,
+            )
+            .expect("plain documents should not need a graphics backend")
+            .backend,
+            GraphicsBackendKind::Text,
+            "no-graphics content stays on the text projection without starting a backend"
+        );
+    }
+
+    #[test]
+    fn no_response_uses_environment_hints_only_as_fallback_evidence() {
+        let selection = select_graphics_backend(
+            GraphicsPreference::Auto,
+            evidence(false, false, false, true, false),
+            true,
+        )
+        .expect("automatic selection should use a fallback hint");
+
+        assert_eq!(selection.backend, GraphicsBackendKind::Kitty);
+        assert_eq!(
+            selection.reason.as_deref(),
+            Some(
+                "selected from an environment fallback hint after no authoritative graphics response"
+            )
+        );
+    }
+
+    #[test]
+    fn non_authoritative_response_keeps_environment_hint_as_fallback_evidence() {
+        let non_authoritative = evidence(false, false, false, true, false);
+
+        assert_eq!(
+            select_graphics_backend(GraphicsPreference::Auto, non_authoritative, true)
+                .expect("an untested protocol may use a fallback hint")
+                .backend,
+            GraphicsBackendKind::Kitty
+        );
+    }
+
+    #[test]
+    fn unavailable_explicit_backend_returns_actionable_diagnostic() {
+        let error = select_graphics_backend(
+            GraphicsPreference::Sixel,
+            evidence(true, true, false, false, true),
+            true,
+        )
+        .expect_err("explicit sixel must not silently choose Kitty");
+
+        assert!(error.contains("requested graphics backend 'sixel' is unavailable"));
+        assert!(error.contains("--graphics auto"));
+        assert!(error.contains("--graphics text"));
+    }
+
+    #[test]
+    fn explicit_backend_is_honored_for_plain_documents() {
+        let selection = select_graphics_backend(
+            GraphicsPreference::Kitty,
+            evidence(true, true, false, false, false),
+            false,
+        )
+        .expect("an available explicit backend should be honored");
+
+        assert_eq!(selection.backend, GraphicsBackendKind::Kitty);
+    }
+
+    #[test]
+    fn unavailable_explicit_backend_is_rejected_for_plain_documents() {
+        let error = select_graphics_backend(
+            GraphicsPreference::Kitty,
+            evidence(true, false, false, false, false),
+            false,
+        )
+        .expect_err("plain content must not bypass explicit availability checks");
+
+        assert!(error.contains("requested graphics backend 'kitty' is unavailable"));
+    }
 
     fn asset(hash: u8, width: u32, height: u32) -> Arc<RasterAsset> {
         let key = RasterAssetKey {
