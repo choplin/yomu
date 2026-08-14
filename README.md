@@ -55,9 +55,19 @@ To use the same monospace or Nerd Font as the terminal, create
 `XDG_CONFIG_HOME` is unset):
 
 ```toml
+[view]
+max_width = 100
+
 [heading]
 families = ["JetBrainsMono Nerd Font Mono"]
 ```
+
+The document body defaults to at most 100 terminal cells and is centered when
+the terminal is wider. Set `view.max_width` to another positive cell count to
+choose a different cap, or to `0` to use the full terminal width. Narrower
+terminals always use all available columns. The header and footer remain at
+terminal width. Invalid values, including negative numbers and non-integers,
+cause config loading to fail with a parse error.
 
 Installed font families are tried in order, followed by the embedded Noto Sans
 JP fallback. Unavailable families are skipped unless none of the configured

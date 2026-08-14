@@ -14,8 +14,9 @@ pub(crate) fn render(
     app: &App,
     layout: &Layout,
     graphics_status: &str,
+    max_width: Option<u16>,
 ) {
-    let [header, body, footer] = viewport_areas(frame.area());
+    let [header, body, footer] = viewport_areas(frame.area(), max_width);
 
     let title = format!(" raden — {}", path.display());
     frame.render_widget(
@@ -63,13 +64,20 @@ pub(crate) fn render(
     );
 }
 
-pub(crate) fn viewport_areas(area: Rect) -> [Rect; 3] {
-    TuiLayout::vertical([
+pub(crate) fn viewport_areas(area: Rect, max_width: Option<u16>) -> [Rect; 3] {
+    let [header, mut body, footer] = TuiLayout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
-    .areas(area)
+    .areas(area);
+    if let Some(max_width) = max_width
+        && body.width > max_width
+    {
+        body.x = body.x.saturating_add((body.width - max_width) / 2);
+        body.width = max_width;
+    }
+    [header, body, footer]
 }
 
 fn row_line(row: &crate::LayoutRow) -> Line<'static> {
@@ -106,4 +114,27 @@ fn tui_style(source: TextStyle) -> Style {
         style = style.fg(Color::DarkGray);
     }
     style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_is_centered_at_the_configured_width() {
+        let [header, body, footer] = viewport_areas(Rect::new(0, 0, 140, 24), Some(100));
+
+        assert_eq!(body, Rect::new(20, 1, 100, 22));
+        assert_eq!(header, Rect::new(0, 0, 140, 1));
+        assert_eq!(footer, Rect::new(0, 23, 140, 1));
+    }
+
+    #[test]
+    fn narrow_and_unbounded_bodies_use_the_available_width() {
+        let [_, narrow, _] = viewport_areas(Rect::new(0, 0, 72, 12), Some(100));
+        let [_, unbounded, _] = viewport_areas(Rect::new(0, 0, 140, 12), None);
+
+        assert_eq!(narrow, Rect::new(0, 1, 72, 10));
+        assert_eq!(unbounded, Rect::new(0, 1, 140, 10));
+    }
 }

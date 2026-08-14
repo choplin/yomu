@@ -1323,7 +1323,7 @@ mod tests {
             layout.row_for_source(image_source.start),
             0,
             CellRect {
-                x: 0,
+                x: 7,
                 y: 1,
                 width: 10,
                 height: 10,
@@ -1334,6 +1334,8 @@ mod tests {
 
         assert_eq!(graphic_row.source, image_source);
         assert_eq!(frame.placements[0].source, image_source);
+        assert_eq!(frame.placements[0].target.x, 7);
+        assert_eq!(frame.placements[0].clip.x, 7);
         let clipped = layout.desired_frame(
             graphic_index,
             1,

@@ -11,14 +11,32 @@ use crate::GraphicsPreference;
 
 const APP_DIRECTORY: &str = "raden";
 const CONFIG_FILE: &str = "config.toml";
+const DEFAULT_MAX_WIDTH: u16 = 100;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     #[serde(default)]
+    view: ViewConfig,
+    #[serde(default)]
     heading: HeadingConfig,
     #[serde(default)]
     graphics: GraphicsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ViewConfig {
+    #[serde(default = "default_max_width")]
+    max_width: u16,
+}
+
+impl Default for ViewConfig {
+    fn default() -> Self {
+        Self {
+            max_width: default_max_width(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -63,6 +81,10 @@ impl Config {
         &self.heading.families
     }
 
+    pub(crate) fn body_max_width(&self) -> Option<u16> {
+        (self.view.max_width > 0).then_some(self.view.max_width)
+    }
+
     pub(crate) fn graphics_preference(&self) -> GraphicsPreference {
         match self.graphics.backend {
             Some(backend) => backend,
@@ -70,6 +92,10 @@ impl Config {
             None => GraphicsPreference::Auto,
         }
     }
+}
+
+const fn default_max_width() -> u16 {
+    DEFAULT_MAX_WIDTH
 }
 
 fn config_path(
@@ -127,6 +153,32 @@ mod tests {
             config.heading_families(),
             &["UDEV Gothic NF", "HackGen35 Console NF"]
         );
+    }
+
+    #[test]
+    fn view_width_defaults_to_one_hundred_cells() {
+        let config = toml::from_str::<Config>("").expect("empty config should parse");
+
+        assert_eq!(config.body_max_width(), Some(100));
+    }
+
+    #[test]
+    fn view_width_accepts_custom_and_unbounded_values() {
+        let custom = toml::from_str::<Config>("[view]\nmax_width = 72\n")
+            .expect("custom view width should parse");
+        let unbounded = toml::from_str::<Config>("[view]\nmax_width = 0\n")
+            .expect("unbounded view width should parse");
+
+        assert_eq!(custom.body_max_width(), Some(72));
+        assert_eq!(unbounded.body_max_width(), None);
+    }
+
+    #[test]
+    fn invalid_view_width_is_rejected() {
+        let error = toml::from_str::<Config>("[view]\nmax_width = -1\n")
+            .expect_err("negative view width should be rejected");
+
+        assert!(error.to_string().contains("max_width"));
     }
 
     #[test]

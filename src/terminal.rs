@@ -83,8 +83,11 @@ pub(crate) fn run(
         document,
         heading_fonts,
         backend,
-        evidence.cell_pixels,
-        initial_diagnostic,
+        RunLoopOptions {
+            queried_cell_pixels: evidence.cell_pixels,
+            initial_diagnostic,
+            max_width: config.body_max_width(),
+        },
     );
     let restore_result = session.restore();
     combine_run_and_restore(run_result, restore_result)
@@ -115,9 +118,13 @@ fn run_loop(
     document: &Document,
     heading_fonts: HeadingFonts,
     backend: GraphicsBackendKind,
-    queried_cell_pixels: Option<PixelSize>,
-    initial_diagnostic: Option<String>,
+    options: RunLoopOptions,
 ) -> Result<()> {
+    let RunLoopOptions {
+        queried_cell_pixels,
+        initial_diagnostic,
+        max_width,
+    } = options;
     let mut graphics = GraphicsMode::from_kind(backend);
     let images = ImageCatalog::load(document, path);
     let diagnostic_count = images.diagnostics().len();
@@ -131,6 +138,7 @@ fn run_loop(
         diagnostic_count,
         queried_cell_pixels,
         initial_diagnostic,
+        max_width,
     };
     let run_result = drive_loop(terminal, context, &mut logical_renderer, &mut graphics);
     drop(logical_renderer);
@@ -141,6 +149,12 @@ fn run_loop(
         )
     });
     combine_run_and_graphics_cleanup(run_result, clear_result)
+}
+
+struct RunLoopOptions {
+    queried_cell_pixels: Option<PixelSize>,
+    initial_diagnostic: Option<String>,
+    max_width: Option<u16>,
 }
 
 fn needs_graphics(document: &Document) -> bool {
@@ -157,6 +171,7 @@ struct DriveContext<'a> {
     diagnostic_count: usize,
     queried_cell_pixels: Option<PixelSize>,
     initial_diagnostic: Option<String>,
+    max_width: Option<u16>,
 }
 
 fn drive_loop(
@@ -172,18 +187,24 @@ fn drive_loop(
         diagnostic_count,
         queried_cell_pixels,
         initial_diagnostic,
+        max_width,
     } = context;
     let mut app = App::default();
     let mut generation = 1u64;
     let mut graphics_diagnostic = initial_diagnostic;
     let initial_size = terminal.size().context("could not read terminal size")?;
-    let mut layout = Layout::with_text(document, initial_size.width, images);
+    let [_, initial_body, _] = ui::viewport_areas(
+        Rect::new(0, 0, initial_size.width, initial_size.height),
+        max_width,
+    );
+    let mut layout = Layout::with_text(document, initial_body.width, images);
     submit_logical_render(
         logical_renderer,
         generation,
         &app,
         initial_size,
         queried_cell_pixels,
+        max_width,
     );
     let mut dirty = true;
     let mut pending_frame = None;
@@ -218,22 +239,19 @@ fn drive_loop(
             }
             let graphics_status = graphics.status(graphics_diagnostic.as_deref(), diagnostic_count);
             terminal
-                .draw(|frame| ui::render(frame, path, &app, &layout, &graphics_status))
+                .draw(|frame| ui::render(frame, path, &app, &layout, &graphics_status, max_width))
                 .context("could not draw the Markdown document")?;
             dirty = false;
             if let Some(frame) = pending_frame.take() {
                 let backend_name = graphics.name();
                 let render_error = graphics.render(&frame, &mut io::stdout()).err();
                 if let Some(error) = render_error {
-                    let size = terminal
-                        .size()
-                        .context("could not read terminal size after graphics failure")?;
                     let failure = GraphicsFailureContext {
                         path,
                         app: &mut app,
                         document,
                         images,
-                        width: size.width,
+                        max_width,
                         diagnostic_count,
                         backend_name,
                         render_error: &error,
@@ -258,7 +276,15 @@ fn drive_loop(
             continue;
         }
         let size = terminal.size().context("could not read terminal size")?;
-        let batch = apply_input_batch(&mut app, &mut layout, document, images, size, events);
+        let batch = apply_input_batch(
+            &mut app,
+            &mut layout,
+            document,
+            images,
+            size,
+            events,
+            max_width,
+        );
         if app.should_quit() || !batch.changed {
             continue;
         }
@@ -269,7 +295,7 @@ fn drive_loop(
         }
         generation = generation.saturating_add(1);
         let size = batch.size;
-        let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height));
+        let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height), max_width);
         pending_frame = frame_before_logical_render(
             batch.resized,
             &app,
@@ -284,6 +310,7 @@ fn drive_loop(
             &app,
             size,
             queried_cell_pixels,
+            max_width,
         );
         dirty = true;
     }
@@ -332,6 +359,7 @@ fn apply_input_batch(
     images: &ImageCatalog,
     mut size: ratatui::layout::Size,
     events: impl IntoIterator<Item = Event>,
+    max_width: Option<u16>,
 ) -> InputBatchResult {
     let mut result = InputBatchResult {
         size,
@@ -345,7 +373,8 @@ fn apply_input_batch(
                 if command == Command::None {
                     continue;
                 }
-                let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height));
+                let [_, body, _] =
+                    ui::viewport_areas(Rect::new(0, 0, size.width, size.height), max_width);
                 app.apply(command, layout, body.height);
                 result.changed = true;
                 if app.should_quit() {
@@ -354,8 +383,8 @@ fn apply_input_batch(
             }
             Event::Resize(width, height) => {
                 size = ratatui::layout::Size { width, height };
-                *layout = Layout::with_text(document, width, images);
-                let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, width, height));
+                let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, width, height), max_width);
+                *layout = Layout::with_text(document, body.width, images);
                 app.clamp_viewport(layout, body.height);
                 result.size = size;
                 result.changed = true;
@@ -372,7 +401,7 @@ struct GraphicsFailureContext<'a> {
     app: &'a mut App,
     document: &'a Document,
     images: &'a ImageCatalog,
-    width: u16,
+    max_width: Option<u16>,
     diagnostic_count: usize,
     backend_name: &'static str,
     render_error: &'a io::Error,
@@ -388,11 +417,12 @@ fn handle_graphics_failure<B: Backend>(
     let cleanup_error = graphics.clear(writer).err();
     *graphics = GraphicsMode::Text;
     *logical_renderer = None;
-    let layout = Layout::with_text(context.document, context.width, context.images);
     let size = terminal
         .size()
         .map_err(|error| anyhow!("could not read terminal size for text fallback: {error}"))?;
-    let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height));
+    let [_, body, _] =
+        ui::viewport_areas(Rect::new(0, 0, size.width, size.height), context.max_width);
+    let layout = Layout::with_text(context.document, body.width, context.images);
     context.app.clamp_viewport(&layout, body.height);
     let diagnostic = graphics_failure_diagnostic(
         context.backend_name,
@@ -404,7 +434,16 @@ fn handle_graphics_failure<B: Backend>(
         .map_err(|error| anyhow!("could not clear before text fallback: {error}"))?;
     let status = graphics.status(Some(&diagnostic), context.diagnostic_count);
     terminal
-        .draw(|frame| ui::render(frame, context.path, context.app, &layout, &status))
+        .draw(|frame| {
+            ui::render(
+                frame,
+                context.path,
+                context.app,
+                &layout,
+                &status,
+                context.max_width,
+            )
+        })
         .map_err(|error| anyhow!("could not redraw text fallback: {error}"))?;
     Ok(TextFallback { layout, diagnostic })
 }
@@ -421,14 +460,14 @@ fn submit_logical_render(
     app: &App,
     size: ratatui::layout::Size,
     queried_cell_pixels: Option<PixelSize>,
+    max_width: Option<u16>,
 ) {
     let Some(renderer) = renderer else { return };
-    let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height));
+    let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height), max_width);
     renderer.submit(RenderRequest {
         generation,
         top_source: app.top_source(),
         top_row_offset: app.top_row_offset(),
-        size,
         body: CellRect::from(body),
         cell_pixels: cell_pixel_size(size.width, size.height, queried_cell_pixels),
     });
@@ -439,7 +478,6 @@ struct RenderRequest {
     generation: u64,
     top_source: usize,
     top_row_offset: u16,
-    size: ratatui::layout::Size,
     body: CellRect,
     cell_pixels: PixelSize,
 }
@@ -498,7 +536,7 @@ impl LogicalRenderer {
                 };
                 let layout = Layout::with_graphics(
                     &document,
-                    request.size.width,
+                    request.body.width,
                     request.body.height,
                     &images,
                     &mut cache,
@@ -916,10 +954,6 @@ mod tests {
             generation,
             top_source: generation as usize,
             top_row_offset: 0,
-            size: ratatui::layout::Size {
-                width: 80,
-                height: 24,
-            },
             body: CellRect {
                 x: 0,
                 y: 1,
@@ -970,6 +1004,7 @@ mod tests {
             &images,
             size,
             events,
+            None,
         );
         let mut sequential = App::default();
         for _ in 0..20 {
@@ -1001,8 +1036,10 @@ mod tests {
         };
         let mut layout = Layout::with_text(&document, initial_size.width, &images);
         let mut app = App::default();
-        let [_, initial_body, _] =
-            ui::viewport_areas(Rect::new(0, 0, initial_size.width, initial_size.height));
+        let [_, initial_body, _] = ui::viewport_areas(
+            Rect::new(0, 0, initial_size.width, initial_size.height),
+            None,
+        );
         app.apply(Command::End, &layout, initial_body.height);
 
         let resized = apply_input_batch(
@@ -1012,12 +1049,54 @@ mod tests {
             &images,
             initial_size,
             [Event::Resize(80, 12)],
+            None,
         );
-        let [_, resized_body, _] =
-            ui::viewport_areas(Rect::new(0, 0, resized.size.width, resized.size.height));
+        let [_, resized_body, _] = ui::viewport_areas(
+            Rect::new(0, 0, resized.size.width, resized.size.height),
+            None,
+        );
 
         assert!(resized.resized);
         assert_eq!(app.viewport_percent(&layout, resized_body.height), 100);
+    }
+
+    #[test]
+    fn resize_reflows_to_the_centered_body_width() {
+        let source = (0..30)
+            .map(|index| format!("paragraph {index} keeps its source anchor while resizing\n\n"))
+            .collect::<String>();
+        let document = Document::parse(source);
+        let images = ImageCatalog::load(&document, Path::new("doc.md"));
+        let initial_size = ratatui::layout::Size {
+            width: 80,
+            height: 12,
+        };
+        let mut layout = Layout::with_text(&document, initial_size.width, &images);
+        let mut app = App::default();
+        app.apply(Command::Down, &layout, 10);
+        let source_anchor = app.top_source();
+
+        let resized = apply_input_batch(
+            &mut app,
+            &mut layout,
+            &document,
+            &images,
+            initial_size,
+            [Event::Resize(140, 16)],
+            Some(100),
+        );
+        let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, 140, 16), Some(100));
+
+        assert!(resized.resized);
+        assert_eq!(body, Rect::new(20, 1, 100, 14));
+        assert_eq!(layout.width(), 100);
+        assert_eq!(app.top_source(), source_anchor);
+        assert_eq!(
+            layout.rows()[layout.row_for_source(source_anchor)]
+                .source
+                .start,
+            source_anchor
+        );
     }
 
     #[test]
@@ -1041,7 +1120,7 @@ mod tests {
                 app: &mut app,
                 document: &document,
                 images: &images,
-                width: 80,
+                max_width: None,
                 diagnostic_count: 0,
                 backend_name: "kitty",
                 render_error: &render_error,
@@ -1096,7 +1175,7 @@ mod tests {
                 app: &mut app,
                 document: &document,
                 images: &images,
-                width: 24,
+                max_width: None,
                 diagnostic_count: 0,
                 backend_name: "sixel",
                 render_error: &render_error,
