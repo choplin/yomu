@@ -9,3 +9,10 @@ eval = "${CARGO_HOME:-$HOME/.cargo}"
 [[env]]
 name = "PATH"
 prefix = "${CARGO_HOME}/bin"
+
+[[commands]]
+name = "install-local"
+help = "Install the local raden release binary into Cargo's bin directory"
+command = '''
+cargo install --path "$PRJ_ROOT" --locked --force
+'''
