@@ -194,7 +194,19 @@ fn drive_loop(
             && prepared.generation == generation
         {
             layout = prepared.layout;
-            pending_frame = Some(prepared.frame);
+            app.clamp_viewport(&layout, prepared.body.height);
+            let position = app.viewport_position(&layout);
+            pending_frame = Some(if position == prepared.position {
+                prepared.frame
+            } else {
+                layout.desired_frame(
+                    position.0,
+                    position.1,
+                    prepared.body,
+                    generation,
+                    prepared.cell_pixels,
+                )
+            });
             dirty = true;
         }
 
@@ -218,7 +230,7 @@ fn drive_loop(
                         .context("could not read terminal size after graphics failure")?;
                     let failure = GraphicsFailureContext {
                         path,
-                        app: &app,
+                        app: &mut app,
                         document,
                         images,
                         width: size.width,
@@ -343,6 +355,8 @@ fn apply_input_batch(
             Event::Resize(width, height) => {
                 size = ratatui::layout::Size { width, height };
                 *layout = Layout::with_text(document, width, images);
+                let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, width, height));
+                app.clamp_viewport(layout, body.height);
                 result.size = size;
                 result.changed = true;
                 result.resized = true;
@@ -355,7 +369,7 @@ fn apply_input_batch(
 
 struct GraphicsFailureContext<'a> {
     path: &'a Path,
-    app: &'a App,
+    app: &'a mut App,
     document: &'a Document,
     images: &'a ImageCatalog,
     width: u16,
@@ -375,6 +389,11 @@ fn handle_graphics_failure<B: Backend>(
     *graphics = GraphicsMode::Text;
     *logical_renderer = None;
     let layout = Layout::with_text(context.document, context.width, context.images);
+    let size = terminal
+        .size()
+        .map_err(|error| anyhow!("could not read terminal size for text fallback: {error}"))?;
+    let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height));
+    context.app.clamp_viewport(&layout, body.height);
     let diagnostic = graphics_failure_diagnostic(
         context.backend_name,
         context.render_error,
@@ -430,6 +449,9 @@ struct PreparedRender {
     generation: u64,
     layout: Layout,
     frame: DesiredFrame,
+    position: (usize, u16),
+    body: CellRect,
+    cell_pixels: PixelSize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -484,9 +506,15 @@ impl LogicalRenderer {
                     request.top_source,
                 );
                 let first = layout.row_for_source(request.top_source);
-                let frame = layout.desired_frame(
+                let position = (
                     first,
-                    request.top_row_offset,
+                    request
+                        .top_row_offset
+                        .min(layout.rows()[first].height.saturating_sub(1)),
+                );
+                let frame = layout.desired_frame(
+                    position.0,
+                    position.1,
                     request.body,
                     request.generation,
                     request.cell_pixels,
@@ -504,6 +532,9 @@ impl LogicalRenderer {
                         generation: request.generation,
                         layout,
                         frame,
+                        position,
+                        body: request.body,
+                        cell_pixels: request.cell_pixels,
                     });
                 }
             }
@@ -958,13 +989,45 @@ mod tests {
     }
 
     #[test]
+    fn resize_input_reclamps_the_last_viewport_after_reflow() {
+        let source = (0..40)
+            .map(|index| format!("paragraph {index} wraps at the narrow width\n\n"))
+            .collect::<String>();
+        let document = Document::parse(source);
+        let images = ImageCatalog::load(&document, Path::new("doc.md"));
+        let initial_size = ratatui::layout::Size {
+            width: 20,
+            height: 8,
+        };
+        let mut layout = Layout::with_text(&document, initial_size.width, &images);
+        let mut app = App::default();
+        let [_, initial_body, _] =
+            ui::viewport_areas(Rect::new(0, 0, initial_size.width, initial_size.height));
+        app.apply(Command::End, &layout, initial_body.height);
+
+        let resized = apply_input_batch(
+            &mut app,
+            &mut layout,
+            &document,
+            &images,
+            initial_size,
+            [Event::Resize(80, 12)],
+        );
+        let [_, resized_body, _] =
+            ui::viewport_areas(Rect::new(0, 0, resized.size.width, resized.size.height));
+
+        assert!(resized.resized);
+        assert_eq!(app.viewport_percent(&layout, resized_body.height), 100);
+    }
+
+    #[test]
     fn graphics_failure_rebuilds_large_headings_as_text() {
         let document = Document::parse("# Readable heading\n".to_owned());
         let images = ImageCatalog::load(&document, Path::new("doc.md"));
         let mut graphics = GraphicsMode::Kitty(KittyBackend::new());
         let mut renderer = None;
         let mut cleanup = Vec::new();
-        let app = App::default();
+        let mut app = App::default();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24))
             .expect("test terminal should be created");
         let render_error = io::Error::other("render broke");
@@ -975,7 +1038,7 @@ mod tests {
             &mut cleanup,
             GraphicsFailureContext {
                 path: Path::new("doc.md"),
-                app: &app,
+                app: &mut app,
                 document: &document,
                 images: &images,
                 width: 80,
@@ -1030,7 +1093,7 @@ mod tests {
             &mut cleanup,
             GraphicsFailureContext {
                 path: Path::new("doc.md"),
-                app: &app,
+                app: &mut app,
                 document: &document,
                 images: &images,
                 width: 24,

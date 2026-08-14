@@ -62,6 +62,18 @@ impl App {
     }
 
     #[must_use]
+    pub(crate) fn viewport_percent(&self, layout: &Layout, viewport_height: u16) -> usize {
+        let rows = layout.rows();
+        let (row, offset) = self.viewport_position(layout);
+        let maximum = maximum_scroll_cell(rows, viewport_height);
+        cell_position(rows, row, offset)
+            .min(maximum)
+            .saturating_mul(100)
+            .checked_div(maximum)
+            .unwrap_or(100)
+    }
+
+    #[must_use]
     pub fn should_quit(&self) -> bool {
         self.quit
     }
@@ -84,18 +96,73 @@ impl App {
             Command::PageUp => move_up_cells(rows, current, offset, page),
             Command::PageDown => move_down_cells(rows, current, offset, page),
             Command::Home => (0, 0),
-            Command::End => (last, 0),
+            Command::End => (last, rows[last].height.saturating_sub(1)),
             Command::Quit => {
                 self.quit = true;
                 return;
             }
         };
-        if let Some(row) = rows.get(target) {
+        self.set_position(
+            rows,
+            clamp_position(rows, target, target_offset, viewport_height),
+        );
+    }
+
+    pub(crate) fn clamp_viewport(&mut self, layout: &Layout, viewport_height: u16) {
+        let rows = layout.rows();
+        let (row, offset) = self.viewport_position(layout);
+        self.set_position(rows, clamp_position(rows, row, offset, viewport_height));
+    }
+
+    fn set_position(&mut self, rows: &[crate::LayoutRow], (row, offset): (usize, u16)) {
+        if let Some(row) = rows.get(row) {
             self.top_source = row.source.start;
             self.top_source_end = row.source.end;
-            self.top_row_offset = target_offset;
+            self.top_row_offset = offset;
         }
     }
+}
+
+fn clamp_position(
+    rows: &[crate::LayoutRow],
+    row: usize,
+    offset: u16,
+    viewport_height: u16,
+) -> (usize, u16) {
+    let requested = cell_position(rows, row, offset);
+    position_for_cell(
+        rows,
+        requested.min(maximum_scroll_cell(rows, viewport_height)),
+    )
+}
+
+fn maximum_scroll_cell(rows: &[crate::LayoutRow], viewport_height: u16) -> usize {
+    rows.iter()
+        .fold(0usize, |height, row| {
+            height.saturating_add(usize::from(row.height))
+        })
+        .saturating_sub(usize::from(viewport_height.max(1)))
+}
+
+fn cell_position(rows: &[crate::LayoutRow], row: usize, offset: u16) -> usize {
+    rows.iter()
+        .take(row)
+        .fold(0usize, |position, row| {
+            position.saturating_add(usize::from(row.height))
+        })
+        .saturating_add(usize::from(offset))
+}
+
+fn position_for_cell(rows: &[crate::LayoutRow], mut cell: usize) -> (usize, u16) {
+    for (row_index, row) in rows.iter().enumerate() {
+        let height = usize::from(row.height);
+        if cell < height {
+            return (row_index, cell as u16);
+        }
+        cell = cell.saturating_sub(height);
+    }
+    let last = rows.len().saturating_sub(1);
+    (last, rows[last].height.saturating_sub(1))
 }
 
 fn move_down_cells(
@@ -150,6 +217,78 @@ mod tests {
 
     use super::*;
 
+    fn remaining_cells(layout: &Layout, (row, offset): (usize, u16)) -> usize {
+        usize::from(layout.rows()[row].height.saturating_sub(offset))
+            + layout
+                .rows()
+                .iter()
+                .skip(row + 1)
+                .map(|row| usize::from(row.height))
+                .sum::<usize>()
+    }
+
+    fn viewport_contains_source(
+        layout: &Layout,
+        position: (usize, u16),
+        viewport_height: u16,
+        source: usize,
+    ) -> bool {
+        let (first, offset) = position;
+        let target = layout.row_for_source(source);
+        if target < first {
+            return false;
+        }
+        let cells_before_target = usize::from(layout.rows()[first].height.saturating_sub(offset))
+            + layout
+                .rows()
+                .iter()
+                .skip(first + 1)
+                .take(target.saturating_sub(first + 1))
+                .map(|row| usize::from(row.height))
+                .sum::<usize>();
+        target == first || cells_before_target < usize::from(viewport_height)
+    }
+
+    #[test]
+    fn short_document_never_scrolls_beyond_its_initial_viewport() {
+        let document = Document::parse("short document".to_owned());
+        let layout = Layout::new(&document, 80);
+        let mut app = App::default();
+
+        for command in [Command::Down, Command::PageDown, Command::End] {
+            app.apply(command, &layout, 10);
+        }
+
+        assert_eq!(app.viewport_position(&layout), (0, 0));
+        assert_eq!(app.viewport_percent(&layout, 10), 100);
+    }
+
+    #[test]
+    fn down_and_page_down_stop_at_the_same_last_useful_viewport() {
+        let source = (0..12)
+            .map(|index| format!("paragraph {index}\n\n"))
+            .collect::<String>();
+        let document = Document::parse(source);
+        let layout = Layout::new(&document, 80);
+        let mut row_scrolling = App::default();
+        let mut page_scrolling = App::default();
+
+        for _ in 0..100 {
+            row_scrolling.apply(Command::Down, &layout, 4);
+            page_scrolling.apply(Command::PageDown, &layout, 4);
+        }
+
+        assert_eq!(
+            row_scrolling.viewport_position(&layout),
+            page_scrolling.viewport_position(&layout)
+        );
+        assert_eq!(
+            remaining_cells(&layout, row_scrolling.viewport_position(&layout)),
+            4
+        );
+        assert_eq!(row_scrolling.viewport_percent(&layout, 4), 100);
+    }
+
     #[test]
     fn navigation_tracks_source_instead_of_row_number() {
         let document = Document::parse("one two three four five six seven eight".to_owned());
@@ -200,16 +339,27 @@ mod tests {
             .expect("fixture should contain a four-cell image row");
         let mut app = App::default();
         while app.viewport_position(&layout).0 < graphic_row {
-            app.apply(Command::Down, &layout, 10);
+            app.apply(Command::Down, &layout, 2);
         }
 
         assert_eq!(app.viewport_position(&layout), (graphic_row, 0));
-        app.apply(Command::Down, &layout, 10);
+        app.apply(Command::Down, &layout, 2);
         assert_eq!(app.viewport_position(&layout), (graphic_row, 1));
-        app.apply(Command::Down, &layout, 10);
+        app.apply(Command::Down, &layout, 2);
         assert_eq!(app.viewport_position(&layout), (graphic_row, 2));
-        app.apply(Command::Up, &layout, 10);
+        app.apply(Command::Up, &layout, 2);
         assert_eq!(app.viewport_position(&layout), (graphic_row, 1));
+
+        let mut page_app = App::default();
+        for _ in 0..32 {
+            app.apply(Command::Down, &layout, 2);
+            page_app.apply(Command::PageDown, &layout, 2);
+        }
+        assert_eq!(
+            app.viewport_position(&layout),
+            page_app.viewport_position(&layout)
+        );
+        assert_eq!(remaining_cells(&layout, app.viewport_position(&layout)), 2);
 
         fs::remove_file(image_path).expect("fixture should be removable");
         fs::remove_dir(root).expect("fixture directory should be removable");
@@ -249,7 +399,7 @@ mod tests {
         let mut app = App::default();
 
         for _ in 0..32 {
-            app.apply(Command::Down, &layout, 10);
+            app.apply(Command::Down, &layout, 2);
         }
 
         fs::remove_file(image_path).expect("fixture should be removable");
@@ -294,14 +444,14 @@ mod tests {
                 cell,
                 app.top_source(),
             );
-            if app.top_source() >= target {
+            if viewport_contains_source(&layout, app.viewport_position(&layout), 22, target) {
                 break;
             }
         }
 
         assert!(
-            app.top_source() >= target,
-            "navigation stopped at source {} before checkpoint {target}; nearby rows: {:?}",
+            viewport_contains_source(&layout, app.viewport_position(&layout), 22, target),
+            "navigation stopped at source {} before checkpoint {target} became visible; nearby rows: {:?}",
             app.top_source(),
             layout
                 .rows()
@@ -348,6 +498,26 @@ mod tests {
             0,
             "upward navigation stopped before the start of the showcase"
         );
+    }
+
+    #[test]
+    fn resizing_near_the_end_reclamps_to_a_valid_source_anchored_position() {
+        let source = (0..20)
+            .map(|index| format!("wrapped paragraph number {index}\n\n"))
+            .collect::<String>();
+        let document = Document::parse(source);
+        let narrow = Layout::new(&document, 12);
+        let wide = Layout::new(&document, 40);
+        let mut app = App::default();
+        app.apply(Command::End, &narrow, 4);
+
+        app.clamp_viewport(&wide, 8);
+
+        let (row, offset) = app.viewport_position(&wide);
+        assert_eq!(app.top_source, wide.rows()[row].source.start);
+        assert_eq!(app.top_source_end, wide.rows()[row].source.end);
+        assert!(offset < wide.rows()[row].height);
+        assert_eq!(remaining_cells(&wide, (row, offset)), 8);
     }
 
     #[test]

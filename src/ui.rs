@@ -52,8 +52,7 @@ pub(crate) fn render(
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), body);
 
-    let total = layout.rows().len().max(1);
-    let percent = first.saturating_mul(100) / total.saturating_sub(1).max(1);
+    let percent = app.viewport_percent(layout, body.height);
     let status = format!(
         " j/k scroll  Ctrl-d/u page  g/G ends  q quit  {graphics_status}{:>5}% ",
         percent,
