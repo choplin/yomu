@@ -23,7 +23,7 @@ const MAX_TABLE_COLUMNS: usize = 32;
 const MAX_TABLE_CELLS: usize = 2_048;
 const MAX_TABLE_RASTER_ROWS: u32 = 256;
 const MAX_TABLE_RASTER_BYTES: u64 = 128 * 1024 * 1024;
-const TABLE_RASTERIZER_VERSION: u16 = 9;
+const TABLE_RASTERIZER_VERSION: u16 = 10;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TablePlan {
@@ -205,9 +205,10 @@ impl TablePlan {
         self.columns = cells_for(width, cell_pixels.width);
         Ok((
             self,
-            RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).ok_or_else(
-                || "table raster byte length did not match its dimensions".to_owned(),
-            )?,
+            RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixmap.take_demultiplied())
+                .ok_or_else(|| {
+                    "table raster byte length did not match its dimensions".to_owned()
+                })?,
         ))
     }
 }
