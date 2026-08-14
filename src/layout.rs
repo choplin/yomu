@@ -8,14 +8,15 @@ use crate::document::{Document, Segment};
 use crate::image::{ImageCatalog, MAX_IMAGE_ROWS};
 use crate::scene::GraphicSourceRegion;
 use crate::{
-    CellRect, DesiredFrame, ElementKey, GraphicPlacement, PixelSize, RasterAsset, RasterCache,
-    SourceSpan, TextStyle,
+    CellRect, DesiredFrame, ElementKey, GraphicPlacement, MathForm, PixelSize, RasterAsset,
+    RasterCache, SourceSpan, TextStyle,
 };
 
 const MAX_RASTERIZED_HEADINGS: usize = 8;
 const MAX_LAYOUT_HEADING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RASTERIZED_TABLES: usize = 4;
 const MAX_LAYOUT_TABLE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LAYOUT_MATH_BYTES: usize = 32 * 1024 * 1024;
 
 /// A displayed text fragment that retains its original source identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,7 +32,7 @@ pub struct LayoutRow {
     pub fragments: Vec<LayoutFragment>,
     pub source: SourceSpan,
     pub height: u16,
-    graphic: Option<usize>,
+    graphics: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +43,7 @@ struct LayoutGraphic {
     rows: u16,
     asset: Arc<RasterAsset>,
     source_regions: Vec<GraphicSourceRegion>,
+    column: u16,
 }
 
 /// Width-dependent terminal layout derived from a source-ranged document.
@@ -113,6 +115,7 @@ impl Layout {
             .unwrap_or_default();
         let mut heading_bytes = 0usize;
         let mut table_bytes = 0usize;
+        let mut math_bytes = 0usize;
         for segment in &document.segments {
             match segment {
                 Segment::Text {
@@ -289,6 +292,76 @@ impl Layout {
                         builder.table_text(table, raster_error.as_deref());
                     }
                 }
+                Segment::Math { index } => {
+                    let Some(math) = document.math().get(*index) else {
+                        continue;
+                    };
+                    let mut raster_error = None;
+                    let available_columns = width;
+                    let rendered = match graphics.as_mut() {
+                        Some((cache, cell_pixels, available_rows, _)) => {
+                            match cache.rasterize_math(
+                                *index,
+                                math,
+                                u16::try_from(available_columns).unwrap_or(u16::MAX),
+                                *available_rows,
+                                *cell_pixels,
+                            ) {
+                                Ok(rendered) => rendered,
+                                Err(error) => {
+                                    raster_error = Some(error);
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    let rendered = rendered.filter(|rendered| {
+                        let bytes = rendered.asset.rgba.len();
+                        if math_bytes.saturating_add(bytes) > MAX_LAYOUT_MATH_BYTES {
+                            raster_error = Some(format!(
+                                "math raster needs {bytes} bytes but the layout budget has {} of {MAX_LAYOUT_MATH_BYTES} bytes remaining",
+                                MAX_LAYOUT_MATH_BYTES.saturating_sub(math_bytes)
+                            ));
+                            false
+                        } else {
+                            math_bytes = math_bytes.saturating_add(bytes);
+                            true
+                        }
+                    });
+                    if let Some(rendered) = rendered {
+                        match math.form {
+                            MathForm::Inline => builder.inline_image(
+                                rendered.element_key,
+                                math.source.clone(),
+                                math.style,
+                                rendered.columns,
+                                rendered.rows,
+                                rendered.asset,
+                            ),
+                            MathForm::Display => builder.centered_image(
+                                rendered.element_key,
+                                math.source.clone(),
+                                rendered.columns,
+                                rendered.rows,
+                                rendered.asset,
+                            ),
+                        }
+                    } else {
+                        let projection = raster_error.map_or_else(
+                            || math.text_projection(),
+                            |error| {
+                                format!(
+                                    "{} [math raster unavailable: {error}]",
+                                    math.text_projection()
+                                )
+                            },
+                        );
+                        let mut style = math.style;
+                        style.code = true;
+                        builder.text(&projection, math.source.clone(), style, false);
+                    }
+                }
             }
         }
         builder.finish(document.source_len())
@@ -327,17 +400,26 @@ impl Layout {
                 0
             };
             let remaining_height = row.height.saturating_sub(row_offset);
-            if let Some(graphic) = row.graphic.and_then(|index| self.graphics.get(index)) {
-                let visible_height = remaining_height.min(bottom.saturating_sub(y));
-                let width = graphic.columns.min(body.width);
+            for graphic in row
+                .graphics
+                .iter()
+                .filter_map(|index| self.graphics.get(*index))
+            {
+                if row_offset >= graphic.rows {
+                    continue;
+                }
+                let graphic_remaining = graphic.rows.saturating_sub(row_offset);
+                let visible_height = graphic_remaining.min(bottom.saturating_sub(y));
+                let available_width = body.width.saturating_sub(graphic.column);
+                let width = graphic.columns.min(available_width);
                 let target = CellRect {
-                    x: body.x,
+                    x: body.x.saturating_add(graphic.column),
                     y,
                     width: graphic.columns,
                     height: graphic.rows,
                 };
                 let clip = CellRect {
-                    x: body.x,
+                    x: body.x.saturating_add(graphic.column),
                     y,
                     width,
                     height: visible_height,
@@ -418,6 +500,8 @@ struct Builder {
     current: Vec<LayoutFragment>,
     anchor: usize,
     graphics: Vec<LayoutGraphic>,
+    current_graphics: Vec<usize>,
+    current_height: u16,
 }
 
 impl Builder {
@@ -429,6 +513,8 @@ impl Builder {
             current: Vec::new(),
             anchor: 0,
             graphics: Vec::new(),
+            current_graphics: Vec::new(),
+            current_height: 1,
         }
     }
 
@@ -577,14 +663,81 @@ impl Builder {
             rows,
             asset,
             source_regions,
+            column: 0,
         });
         self.rows.push(LayoutRow {
             fragments: Vec::new(),
             source,
             height: rows,
-            graphic: Some(graphic),
+            graphics: vec![graphic],
         });
         self.cell_width = 0;
+    }
+
+    fn centered_image(
+        &mut self,
+        element_key: ElementKey,
+        source: SourceSpan,
+        columns: u16,
+        rows: u16,
+        asset: Arc<RasterAsset>,
+    ) {
+        if !self.current.is_empty() {
+            self.push_row(source.start);
+        }
+        let graphic = self.graphics.len();
+        let column =
+            u16::try_from(self.width.saturating_sub(usize::from(columns)) / 2).unwrap_or(u16::MAX);
+        self.graphics.push(LayoutGraphic {
+            element_key,
+            source: source.clone(),
+            columns,
+            rows,
+            asset,
+            source_regions: Vec::new(),
+            column,
+        });
+        self.rows.push(LayoutRow {
+            fragments: Vec::new(),
+            source,
+            height: rows,
+            graphics: vec![graphic],
+        });
+        self.cell_width = 0;
+    }
+
+    fn inline_image(
+        &mut self,
+        element_key: ElementKey,
+        source: SourceSpan,
+        style: TextStyle,
+        columns: u16,
+        rows: u16,
+        asset: Arc<RasterAsset>,
+    ) {
+        let columns_usize = usize::from(columns);
+        if self.cell_width > 0 && self.cell_width.saturating_add(columns_usize) > self.width {
+            self.push_row(source.start);
+        }
+        let column = u16::try_from(self.cell_width).unwrap_or(u16::MAX);
+        let graphic = self.graphics.len();
+        self.graphics.push(LayoutGraphic {
+            element_key,
+            source: source.clone(),
+            columns,
+            rows,
+            asset,
+            source_regions: Vec::new(),
+            column,
+        });
+        self.current_graphics.push(graphic);
+        self.current_height = self.current_height.max(rows);
+        self.current.push(LayoutFragment {
+            text: " ".repeat(columns_usize),
+            source,
+            style,
+        });
+        self.cell_width = self.cell_width.saturating_add(columns_usize);
     }
 
     fn table_text(&mut self, table: &crate::TableElement, raster_error: Option<&str>) {
@@ -623,10 +776,11 @@ impl Builder {
         self.rows.push(LayoutRow {
             fragments: std::mem::take(&mut self.current),
             source,
-            height: 1,
-            graphic: None,
+            height: self.current_height,
+            graphics: std::mem::take(&mut self.current_graphics),
         });
         self.cell_width = 0;
+        self.current_height = 1;
         self.anchor = fallback;
     }
 
@@ -639,7 +793,7 @@ impl Builder {
                 fragments: Vec::new(),
                 source: self.anchor..self.anchor,
                 height: 1,
-                graphic: None,
+                graphics: Vec::new(),
             });
         }
         Layout {
@@ -691,6 +845,170 @@ mod tests {
     use image::{ImageBuffer, Rgba};
 
     use super::*;
+
+    #[test]
+    fn inline_math_shares_its_logical_row_and_keeps_exact_source_targeting() {
+        let markdown = "before $x^2 + y^2$ after";
+        let document = Document::parse(markdown.to_owned());
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let mut cache = RasterCache::default();
+        let cell = PixelSize {
+            width: 8,
+            height: 16,
+        };
+        let layout = Layout::with_graphics(&document, 80, 20, &catalog, &mut cache, cell, 0);
+        let row = layout
+            .rows()
+            .iter()
+            .find(|row| !row.graphics.is_empty())
+            .expect("inline math should produce a graphic on a text row");
+        let text = row
+            .fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+        let frame = layout.desired_frame(
+            layout.row_for_source(document.math()[0].source.start),
+            0,
+            CellRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 20,
+            },
+            1,
+            cell,
+        );
+
+        assert!(text.starts_with("before "));
+        assert!(text.ends_with(" after"));
+        assert_eq!(frame.placements.len(), 1);
+        assert!(frame.placements[0].target.x > 0);
+        assert_eq!(frame.placements[0].source, document.math()[0].source);
+        assert_eq!(
+            frame.placements[0]
+                .source_at(frame.placements[0].target.x, frame.placements[0].target.y),
+            document.math()[0].source
+        );
+    }
+
+    #[test]
+    fn mixed_height_inline_graphics_clip_within_each_asset_when_scrolled() {
+        let cell = PixelSize {
+            width: 1,
+            height: 1,
+        };
+        let asset = |seed: u8, height: u32| {
+            let key = crate::RasterAssetKey {
+                content_hash: [seed; 32],
+                pixels: PixelSize { width: 2, height },
+                rasterizer_version: 1,
+            };
+            Arc::new(RasterAsset {
+                key,
+                rgba: Arc::from(vec![seed; 2 * height as usize * 4]),
+            })
+        };
+        let mut builder = Builder::new(20);
+        builder.inline_image(ElementKey(1), 0..3, TextStyle::default(), 2, 1, asset(1, 1));
+        builder.inline_image(ElementKey(2), 3..6, TextStyle::default(), 2, 2, asset(2, 2));
+        let layout = builder.finish(6);
+        let body = CellRect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 2,
+        };
+
+        let full = layout.desired_frame(0, 0, body, 1, cell);
+        assert_eq!(full.placements.len(), 2);
+        assert_eq!(full.placements[0].clip.height, 1);
+        assert_eq!(full.placements[1].clip.height, 2);
+
+        let scrolled = layout.desired_frame(0, 1, body, 2, cell);
+        assert_eq!(scrolled.placements.len(), 1);
+        assert_eq!(scrolled.placements[0].element_key, ElementKey(2));
+        assert_eq!(scrolled.placements[0].source_y, 1);
+        assert_eq!(scrolled.placements[0].clip.height, 1);
+    }
+
+    #[test]
+    fn display_math_is_centered_and_invalid_math_falls_back_to_source() {
+        let supported = Document::parse("$$\\frac{1}{3}$$".to_owned());
+        let catalog = ImageCatalog::load(&supported, std::path::Path::new("doc.md"));
+        let mut cache = RasterCache::default();
+        let cell = PixelSize {
+            width: 8,
+            height: 16,
+        };
+        let layout = Layout::with_graphics(&supported, 80, 20, &catalog, &mut cache, cell, 0);
+        let frame = layout.desired_frame(
+            0,
+            0,
+            CellRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 20,
+            },
+            1,
+            cell,
+        );
+        let placement = frame
+            .placements
+            .first()
+            .expect("display math should produce a placement");
+        assert_eq!(
+            placement.target.x,
+            (80_u16.saturating_sub(placement.target.width)) / 2
+        );
+
+        let invalid = Document::parse("before $\\unknowncommand{x}$ after".to_owned());
+        let invalid_catalog = ImageCatalog::load(&invalid, std::path::Path::new("doc.md"));
+        let invalid_layout =
+            Layout::with_graphics(&invalid, 80, 20, &invalid_catalog, &mut cache, cell, 0);
+        let projection = invalid_layout
+            .rows()
+            .iter()
+            .flat_map(|row| &row.fragments)
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+        assert!(projection.contains("$\\unknowncommand{x}$"));
+        assert!(projection.contains("math raster unavailable"));
+    }
+
+    #[test]
+    fn supported_math_is_not_silently_deferred_after_thirty_two_elements() {
+        let markdown = (0..33)
+            .map(|index| format!("$x_{{{index}}}$"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let document = Document::parse(markdown);
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let mut cache = RasterCache::default();
+        let layout = Layout::with_graphics(
+            &document,
+            80,
+            20,
+            &catalog,
+            &mut cache,
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            0,
+        );
+
+        assert_eq!(document.math().len(), 33);
+        assert_eq!(layout.graphics.len(), 33);
+        assert!(
+            layout
+                .rows()
+                .iter()
+                .flat_map(|row| &row.fragments)
+                .all(|fragment| !fragment.text.contains("math raster unavailable"))
+        );
+    }
 
     #[test]
     fn wrapping_preserves_ordered_source_anchors() {
@@ -996,7 +1314,7 @@ mod tests {
         let graphic_index = layout
             .rows()
             .iter()
-            .position(|row| row.graphic.is_some())
+            .position(|row| !row.graphics.is_empty())
             .expect("layout should contain graphic row");
         let graphic_row = &layout.rows()[graphic_index];
         let before = markdown.find("before").expect("fixture contains before");
@@ -1129,14 +1447,14 @@ mod tests {
         let graphic_rows = layout
             .rows()
             .iter()
-            .filter(|row| row.graphic.is_some())
+            .filter(|row| !row.graphics.is_empty())
             .count();
 
         assert_eq!(graphic_rows, MAX_RASTERIZED_HEADINGS);
         assert!(
-            layout.rows()[layout.row_for_source(focus)]
-                .graphic
-                .is_some()
+            !layout.rows()[layout.row_for_source(focus)]
+                .graphics
+                .is_empty()
         );
         assert!(
             layout

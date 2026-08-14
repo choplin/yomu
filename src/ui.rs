@@ -38,7 +38,11 @@ pub(crate) fn render(
         } else {
             0
         };
-        lines.push(row_line(row));
+        lines.push(if row_offset == 0 {
+            row_line(row)
+        } else {
+            Line::default()
+        });
         for _ in row_offset.saturating_add(1)..row.height {
             if lines.len() >= usize::from(body.height) {
                 break;

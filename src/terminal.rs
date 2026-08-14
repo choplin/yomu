@@ -97,6 +97,7 @@ fn needs_graphics(document: &Document) -> bool {
     !document.images().is_empty()
         || !document.headings().is_empty()
         || !document.tables().is_empty()
+        || !document.math().is_empty()
 }
 
 fn drive_loop(
@@ -179,18 +180,36 @@ fn drive_loop(
         generation = generation.saturating_add(1);
         let size = batch.size;
         let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height));
-        let (first, first_row_offset) = app.viewport_position(&layout);
-        pending_frame = Some(layout.desired_frame(
-            first,
-            first_row_offset,
+        pending_frame = frame_before_logical_render(
+            batch.resized,
+            &app,
+            &layout,
             CellRect::from(body),
             generation,
             cell_pixel_size(size.width, size.height),
-        ));
+        );
         submit_logical_render(logical_renderer, generation, &app, size);
         dirty = true;
     }
     Ok(())
+}
+
+fn frame_before_logical_render(
+    resized: bool,
+    app: &App,
+    layout: &Layout,
+    body: CellRect,
+    generation: u64,
+    cell_pixels: PixelSize,
+) -> Option<DesiredFrame> {
+    if resized {
+        // The current layout is the text projection rebuilt at the new width.
+        // Wait for the logical renderer rather than re-placing old raster
+        // assets with new cell metrics after the backend was cleared.
+        return None;
+    }
+    let (first, first_row_offset) = app.viewport_position(layout);
+    Some(layout.desired_frame(first, first_row_offset, body, generation, cell_pixels))
 }
 
 fn read_input_batch(wait: Duration) -> Result<Vec<Event>> {
@@ -670,6 +689,33 @@ mod tests {
         let graphics = GraphicsMode::select(true, false);
 
         assert!(matches!(graphics, GraphicsMode::Text));
+    }
+
+    #[test]
+    fn resize_waits_for_new_rasters_instead_of_replacing_stale_assets() {
+        let document = Document::parse("$x^2$".to_owned());
+        let layout = Layout::new(&document, 80);
+        let body = CellRect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 20,
+        };
+
+        assert!(
+            frame_before_logical_render(
+                true,
+                &App::default(),
+                &layout,
+                body,
+                2,
+                PixelSize {
+                    width: 10,
+                    height: 20,
+                },
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -61,6 +61,14 @@ $$
 \int_0^1 x^2\,dx = \frac{1}{3}
 $$
 
+Supported subset fixture: $\alpha + \beta \leq \sqrt{x_1^2 + x_2^2}$
+
+$$
+\sum_{i=1}^{n} i = \frac{n(n+1)}{2} \longrightarrow n \in \mathbb{N}
+$$
+
+Invalid conversion fallback: $\unknowncommand{x}$
+
 ## Horizontal rule
 
 ---

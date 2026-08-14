@@ -8,10 +8,11 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use percent_encoding::percent_decode_str;
 
-use crate::{Document, ImageElement, SourceSpan, TableElement, TextStyle};
+use crate::{Document, ImageElement, MathElement, SourceSpan, TableElement, TextStyle};
 use crate::{
     HeadingElement,
     heading::{HeadingFonts, HeadingPlan},
+    math::MathPlan,
     table::TablePlan,
 };
 
@@ -66,6 +67,14 @@ pub(crate) struct TableRaster {
     pub columns: u16,
     pub rows: u16,
     pub source_regions: Vec<crate::scene::GraphicSourceRegion>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MathRaster {
+    pub asset: Arc<RasterAsset>,
+    pub element_key: ElementKey,
+    pub columns: u16,
+    pub rows: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -361,6 +370,7 @@ pub struct RasterCache {
     entries: HashMap<RasterAssetKey, CacheEntry>,
     heading_keys: HashMap<[u8; 32], RasterAssetKey>,
     table_keys: HashMap<[u8; 32], RasterAssetKey>,
+    math_keys: HashMap<[u8; 32], RasterAssetKey>,
     failures: HashMap<[u8; 32], String>,
     capacity: usize,
     used: usize,
@@ -389,6 +399,7 @@ impl RasterCache {
             entries: HashMap::new(),
             heading_keys: HashMap::new(),
             table_keys: HashMap::new(),
+            math_keys: HashMap::new(),
             failures: HashMap::new(),
             capacity,
             used: 0,
@@ -643,6 +654,80 @@ impl RasterCache {
         }))
     }
 
+    pub(crate) fn rasterize_math(
+        &mut self,
+        index: usize,
+        math: &MathElement,
+        available_columns: u16,
+        available_rows: u16,
+        cell_pixels: PixelSize,
+    ) -> Result<Option<MathRaster>, String> {
+        let identity =
+            MathPlan::cache_identity(math, available_columns, available_rows, cell_pixels);
+        self.clock = self.clock.saturating_add(1);
+        if let Some(key) = self.math_keys.get(&identity).copied()
+            && let Some(entry) = self.entries.get_mut(&key)
+        {
+            entry.last_used = self.clock;
+            return Ok(Some(MathRaster {
+                asset: Arc::clone(&entry.asset),
+                element_key: MathPlan::element_key(index),
+                columns: cells_for(key.pixels.width, cell_pixels.width),
+                rows: cells_for(key.pixels.height, cell_pixels.height),
+            }));
+        }
+        if let Some(error) = self.failures.get(&identity) {
+            return Err(error.clone());
+        }
+        let plan =
+            match MathPlan::build(index, math, available_columns, available_rows, cell_pixels) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.failures.insert(identity, error.clone());
+                    return Err(error);
+                }
+            };
+        let (plan, rendered) = match plan.render(cell_pixels) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.failures.insert(identity, error.clone());
+                return Err(error);
+            }
+        };
+        let rgba: Arc<[u8]> = Arc::from(rendered.into_raw());
+        let bytes = rgba.len();
+        if bytes > self.capacity {
+            return Err(format!(
+                "math raster needs {bytes} bytes but cache capacity is {} bytes",
+                self.capacity
+            ));
+        }
+        self.evict_for(bytes);
+        let asset = Arc::new(RasterAsset {
+            key: plan.key,
+            rgba,
+        });
+        let replaced = self.entries.insert(
+            plan.key,
+            CacheEntry {
+                asset: Arc::clone(&asset),
+                bytes,
+                last_used: self.clock,
+            },
+        );
+        if let Some(replaced) = replaced {
+            self.used = self.used.saturating_sub(replaced.bytes);
+        }
+        self.math_keys.insert(identity, plan.key);
+        self.used = self.used.saturating_add(bytes);
+        Ok(Some(MathRaster {
+            asset,
+            element_key: plan.element_key,
+            columns: plan.columns,
+            rows: plan.rows,
+        }))
+    }
+
     fn evict_for(&mut self, incoming: usize) {
         while self.used.saturating_add(incoming) > self.capacity {
             let Some(key) = self
@@ -658,6 +743,7 @@ impl RasterCache {
             }
             self.heading_keys.retain(|_, mapped| *mapped != key);
             self.table_keys.retain(|_, mapped| *mapped != key);
+            self.math_keys.retain(|_, mapped| *mapped != key);
         }
     }
 

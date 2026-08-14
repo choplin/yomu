@@ -83,6 +83,29 @@ Tables use a booktabs-like paper style: no vertical grid or left/right border,
 with strong top and bottom rules plus a lighter rule separating the bold header
 from the body.
 
+Inline and display math render through a TeX-to-Typst-to-SVG-to-RGBA pipeline.
+Inline formulas remain in their surrounding logical line and fit one terminal
+row; display formulas use a larger centered placement capped at four rows, with
+roughly half a row of breathing room above and below the painted formula.
+Raster canvases align exactly to terminal-cell pixels so the graphics protocol
+does not rescale otherwise crisp inline glyphs during placement. The rasterizer
+fits the actual painted glyph bounds, including accents and bearings, and keeps
+transparent pixels above and below them to prevent vertical clipping.
+The renderer embeds Typst's bundled New Computer Modern fonts and exposes no
+Typst package, network, or filesystem resolver. Raster cache identity includes
+the formula, inline/display form, target geometry, foreground render setting,
+bundled fonts, converter version, and rasterizer version, so resize cannot reuse
+stale pixels. The current viewer uses a fixed dark-palette foreground; adaptive
+light/dark theme selection is not yet a configuration surface.
+
+The evidenced MVP subset includes ordinary symbols and relations, Greek
+letters, superscripts and subscripts, fractions, roots, sums, integrals,
+parenthesized expressions, and common arrows as demonstrated in
+`examples/showcase.md`. This is intentionally not a claim of full LaTeX or
+MathJax compatibility. Unsupported or malformed input remains visible with its
+original `$...$` or `$$...$$` delimiters and a concise conversion or rendering
+diagnostic.
+
 Sixel is available as an experimental second graphics backend. Capability
 detection is not enabled yet, so select it explicitly in the same config file:
 
@@ -138,11 +161,18 @@ Check the backend label in the footer and verify this lifecycle:
 7. Inspect the tables in both showcase files: headers, alignment, borders,
    Unicode, and wrapped cells remain legible; narrowing below the readable
    column minimum switches to text without dropping a cell.
+8. Inspect the inline and display formulas: inline math stays with its prose,
+   display math is centered and larger, and resizing produces crisp replacement
+   pixels without stale placements.
+9. Confirm the intentionally invalid math sample remains readable as source
+   with a diagnostic while the supported formulas continue rendering.
 
 The automated tests separately cover desired-frame reconciliation, upload and
 placement replacement, stale deletion, cache ownership, path escape rejection,
 decode fallback, table layout and overflow, Unicode, cache keys, failure
-projection, and source ranges. Real-terminal checks remain necessary because
+projection, math parse boundaries, supported conversion, invalid-input
+fallback, inline/display layout, resize-sensitive cache keys, and source ranges.
+Real-terminal checks remain necessary because
 terminal graphics behavior cannot be observed through a test backend.
 
 ## Experimental sixel graphics check

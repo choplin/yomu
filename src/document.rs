@@ -31,6 +31,32 @@ pub struct HeadingElement {
     pub style: TextStyle,
 }
 
+/// Whether a Markdown math expression participates in a line or owns a block.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MathForm {
+    Inline,
+    Display,
+}
+
+/// A source-ranged TeX math expression before conversion and rasterization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MathElement {
+    pub expression: String,
+    pub form: MathForm,
+    pub source: SourceSpan,
+    pub style: TextStyle,
+}
+
+impl MathElement {
+    #[must_use]
+    pub fn text_projection(&self) -> String {
+        match self.form {
+            MathForm::Inline => format!("${}$", self.expression),
+            MathForm::Display => format!("$${}$$", self.expression),
+        }
+    }
+}
+
 /// Horizontal alignment declared for one GFM table column.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TableAlignment {
@@ -100,6 +126,9 @@ pub(crate) enum Segment {
     Table {
         index: usize,
     },
+    Math {
+        index: usize,
+    },
 }
 
 /// Parsed Markdown content with source identity attached to every fragment.
@@ -111,6 +140,7 @@ pub struct Document {
     images: Vec<ImageElement>,
     headings: Vec<HeadingElement>,
     tables: Vec<TableElement>,
+    math: Vec<MathElement>,
 }
 
 impl Document {
@@ -163,6 +193,11 @@ impl Document {
     pub fn tables(&self) -> &[TableElement] {
         &self.tables
     }
+
+    #[must_use]
+    pub fn math(&self) -> &[MathElement] {
+        &self.math
+    }
 }
 
 #[derive(Debug)]
@@ -181,6 +216,7 @@ struct Builder {
     images: Vec<ImageElement>,
     heading: Option<HeadingBuilder>,
     headings: Vec<HeadingElement>,
+    math: Vec<MathElement>,
 }
 
 #[derive(Debug)]
@@ -343,15 +379,11 @@ impl Builder {
                 self.text(text.as_ref(), range, style);
             }
             Event::InlineMath(text) => {
-                let mut style = self.style;
-                style.code = true;
-                self.text(&format!("${text}$"), range, style);
+                self.math(text.as_ref(), MathForm::Inline, range);
             }
             Event::DisplayMath(text) => {
                 self.line_break(range.start, false);
-                let mut style = self.style;
-                style.code = true;
-                self.text(&format!("$${text}$$"), range.clone(), style);
+                self.math(text.as_ref(), MathForm::Display, range.clone());
                 self.line_break(range.end, true);
             }
             Event::Html(text) | Event::InlineHtml(text) => {
@@ -554,6 +586,17 @@ impl Builder {
         self.segments.push(Segment::Image { index });
     }
 
+    fn math(&mut self, expression: &str, form: MathForm, source: SourceSpan) {
+        let index = self.math.len();
+        self.math.push(MathElement {
+            expression: expression.to_owned(),
+            form,
+            source,
+            style: self.style,
+        });
+        self.segments.push(Segment::Math { index });
+    }
+
     fn finish_heading(&mut self, range: SourceSpan) {
         let Some(mut heading) = self.heading.take() else {
             return;
@@ -633,6 +676,7 @@ impl Builder {
             images: self.images,
             headings: self.headings,
             tables: self.tables,
+            math: self.math,
         }
     }
 }
@@ -745,12 +789,16 @@ mod tests {
                 Segment::Break { .. }
                 | Segment::Image { .. }
                 | Segment::Heading { .. }
-                | Segment::Table { .. } => None,
+                | Segment::Table { .. }
+                | Segment::Math { .. } => None,
             })
             .collect();
 
         assert!(text_segments.iter().any(|(text, _)| text == &"[x]"));
-        assert!(text_segments.iter().any(|(text, _)| text == &"$x$"));
+        assert_eq!(document.math().len(), 1);
+        assert_eq!(document.math()[0].expression, "x");
+        assert_eq!(document.math()[0].form, MathForm::Inline);
+        assert_eq!(&source[document.math()[0].source.clone()], "$x$");
         assert_eq!(document.tables()[0].rows[0].cells[0].text, "a");
         assert_eq!(document.tables()[0].rows[1].cells[1].text, "2");
         assert!(
@@ -762,6 +810,33 @@ mod tests {
         assert!(document.events().iter().all(|event| {
             event.source.start <= event.source.end && event.source.end <= document.source_len()
         }));
+    }
+
+    #[test]
+    fn inline_and_display_math_retain_exact_source_ranges_and_boundaries() {
+        let source = "before $x^2 + y^2$ after\n\n$$\n\\frac{1}{3}\n$$\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.math().len(), 2);
+        assert_eq!(document.math()[0].form, MathForm::Inline);
+        assert_eq!(document.math()[0].expression, "x^2 + y^2");
+        assert_eq!(&source[document.math()[0].source.clone()], "$x^2 + y^2$");
+        assert_eq!(document.math()[1].form, MathForm::Display);
+        assert_eq!(document.math()[1].expression, "\n\\frac{1}{3}\n");
+        assert_eq!(
+            &source[document.math()[1].source.clone()],
+            "$$\n\\frac{1}{3}\n$$"
+        );
+        let before = document.segments.iter().find_map(|segment| match segment {
+            Segment::Text { text, .. } if text == "before " => Some(text),
+            _ => None,
+        });
+        let after = document.segments.iter().find_map(|segment| match segment {
+            Segment::Text { text, .. } if text == " after" => Some(text),
+            _ => None,
+        });
+        assert!(before.is_some());
+        assert!(after.is_some());
     }
 
     #[test]

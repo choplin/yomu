@@ -7,6 +7,7 @@ mod graphics;
 mod heading;
 mod image;
 mod layout;
+mod math;
 mod scene;
 mod table;
 mod terminal;
@@ -19,8 +20,8 @@ use anyhow::{Context, Result};
 
 pub use app::{App, Command};
 pub use document::{
-    Document, HeadingElement, ImageElement, SourceEvent, SourceSpan, TableAlignment, TableCell,
-    TableElement, TableRow, TextStyle,
+    Document, HeadingElement, ImageElement, MathElement, MathForm, SourceEvent, SourceSpan,
+    TableAlignment, TableCell, TableElement, TableRow, TextStyle,
 };
 pub(crate) use image::{ElementKey, PixelSize, RasterAsset, RasterAssetKey, RasterCache};
 pub use layout::{Layout, LayoutFragment, LayoutRow};
