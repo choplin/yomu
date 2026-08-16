@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 
 pub use app::{App, Command};
 pub use document::{
-    Document, HeadingElement, ImageElement, MathElement, MathForm, SourceEvent, SourceSpan,
-    TableAlignment, TableCell, TableElement, TableRow, TextStyle,
+    Document, HeadingElement, ImageElement, LinkElement, MathElement, MathForm, SourceEvent,
+    SourceSpan, TableAlignment, TableCell, TableElement, TableRow, TextStyle,
 };
 pub use graphics::GraphicsPreference;
 pub(crate) use image::{ElementKey, PixelSize, RasterAsset, RasterAssetKey, RasterCache};

@@ -292,6 +292,18 @@ impl Layout {
                         builder.table_text(table, raster_error.as_deref());
                     }
                 }
+                Segment::Link { index } => {
+                    let Some(link) = document.links().get(*index) else {
+                        continue;
+                    };
+                    let Some(projection) = link.destination_projection() else {
+                        continue;
+                    };
+                    let mut style = link.style;
+                    style.link = false;
+                    style.muted = true;
+                    builder.text(&projection, link.destination_source.clone(), style, false);
+                }
                 Segment::Math { index } => {
                     let Some(math) = document.math().get(*index) else {
                         continue;
@@ -1028,6 +1040,112 @@ mod tests {
                     && fragment.source.end <= document.source_len()
             })
         }));
+    }
+
+    #[test]
+    fn link_labels_are_followed_by_a_subdued_destination() {
+        let document = Document::parse("Read [the docs](https://example.com/a) now.".to_owned());
+        let layout = Layout::new(&document, 80);
+        let fragments = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .collect::<Vec<_>>();
+        let rendered = fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(rendered, "Read the docs <https://example.com/a> now.");
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.text.contains("the docs") && fragment.style.link)
+        );
+        let destination = fragments
+            .iter()
+            .find(|fragment| fragment.text.contains("example.com"))
+            .expect("destination is rendered");
+        assert!(destination.style.muted);
+        assert!(!destination.style.link);
+        assert!(
+            document.links()[0]
+                .destination_source
+                .contains(&destination.source.start)
+        );
+    }
+
+    #[test]
+    fn collapsed_links_render_their_destination_once() {
+        let document = Document::parse("<https://example.com/a> then more".to_owned());
+        let rendered = Layout::new(&document, 80)
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(rendered, "https://example.com/a then more");
+    }
+
+    #[test]
+    fn long_and_unicode_destinations_wrap_without_clipping_or_reordering() {
+        let markdown =
+            "[螺鈿の資料](https://example.com/very/long/path/segment/for/wrapping/日本語)";
+        let document = Document::parse(markdown.to_owned());
+        let layout = Layout::new(&document, 16);
+        let rendered = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(
+            rendered.replace(' ', ""),
+            "螺鈿の資料<https://example.com/very/long/path/segment/for/wrapping/日本語>"
+                .replace(' ', "")
+        );
+        assert!(layout.rows().len() > 1);
+        assert!(layout.rows().iter().all(|row| {
+            row.fragments
+                .iter()
+                .map(|fragment| {
+                    fragment
+                        .text
+                        .chars()
+                        .map(|character| character.width().unwrap_or(0))
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
+                <= layout.width()
+        }));
+        assert!(
+            layout
+                .rows()
+                .windows(2)
+                .all(|rows| rows[0].source.start <= rows[1].source.start)
+        );
+        assert!(layout.rows().iter().all(|row| {
+            row.fragments.iter().all(|fragment| {
+                fragment.source.start <= fragment.source.end
+                    && fragment.source.end <= document.source_len()
+            })
+        }));
+    }
+
+    #[test]
+    fn linked_images_keep_the_image_projection_and_the_link_destination() {
+        let document =
+            Document::parse("[![diagram](missing.png)](https://example.com/page)".to_owned());
+        let rendered = Layout::new(&document, 80)
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(rendered, "[image: diagram] <https://example.com/page>");
     }
 
     #[test]

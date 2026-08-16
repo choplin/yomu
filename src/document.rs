@@ -22,6 +22,46 @@ pub struct ImageElement {
     pub style: TextStyle,
 }
 
+/// An ordinary Markdown link whose destination survives into the rendered view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkElement {
+    pub destination: String,
+    pub title: String,
+    pub label: String,
+    pub source: SourceSpan,
+    pub label_source: SourceSpan,
+    pub destination_source: SourceSpan,
+    pub style: TextStyle,
+    /// Whether the link rendered any label content, including a nested image.
+    pub has_label: bool,
+}
+
+impl LinkElement {
+    /// Whether the label already carries the destination, so showing both would duplicate it.
+    #[must_use]
+    pub fn is_collapsed(&self) -> bool {
+        let label = self.label.trim();
+        label == self.destination
+            || self
+                .destination
+                .strip_prefix("mailto:")
+                .is_some_and(|address| address == label)
+    }
+
+    /// The subdued destination shown after the label, or `None` when it would duplicate it.
+    #[must_use]
+    pub fn destination_projection(&self) -> Option<String> {
+        if self.destination.is_empty() || self.is_collapsed() {
+            return None;
+        }
+        Some(if self.has_label {
+            format!(" <{}>", self.destination)
+        } else {
+            format!("<{}>", self.destination)
+        })
+    }
+}
+
 /// A level-one or level-two heading that can be projected as text or raster.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeadingElement {
@@ -129,6 +169,9 @@ pub(crate) enum Segment {
     Math {
         index: usize,
     },
+    Link {
+        index: usize,
+    },
 }
 
 /// Parsed Markdown content with source identity attached to every fragment.
@@ -141,6 +184,7 @@ pub struct Document {
     headings: Vec<HeadingElement>,
     tables: Vec<TableElement>,
     math: Vec<MathElement>,
+    links: Vec<LinkElement>,
 }
 
 impl Document {
@@ -198,6 +242,11 @@ impl Document {
     pub fn math(&self) -> &[MathElement] {
         &self.math
     }
+
+    #[must_use]
+    pub fn links(&self) -> &[LinkElement] {
+        &self.links
+    }
 }
 
 #[derive(Debug)]
@@ -217,6 +266,19 @@ struct Builder {
     heading: Option<HeadingBuilder>,
     headings: Vec<HeadingElement>,
     math: Vec<MathElement>,
+    link: Option<LinkBuilder>,
+    links: Vec<LinkElement>,
+}
+
+#[derive(Debug)]
+struct LinkBuilder {
+    destination: String,
+    title: String,
+    label: String,
+    source: SourceSpan,
+    label_source: Option<SourceSpan>,
+    style: TextStyle,
+    segment_start: usize,
 }
 
 #[derive(Debug)]
@@ -474,7 +536,20 @@ impl Builder {
             Tag::Emphasis => self.style.emphasis = true,
             Tag::Strong => self.style.strong = true,
             Tag::Strikethrough => self.style.strikethrough = true,
-            Tag::Link { .. } => self.style.link = true,
+            Tag::Link {
+                dest_url, title, ..
+            } => {
+                self.style.link = true;
+                self.link = Some(LinkBuilder {
+                    destination: dest_url.into_string(),
+                    title: title.into_string(),
+                    label: String::new(),
+                    source: range,
+                    label_source: None,
+                    style: self.style,
+                    segment_start: self.segments.len(),
+                });
+            }
             Tag::Image {
                 dest_url, title, ..
             } => {
@@ -527,7 +602,10 @@ impl Builder {
             TagEnd::Emphasis => self.style.emphasis = false,
             TagEnd::Strong => self.style.strong = false,
             TagEnd::Strikethrough => self.style.strikethrough = false,
-            TagEnd::Link => self.style.link = false,
+            TagEnd::Link => {
+                self.style.link = false;
+                self.finish_link(range);
+            }
             TagEnd::Image => {}
             TagEnd::FootnoteDefinition => self.line_break(range.end, true),
             TagEnd::Superscript
@@ -540,6 +618,13 @@ impl Builder {
     }
 
     fn text(&mut self, text: &str, source: SourceSpan, style: TextStyle) {
+        if let Some(link) = self.link.as_mut() {
+            link.label.push_str(text);
+            link.label_source = Some(match link.label_source.take() {
+                Some(existing) => existing.start.min(source.start)..existing.end.max(source.end),
+                None => source.clone(),
+            });
+        }
         if !text.is_empty() {
             self.segments.push(Segment::Text {
                 text: text.to_owned(),
@@ -595,6 +680,30 @@ impl Builder {
             style: self.style,
         });
         self.segments.push(Segment::Math { index });
+    }
+
+    fn finish_link(&mut self, range: SourceSpan) {
+        let Some(mut link) = self.link.take() else {
+            return;
+        };
+        link.source.end = link.source.end.max(range.end);
+        let label_source = link
+            .label_source
+            .unwrap_or(link.source.start..link.source.start);
+        let has_label = self.segments.len() > link.segment_start;
+        let index = self.links.len();
+        self.links.push(LinkElement {
+            destination: link.destination,
+            title: link.title,
+            label: link.label,
+            source: link.source,
+            label_source,
+            // Resolved against the document source once parsing completes.
+            destination_source: 0..0,
+            style: link.style,
+            has_label,
+        });
+        self.segments.push(Segment::Link { index });
     }
 
     fn finish_heading(&mut self, range: SourceSpan) {
@@ -663,6 +772,9 @@ impl Builder {
     }
 
     fn finish(mut self, source: String, events: Vec<SourceEvent>) -> Document {
+        for link in &mut self.links {
+            link.destination_source = destination_span(&source, link);
+        }
         if self.segments.is_empty() {
             self.segments.push(Segment::Break {
                 source: 0,
@@ -677,8 +789,34 @@ impl Builder {
             headings: self.headings,
             tables: self.tables,
             math: self.math,
+            links: self.links,
         }
     }
+}
+
+/// Locate the destination inside the link's own source text, preferring the text after its label.
+fn destination_span(source: &str, link: &LinkElement) -> SourceSpan {
+    let tail_start = link
+        .label_source
+        .end
+        .clamp(link.source.start, link.source.end);
+    let fallback = tail_start..link.source.end;
+    if link.destination.is_empty() {
+        return fallback;
+    }
+    let Some(text) = source.get(link.source.clone()) else {
+        return fallback;
+    };
+    let tail_offset = tail_start.saturating_sub(link.source.start);
+    let found = text
+        .get(tail_offset..)
+        .and_then(|tail| tail.find(link.destination.as_str()))
+        .map(|offset| tail_offset.saturating_add(offset))
+        .or_else(|| text.find(link.destination.as_str()));
+    found.map_or(fallback, |offset| {
+        let start = link.source.start.saturating_add(offset);
+        start..start.saturating_add(link.destination.len())
+    })
 }
 
 impl TableBuilder {
@@ -790,7 +928,8 @@ mod tests {
                 | Segment::Image { .. }
                 | Segment::Heading { .. }
                 | Segment::Table { .. }
-                | Segment::Math { .. } => None,
+                | Segment::Math { .. }
+                | Segment::Link { .. } => None,
             })
             .collect();
 
@@ -913,6 +1052,129 @@ mod tests {
                 .iter()
                 .any(|segment| matches!(segment, Segment::Image { index: 0 }))
         );
+    }
+
+    #[test]
+    fn named_links_retain_label_destination_and_source_subranges() {
+        let source = "See [the docs](https://example.com/a?b=c#d \"Docs\") today.\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.links().len(), 1);
+        let link = &document.links()[0];
+        assert_eq!(link.destination, "https://example.com/a?b=c#d");
+        assert_eq!(link.label, "the docs");
+        assert_eq!(link.title, "Docs");
+        assert!(!link.is_collapsed());
+        assert_eq!(
+            link.destination_projection().as_deref(),
+            Some(" <https://example.com/a?b=c#d>")
+        );
+        assert_eq!(
+            &source[link.source.clone()],
+            "[the docs](https://example.com/a?b=c#d \"Docs\")"
+        );
+        assert_eq!(&source[link.label_source.clone()], "the docs");
+        assert_eq!(
+            &source[link.destination_source.clone()],
+            "https://example.com/a?b=c#d"
+        );
+        assert!(link.source.start <= link.label_source.start);
+        assert!(link.label_source.end <= link.destination_source.start);
+        assert!(link.destination_source.end <= link.source.end);
+        assert!(
+            document
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::Link { index: 0 }))
+        );
+    }
+
+    #[test]
+    fn autolinks_and_label_equal_destinations_are_not_duplicated() {
+        let source = "<https://example.com> and [https://example.com](https://example.com) and <a@b.com> and [a@b.com](mailto:a@b.com)\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.links().len(), 4);
+        for link in document.links() {
+            assert!(link.is_collapsed());
+            assert_eq!(link.destination_projection(), None);
+        }
+        assert_eq!(document.links()[2].destination, "a@b.com");
+        assert_eq!(document.links()[3].destination, "mailto:a@b.com");
+        assert_eq!(document.links()[3].label, "a@b.com");
+        assert_eq!(
+            &source[document.links()[0].destination_source.clone()],
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn relative_fragment_and_email_destinations_are_preserved_exactly() {
+        let source = "[rel](../notes/a%20b.md) [frag](#section-1) [mail](mailto:a@b.com)\n";
+        let document = Document::parse(source.to_owned());
+
+        let destinations = document
+            .links()
+            .iter()
+            .map(|link| link.destination.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            destinations,
+            ["../notes/a%20b.md", "#section-1", "mailto:a@b.com"]
+        );
+        for link in document.links() {
+            assert_eq!(&source[link.destination_source.clone()], link.destination);
+        }
+    }
+
+    #[test]
+    fn images_inside_links_stay_on_the_image_path() {
+        let source = "[![diagram alt](assets/d.png)](https://example.com/page)\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.images().len(), 1);
+        assert_eq!(document.images()[0].destination, "assets/d.png");
+        assert_eq!(document.links().len(), 1);
+        assert_eq!(document.links()[0].destination, "https://example.com/page");
+        assert!(
+            document
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::Image { index: 0 }))
+        );
+    }
+
+    #[test]
+    fn reference_links_keep_a_meaningful_destination_subrange() {
+        let source = "[label][ref]\n\n[ref]: https://example.com/target\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.links().len(), 1);
+        let link = &document.links()[0];
+        assert_eq!(link.destination, "https://example.com/target");
+        assert_eq!(link.label, "label");
+        assert!(link.label_source.end <= link.destination_source.start);
+        assert!(link.destination_source.end <= link.source.end);
+        assert_eq!(&source[link.destination_source.clone()], "][ref]");
+    }
+
+    #[test]
+    fn malformed_link_syntax_remains_readable_source_text() {
+        let source = "[unclosed](https://example.com and [text] alone\n";
+        let document = Document::parse(source.to_owned());
+        let rendered = document
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert!(document.links().is_empty());
+        assert!(rendered.contains("[unclosed](https://example.com"));
+        assert!(rendered.contains("[text]"));
     }
 
     #[test]
