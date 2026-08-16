@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::Layout;
 
@@ -18,15 +18,14 @@ pub enum Command {
 impl Command {
     #[must_use]
     pub fn from_key(key: KeyEvent) -> Self {
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('q') | KeyCode::Esc, _) => Self::Quit,
-            (KeyCode::Up | KeyCode::Char('k'), _) => Self::Up,
-            (KeyCode::Down | KeyCode::Char('j'), _) => Self::Down,
-            (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => Self::PageUp,
-            (KeyCode::PageDown | KeyCode::Char(' '), _)
-            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => Self::PageDown,
-            (KeyCode::Home | KeyCode::Char('g'), _) => Self::Home,
-            (KeyCode::End | KeyCode::Char('G'), _) => Self::End,
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Self::Quit,
+            KeyCode::Up | KeyCode::Char('k') => Self::Up,
+            KeyCode::Down | KeyCode::Char('j') => Self::Down,
+            KeyCode::PageUp | KeyCode::Char('u') => Self::PageUp,
+            KeyCode::PageDown | KeyCode::Char(' ' | 'd') => Self::PageDown,
+            KeyCode::Home | KeyCode::Char('g') => Self::Home,
+            KeyCode::End | KeyCode::Char('G') => Self::End,
             _ => Self::None,
         }
     }
@@ -247,6 +246,17 @@ mod tests {
                 .map(|row| usize::from(row.height))
                 .sum::<usize>();
         target == first || cells_before_target < usize::from(viewport_height)
+    }
+
+    #[test]
+    fn page_scrolling_binds_to_unmodified_d_and_u() {
+        let key = |code| Command::from_key(KeyEvent::from(code));
+
+        assert_eq!(key(KeyCode::Char('u')), Command::PageUp);
+        assert_eq!(key(KeyCode::Char('d')), Command::PageDown);
+        assert_eq!(key(KeyCode::PageUp), Command::PageUp);
+        assert_eq!(key(KeyCode::PageDown), Command::PageDown);
+        assert_eq!(key(KeyCode::Char(' ')), Command::PageDown);
     }
 
     #[test]

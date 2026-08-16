@@ -161,7 +161,7 @@ diagnostic instead of clipping or omitting source content.
 The initial Reading mode uses these deliberately reversible bindings:
 
 - `j` / `k` or arrow keys: scroll one rendered row
-- `Ctrl-d` / `Ctrl-u`, Page Down / Page Up, or Space: scroll one page
+- `d` / `u`, Page Down / Page Up, or Space: scroll one page
 - `g` / `G` or Home / End: jump to the start or end
 - `q` or Escape: exit
 

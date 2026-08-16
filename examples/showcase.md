@@ -91,5 +91,5 @@ without interrupting review:
 ## Navigation checkpoint
 
 If you reached this section using `j`, arrow keys, Page Down, Space, or
-`Ctrl-d`, vertical navigation is working. Press `g` to return to the beginning,
+`d`, vertical navigation is working. Press `g` to return to the beginning,
 `G` to come back here, then `q` or Escape to exit.

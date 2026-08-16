@@ -55,7 +55,7 @@ pub(crate) fn render(
 
     let percent = app.viewport_percent(layout, body.height);
     let status = format!(
-        " j/k scroll  Ctrl-d/u page  g/G ends  q quit  {graphics_status}{:>5}% ",
+        " j/k scroll  d/u page  g/G ends  q quit  {graphics_status}{:>5}% ",
         percent,
     );
     frame.render_widget(
