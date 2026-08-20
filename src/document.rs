@@ -157,6 +157,10 @@ pub(crate) enum Segment {
         source: usize,
         blank: bool,
     },
+    Rule {
+        source: SourceSpan,
+        style: TextStyle,
+    },
     Image {
         index: usize,
     },
@@ -460,7 +464,7 @@ impl Builder {
             Event::HardBreak => self.line_break(range.end, false),
             Event::Rule => {
                 self.line_break(range.start, false);
-                self.text("───", range.clone(), self.style);
+                self.rule(range.clone());
                 self.line_break(range.end, true);
             }
             Event::TaskListMarker(checked) => {
@@ -644,6 +648,14 @@ impl Builder {
                 synthetic: true,
             });
         }
+    }
+
+    /// Record a thematic break as a width-independent element resolved at layout time.
+    fn rule(&mut self, source: SourceSpan) {
+        self.segments.push(Segment::Rule {
+            source,
+            style: self.style,
+        });
     }
 
     fn line_break(&mut self, source: usize, blank: bool) {
@@ -925,6 +937,7 @@ mod tests {
             .filter_map(|segment| match segment {
                 Segment::Text { text, source, .. } => Some((text, source)),
                 Segment::Break { .. }
+                | Segment::Rule { .. }
                 | Segment::Image { .. }
                 | Segment::Heading { .. }
                 | Segment::Table { .. }
@@ -1215,5 +1228,50 @@ mod tests {
             "Energy $E=mc^2$, `code`, and [image: diagram]"
         );
         assert_eq!(document.headings()[0].source, 0..source.len());
+    }
+
+    #[test]
+    fn a_document_rule_is_a_width_independent_segment() {
+        let source = "before\n\n---\n\nafter";
+        let document = Document::parse(source.to_owned());
+
+        let rules: Vec<_> = document
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Rule { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(source[rules[0].clone()].trim_end(), "---");
+        assert!(
+            !document.segments.iter().any(|segment| matches!(
+                segment,
+                Segment::Text { text, .. } if text.contains('─')
+            )),
+            "the parsed model must not resolve a rule into fixed glyph text"
+        );
+    }
+
+    #[test]
+    fn heading_summaries_stay_compact_around_a_rule() {
+        let document = Document::parse("# Title\n\n---\n\n## Next\n".to_owned());
+
+        let texts: Vec<_> = document
+            .headings()
+            .iter()
+            .map(|heading| heading.text.as_str())
+            .collect();
+
+        assert_eq!(texts, ["Title", "Next"]);
+    }
+
+    #[test]
+    fn a_table_cell_rule_stays_compact_source_text() {
+        let document = Document::parse("| a |\n| - |\n| --- |\n".to_owned());
+
+        assert_eq!(document.tables()[0].rows[1].cells[0].text, "---");
     }
 }

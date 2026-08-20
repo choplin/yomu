@@ -18,6 +18,9 @@ const MAX_RASTERIZED_TABLES: usize = 4;
 const MAX_LAYOUT_TABLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LAYOUT_MATH_BYTES: usize = 32 * 1024 * 1024;
 
+/// The single-cell glyph a thematic break is drawn from.
+const RULE_GLYPH: char = '─';
+
 /// A displayed text fragment that retains its original source identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayoutFragment {
@@ -125,6 +128,7 @@ impl Layout {
                     synthetic,
                 } => builder.text(text, source.clone(), *style, *synthetic),
                 Segment::Break { source, blank } => builder.line_break(*source, *blank),
+                Segment::Rule { source, style } => builder.rule(source.clone(), *style),
                 Segment::Image { index } => {
                     let prepared = images.and_then(|catalog| catalog.get(*index));
                     let mut raster_error = None;
@@ -653,6 +657,20 @@ impl Builder {
             self.anchor = source;
             self.push_row(source);
         }
+    }
+
+    /// Emit a thematic break spanning the content width still available on this row.
+    fn rule(&mut self, source: SourceSpan, style: TextStyle) {
+        if !self.current.is_empty() {
+            self.push_row(source.start);
+        }
+        let columns = self.width.saturating_sub(self.cell_width).max(1);
+        self.current.push(LayoutFragment {
+            text: RULE_GLYPH.to_string().repeat(columns),
+            source,
+            style,
+        });
+        self.cell_width = self.cell_width.saturating_add(columns);
     }
 
     fn image(
@@ -1593,5 +1611,127 @@ mod tests {
         assert_eq!(used, MAX_LAYOUT_TABLE_BYTES);
         assert!(reserve_table_bytes(&mut used, 1).is_err());
         assert_eq!(used, MAX_LAYOUT_TABLE_BYTES);
+    }
+
+    fn rule_row(layout: &Layout) -> &LayoutRow {
+        layout
+            .rows()
+            .iter()
+            .find(|row| {
+                row.fragments
+                    .iter()
+                    .any(|fragment| fragment.text.starts_with(RULE_GLYPH))
+            })
+            .expect("a thematic break must produce a row")
+    }
+
+    fn rule_width(layout: &Layout) -> usize {
+        rule_row(layout)
+            .fragments
+            .iter()
+            .map(|fragment| fragment.text.chars().count())
+            .sum()
+    }
+
+    #[test]
+    fn a_root_thematic_rule_spans_the_content_width() {
+        let source = "before\n\n---\n\nafter";
+        let document = Document::parse(source.to_owned());
+        let layout = Layout::new(&document, 40);
+
+        let row = rule_row(&layout);
+        assert_eq!(row.fragments.len(), 1);
+        assert_eq!(row.fragments[0].text, RULE_GLYPH.to_string().repeat(40));
+        assert_eq!(
+            &source[row.source.clone()].trim_end(),
+            &"---",
+            "the row must keep the exact Markdown source range"
+        );
+    }
+
+    #[test]
+    fn a_nested_thematic_rule_spans_its_available_content_width() {
+        for source in ["> quoted\n>\n> ---\n", "- item\n\n  ---\n"] {
+            let document = Document::parse(source.to_owned());
+            let layout = Layout::new(&document, 24);
+
+            assert_eq!(
+                rule_width(&layout),
+                24,
+                "nested rule in {source:?} must fill the available width"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thematic_rule_follows_the_body_width_on_resize() {
+        let document = Document::parse("---\n".to_owned());
+
+        for width in [1u16, 3, 20, 79, 200] {
+            let layout = Layout::new(&document, width);
+            assert_eq!(rule_width(&layout), usize::from(width));
+        }
+    }
+
+    #[test]
+    fn a_narrow_thematic_rule_stays_a_nonzero_separator() {
+        let document = Document::parse("---\n".to_owned());
+        let layout = Layout::new(&document, 0);
+
+        assert_eq!(
+            rule_width(&layout),
+            1,
+            "a degenerate width must still render one separator cell"
+        );
+    }
+
+    #[test]
+    fn thematic_rule_rows_keep_ordered_source_ranges() {
+        let source = "before\n\n---\n\nafter\n\n***\n\nend";
+        let document = Document::parse(source.to_owned());
+        let layout = Layout::new(&document, 30);
+
+        let mut previous = 0usize;
+        for row in layout.rows() {
+            assert!(row.source.start <= row.source.end);
+            assert!(row.source.end <= source.len());
+            assert!(
+                row.source.start >= previous,
+                "row sources must not move backwards"
+            );
+            previous = row.source.start;
+        }
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .filter(|row| row
+                    .fragments
+                    .iter()
+                    .any(|fragment| fragment.text.starts_with(RULE_GLYPH)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_table_cell_rule_stays_compact_instead_of_spanning_the_document() {
+        let source = "| a | b |\n| - | - |\n| --- | x |\n";
+        let document = Document::parse(source.to_owned());
+        let layout = Layout::new(&document, 60);
+
+        assert_eq!(document.tables()[0].rows[1].cells[0].text, "---");
+        assert!(
+            layout
+                .rows()
+                .iter()
+                .all(|row| row.fragments.iter().all(|fragment| fragment
+                    .text
+                    .chars()
+                    .filter(|c| *c == RULE_GLYPH)
+                    .count()
+                    < 60)),
+            "a rule inside a table must stay readable cell text"
+        );
     }
 }

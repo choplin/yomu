@@ -576,4 +576,28 @@ mod tests {
         let item = source.find("item").expect("fixture contains task text");
         assert!(app.top_source() >= item);
     }
+
+    #[test]
+    fn navigation_crosses_a_full_width_rule_in_both_directions() {
+        let source = "before\n\n---\n\nafter the rule";
+        let document = Document::parse(source.to_owned());
+        let layout = Layout::new(&document, 40);
+        let after = source
+            .find("after")
+            .expect("fixture contains trailing text");
+        let mut app = App::default();
+
+        for _ in 0..layout.rows().len() {
+            app.apply(Command::Down, &layout, 2);
+        }
+        assert!(
+            app.top_source() >= after,
+            "downward motion must clear the rule"
+        );
+
+        for _ in 0..layout.rows().len() {
+            app.apply(Command::Up, &layout, 2);
+        }
+        assert_eq!(app.top_source(), 0, "upward motion must clear the rule");
+    }
 }
