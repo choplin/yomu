@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     CellRect, ElementKey, GraphicSourceRegion, PixelSize, RasterAssetKey, TableAlignment,
     TableElement,
+    image::{cell_aligned_size, pad_to_cell_grid},
 };
 
 const FONT: &[u8] = include_bytes!("../assets/fonts/NotoSansJP.ttf");
@@ -192,24 +193,32 @@ impl TablePlan {
         let natural = tree.size();
         let height = u32::from(self.rows).saturating_mul(cell_pixels.height.max(1));
         let scale = height as f32 / natural.height().max(1.0);
-        let width = (natural.width() * scale).ceil().max(1.0) as u32;
-        validate_raster_bounds(width, height, cell_pixels)?;
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        let content_width = (natural.width() * scale).ceil().max(1.0) as u32;
+        validate_raster_bounds(content_width, height, cell_pixels)?;
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(content_width, height)
             .ok_or_else(|| "table raster has invalid dimensions".to_owned())?;
         resvg::render(
             &tree,
             resvg::tiny_skia::Transform::from_scale(scale, scale),
             &mut pixmap.as_mut(),
         );
-        self.key.pixels = PixelSize { width, height };
-        self.columns = cells_for(width, cell_pixels.width);
-        Ok((
-            self,
+        let raster =
             RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixmap.take_demultiplied())
                 .ok_or_else(|| {
                     "table raster byte length did not match its dimensions".to_owned()
-                })?,
-        ))
+                })?;
+        let pixels = cell_aligned_size(
+            PixelSize {
+                width: content_width,
+                height,
+            },
+            cell_pixels,
+        );
+        validate_raster_bounds(pixels.width, pixels.height, cell_pixels)?;
+        let raster = pad_to_cell_grid(raster, cell_pixels);
+        self.key.pixels = pixels;
+        self.columns = cells_for(pixels.width, cell_pixels.width);
+        Ok((self, raster))
     }
 }
 
@@ -567,6 +576,29 @@ mod tests {
 
         assert!(alpha.contains(&0));
         assert!(alpha.iter().any(|channel| *channel > 0));
+    }
+
+    #[test]
+    fn rendered_tables_use_cell_aligned_canvases_at_multiple_cell_sizes() {
+        for cell in [
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            PixelSize {
+                width: 9,
+                height: 17,
+            },
+        ] {
+            let (plan, raster) = TablePlan::build(0, &table("short"), 80, cell)
+                .expect("table should plan")
+                .render(cell)
+                .expect("table should render");
+
+            assert_eq!(raster.width(), u32::from(plan.columns) * cell.width);
+            assert_eq!(raster.height(), u32::from(plan.rows) * cell.height);
+            assert!(raster.pixels().any(|pixel| pixel.0[3] > 0));
+        }
     }
 
     #[test]

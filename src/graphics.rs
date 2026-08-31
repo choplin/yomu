@@ -706,13 +706,13 @@ fn write_placement<W: Write>(
                 .height
                 .saturating_sub(placement.source_y),
         );
+    let visible_width = u32::from(placement.clip.width)
+        .saturating_mul(frame.cell_pixels.width)
+        .min(placement.asset_key.pixels.width);
     write!(
         writer,
         "\x1b_Ga=p,i={image_id},p={placement_id},y={},w={},h={visible_pixels},c={},r={},C=1,q=2\x1b\\\x1b8",
-        placement.source_y,
-        placement.asset_key.pixels.width,
-        placement.clip.width,
-        placement.clip.height
+        placement.source_y, visible_width, placement.clip.width, placement.clip.height
     )
 }
 
@@ -1039,6 +1039,28 @@ mod tests {
         assert!(encoded.starts_with("\x1b7\x1b[2;4H"));
         assert!(encoded.contains("y=8,w=16,h=8"));
         assert!(encoded.ends_with("\x1b8"));
+    }
+
+    #[test]
+    fn kitty_placement_crops_the_source_to_the_horizontal_clip() {
+        let image = asset(1, 16, 16);
+        let mut clipped = placement(&image, 0);
+        clipped.clip.width = 1;
+        let desired = frame(Arc::clone(&image), Some(clipped));
+        let mut output = Vec::new();
+
+        write_placement(
+            &mut output,
+            7,
+            11,
+            desired.placements.first().expect("placement should exist"),
+            &desired,
+        )
+        .expect("placement should encode");
+        let encoded = String::from_utf8(output).expect("placement is UTF-8");
+
+        assert!(encoded.contains("y=0,w=8,h=16,c=1,r=1"));
+        assert!(!encoded.contains("w=16,h=16,c=1"));
     }
 
     #[test]

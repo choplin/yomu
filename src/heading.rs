@@ -409,9 +409,10 @@ fn validate_heading_length(heading: &HeadingElement) -> Result<(), String> {
 }
 
 fn raster_width(available_columns: u16, cell_pixels: PixelSize) -> u32 {
-    u32::from(available_columns.max(1))
-        .saturating_mul(cell_pixels.width.max(1))
-        .min(MAX_RASTER_DIMENSION)
+    let cell_width = cell_pixels.width.max(1);
+    let available = u32::from(available_columns.max(1)).saturating_mul(cell_width);
+    let capped = available.min(MAX_RASTER_DIMENSION);
+    (capped / cell_width).max(1).saturating_mul(cell_width)
 }
 
 fn align_to_cell(pixels: u32, cell_pixels: u32) -> u32 {
@@ -506,25 +507,46 @@ mod tests {
 
     #[test]
     fn raster_height_is_cell_aligned_without_scaling_the_content() {
-        let cell = PixelSize {
-            width: 8,
-            height: 16,
-        };
-        for level in [1, 2] {
-            let plan = HeadingPlan::build(0, &heading(level, "Heading"), 40, cell)
-                .expect("heading should plan");
-            let raster = plan.render().expect("heading should render");
+        for cell in [
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            PixelSize {
+                width: 9,
+                height: 17,
+            },
+        ] {
+            for level in [1, 2] {
+                let plan = HeadingPlan::build(0, &heading(level, "Heading"), 40, cell)
+                    .expect("heading should plan");
+                let raster = plan.render().expect("heading should render");
 
-            assert_eq!(plan.key.pixels.height, u32::from(plan.rows) * cell.height);
-            assert!(
-                raster
-                    .rows()
-                    .next_back()
-                    .expect("raster has a final row")
-                    .all(|pixel| pixel.0[3] == 0),
-                "cell alignment should add transparent padding below H{level}"
-            );
+                assert_eq!(plan.key.pixels.width, u32::from(plan.columns) * cell.width);
+                assert_eq!(plan.key.pixels.height, u32::from(plan.rows) * cell.height);
+                assert!(
+                    raster
+                        .rows()
+                        .next_back()
+                        .expect("raster has a final row")
+                        .all(|pixel| pixel.0[3] == 0),
+                    "cell alignment should add transparent padding below H{level}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn raster_width_stays_cell_aligned_at_the_dimension_limit() {
+        let cell = PixelSize {
+            width: 9,
+            height: 17,
+        };
+        let plan = HeadingPlan::build(0, &heading(1, "Heading"), u16::MAX, cell)
+            .expect("bounded heading should plan");
+
+        assert!(plan.key.pixels.width <= MAX_RASTER_DIMENSION);
+        assert_eq!(plan.key.pixels.width, u32::from(plan.columns) * cell.width);
     }
 
     #[test]

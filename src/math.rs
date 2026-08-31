@@ -331,37 +331,44 @@ mod tests {
 
     #[test]
     fn inline_matches_one_terminal_row_and_display_is_bounded() {
-        let pixels = PixelSize {
-            width: 8,
-            height: 16,
-        };
-        let inline = MathPlan::build(0, &math(r"x^2", MathForm::Inline), 80, 20, pixels)
-            .expect("inline formula should build")
-            .render(pixels)
-            .expect("inline formula should render")
-            .0;
-        let display = MathPlan::build(1, &math(r"x^2", MathForm::Display), 80, 20, pixels)
-            .expect("display formula should build")
-            .render(pixels)
-            .expect("display formula should render")
-            .0;
+        for pixels in [
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            PixelSize {
+                width: 9,
+                height: 17,
+            },
+        ] {
+            let inline = MathPlan::build(0, &math(r"x^2", MathForm::Inline), 80, 20, pixels)
+                .expect("inline formula should build")
+                .render(pixels)
+                .expect("inline formula should render")
+                .0;
+            let display = MathPlan::build(1, &math(r"x^2", MathForm::Display), 80, 20, pixels)
+                .expect("display formula should build")
+                .render(pixels)
+                .expect("display formula should render")
+                .0;
 
-        assert_eq!(inline.rows, 1);
-        assert_eq!(inline.key.pixels.height, pixels.height);
-        assert_eq!(
-            inline.key.pixels.width,
-            u32::from(inline.columns) * pixels.width
-        );
-        assert_eq!(display.rows, DISPLAY_ROWS);
-        assert_eq!(
-            display.key.pixels.height,
-            pixels.height * u32::from(DISPLAY_ROWS)
-        );
-        assert_eq!(
-            display.key.pixels.width,
-            u32::from(display.columns) * pixels.width
-        );
-        assert!(display.key.pixels.height > inline.key.pixels.height);
+            assert_eq!(inline.rows, 1);
+            assert_eq!(inline.key.pixels.height, pixels.height);
+            assert_eq!(
+                inline.key.pixels.width,
+                u32::from(inline.columns) * pixels.width
+            );
+            assert_eq!(display.rows, DISPLAY_ROWS);
+            assert_eq!(
+                display.key.pixels.height,
+                pixels.height * u32::from(DISPLAY_ROWS)
+            );
+            assert_eq!(
+                display.key.pixels.width,
+                u32::from(display.columns) * pixels.width
+            );
+            assert!(display.key.pixels.height > inline.key.pixels.height);
+        }
     }
 
     #[test]

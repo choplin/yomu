@@ -21,7 +21,7 @@ const MAX_DIMENSION: u32 = 8_192;
 const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_IMAGE_ROWS: u16 = 20;
-const RASTERIZER_VERSION: u16 = 1;
+const RASTERIZER_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ElementKey(pub u64);
@@ -424,19 +424,26 @@ impl RasterCache {
                 height: u32::from(available_cells.1).saturating_mul(cell_pixels.height),
             },
         );
+        let canvas_size = cell_aligned_size(target, cell_pixels);
+        let Some(bytes) = raster_bytes(canvas_size) else {
+            return Ok(None);
+        };
+        if canvas_size.width > MAX_DIMENSION
+            || canvas_size.height > MAX_DIMENSION
+            || bytes > self.capacity
+        {
+            return Ok(None);
+        }
         let key = RasterAssetKey {
-            content_hash: recipe.content_hash,
-            pixels: target,
+            content_hash: raster_cache_hash(recipe.content_hash, target, cell_pixels),
+            pixels: canvas_size,
             rasterizer_version: RASTERIZER_VERSION,
         };
+        let (columns, rows) = aligned_cells(canvas_size, cell_pixels)?;
         self.clock = self.clock.saturating_add(1);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.clock;
-            return Ok(Some((
-                Arc::clone(&entry.asset),
-                cells_for(target.width, cell_pixels.width),
-                cells_for(target.height, cell_pixels.height),
-            )));
+            return Ok(Some((Arc::clone(&entry.asset), columns, rows)));
         }
 
         if let Some(error) = self.failures.get(&recipe.content_hash) {
@@ -456,11 +463,9 @@ impl RasterCache {
             target.height,
             FilterType::Lanczos3,
         );
-        let rgba: Arc<[u8]> = Arc::from(resized.into_raw());
-        let bytes = rgba.len();
-        if bytes > self.capacity {
-            return Ok(None);
-        }
+        let raster = pad_to_cell_grid(resized, cell_pixels);
+        let rgba: Arc<[u8]> = Arc::from(raster.into_raw());
+        debug_assert_eq!(rgba.len(), bytes);
         self.evict_for(bytes);
         let asset = Arc::new(RasterAsset { key, rgba });
         self.entries.insert(
@@ -472,11 +477,7 @@ impl RasterCache {
             },
         );
         self.used = self.used.saturating_add(bytes);
-        Ok(Some((
-            asset,
-            cells_for(target.width, cell_pixels.width),
-            cells_for(target.height, cell_pixels.height),
-        )))
+        Ok(Some((asset, columns, rows)))
     }
 
     pub(crate) fn rasterize_heading(
@@ -497,7 +498,7 @@ impl RasterCache {
         if let Some(key) = self.heading_keys.get(&identity).copied()
             && let Some(entry) = self.entries.get_mut(&key)
         {
-            let rows = cells_for(key.pixels.height, cell_pixels.height);
+            let (columns, rows) = aligned_cells(key.pixels, cell_pixels)?;
             if rows > available_rows.max(1) {
                 return Err(format!(
                     "heading needs {rows} terminal rows but viewport has {}",
@@ -508,7 +509,7 @@ impl RasterCache {
             return Ok(Some(HeadingRaster {
                 asset: Arc::clone(&entry.asset),
                 element_key: HeadingPlan::element_key(index),
-                columns: cells_for(key.pixels.width, cell_pixels.width),
+                columns,
                 rows,
             }));
         }
@@ -528,10 +529,12 @@ impl RasterCache {
                 return Err(error);
             }
         };
-        if plan.rows > available_rows.max(1) {
+        let (columns, rows) = aligned_cells(plan.key.pixels, cell_pixels)?;
+        debug_assert_eq!((plan.columns, plan.rows), (columns, rows));
+        if rows > available_rows.max(1) {
             let error = format!(
                 "heading needs {} terminal rows but viewport has {}",
-                plan.rows,
+                rows,
                 available_rows.max(1)
             );
             return Err(error);
@@ -569,8 +572,8 @@ impl RasterCache {
         Ok(Some(HeadingRaster {
             asset,
             element_key: plan.element_key,
-            columns: plan.columns,
-            rows: plan.rows,
+            columns,
+            rows,
         }))
     }
 
@@ -587,18 +590,13 @@ impl RasterCache {
             && let Some(entry) = self.entries.get_mut(&key)
         {
             entry.last_used = self.clock;
-            let columns = cells_for(key.pixels.width, cell_pixels.width);
+            let (columns, rows) = aligned_cells(key.pixels, cell_pixels)?;
             return Ok(Some(TableRaster {
                 asset: Arc::clone(&entry.asset),
                 element_key: TablePlan::element_key(index),
                 columns,
-                rows: cells_for(key.pixels.height, cell_pixels.height),
-                source_regions: TablePlan::source_regions(
-                    table,
-                    columns,
-                    cells_for(key.pixels.height, cell_pixels.height),
-                    cell_pixels,
-                ),
+                rows,
+                source_regions: TablePlan::source_regions(table, columns, rows, cell_pixels),
             }));
         }
         if let Some(error) = self.failures.get(&identity) {
@@ -618,6 +616,8 @@ impl RasterCache {
                 return Err(error);
             }
         };
+        let (columns, rows) = aligned_cells(plan.key.pixels, cell_pixels)?;
+        debug_assert_eq!((plan.columns, plan.rows), (columns, rows));
         let rgba: Arc<[u8]> = Arc::from(rendered.into_raw());
         let bytes = rgba.len();
         if bytes > self.capacity {
@@ -644,12 +644,12 @@ impl RasterCache {
         }
         self.table_keys.insert(identity, plan.key);
         self.used = self.used.saturating_add(bytes);
-        let source_regions = TablePlan::source_regions(table, plan.columns, plan.rows, cell_pixels);
+        let source_regions = TablePlan::source_regions(table, columns, rows, cell_pixels);
         Ok(Some(TableRaster {
             asset,
             element_key: plan.element_key,
-            columns: plan.columns,
-            rows: plan.rows,
+            columns,
+            rows,
             source_regions,
         }))
     }
@@ -669,11 +669,12 @@ impl RasterCache {
             && let Some(entry) = self.entries.get_mut(&key)
         {
             entry.last_used = self.clock;
+            let (columns, rows) = aligned_cells(key.pixels, cell_pixels)?;
             return Ok(Some(MathRaster {
                 asset: Arc::clone(&entry.asset),
                 element_key: MathPlan::element_key(index),
-                columns: cells_for(key.pixels.width, cell_pixels.width),
-                rows: cells_for(key.pixels.height, cell_pixels.height),
+                columns,
+                rows,
             }));
         }
         if let Some(error) = self.failures.get(&identity) {
@@ -694,6 +695,8 @@ impl RasterCache {
                 return Err(error);
             }
         };
+        let (columns, rows) = aligned_cells(plan.key.pixels, cell_pixels)?;
+        debug_assert_eq!((plan.columns, plan.rows), (columns, rows));
         let rgba: Arc<[u8]> = Arc::from(rendered.into_raw());
         let bytes = rgba.len();
         if bytes > self.capacity {
@@ -723,8 +726,8 @@ impl RasterCache {
         Ok(Some(MathRaster {
             asset,
             element_key: plan.element_key,
-            columns: plan.columns,
-            rows: plan.rows,
+            columns,
+            rows,
         }))
     }
 
@@ -765,9 +768,70 @@ fn aspect_fit(source: PixelSize, bounds: PixelSize) -> PixelSize {
     }
 }
 
-fn cells_for(pixels: u32, cell: u32) -> u16 {
-    let cells = pixels.saturating_add(cell.saturating_sub(1)) / cell.max(1);
-    u16::try_from(cells).unwrap_or(u16::MAX).max(1)
+pub(crate) fn cell_aligned_size(content: PixelSize, cell: PixelSize) -> PixelSize {
+    PixelSize {
+        width: align_to_cell(content.width, cell.width),
+        height: align_to_cell(content.height, cell.height),
+    }
+}
+
+pub(crate) fn pad_to_cell_grid(raster: RgbaImage, cell: PixelSize) -> RgbaImage {
+    let canvas_size = cell_aligned_size(
+        PixelSize {
+            width: raster.width(),
+            height: raster.height(),
+        },
+        cell,
+    );
+    if raster.width() == canvas_size.width && raster.height() == canvas_size.height {
+        return raster;
+    }
+
+    let mut canvas = RgbaImage::new(canvas_size.width, canvas_size.height);
+    image::imageops::replace(&mut canvas, &raster, 0, 0);
+    canvas
+}
+
+fn align_to_cell(pixels: u32, cell: u32) -> u32 {
+    let cell = cell.max(1);
+    pixels.max(1).div_ceil(cell).saturating_mul(cell)
+}
+
+fn aligned_cells(pixels: PixelSize, cell: PixelSize) -> Result<(u16, u16), String> {
+    let cell_width = cell.width.max(1);
+    let cell_height = cell.height.max(1);
+    if pixels.width == 0
+        || pixels.height == 0
+        || !pixels.width.is_multiple_of(cell_width)
+        || !pixels.height.is_multiple_of(cell_height)
+    {
+        return Err(format!(
+            "raster {}x{} does not align to terminal cells {}x{}",
+            pixels.width, pixels.height, cell_width, cell_height
+        ));
+    }
+    let columns = u16::try_from(pixels.width / cell_width)
+        .map_err(|_| "raster width exceeds the terminal cell range".to_owned())?;
+    let rows = u16::try_from(pixels.height / cell_height)
+        .map_err(|_| "raster height exceeds the terminal cell range".to_owned())?;
+    Ok((columns.max(1), rows.max(1)))
+}
+
+fn raster_cache_hash(content_hash: [u8; 32], content: PixelSize, cell: PixelSize) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&content_hash);
+    hasher.update(&content.width.to_le_bytes());
+    hasher.update(&content.height.to_le_bytes());
+    hasher.update(&cell.width.to_le_bytes());
+    hasher.update(&cell.height.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn raster_bytes(pixels: PixelSize) -> Option<usize> {
+    usize::try_from(pixels.width)
+        .ok()?
+        .checked_mul(usize::try_from(pixels.height).ok()?)?
+        .checked_mul(4)
 }
 
 #[cfg(test)]
@@ -979,6 +1043,153 @@ mod tests {
         assert!(!cache.contains(key_a));
         assert!(cache.contains(asset_b.key));
         fs::remove_dir_all(root).expect("fixture directory should be removable");
+    }
+
+    #[test]
+    fn rasterized_images_pad_to_cells_without_resizing_the_content() {
+        let root = temp_dir();
+        let path = root.join("unaligned.png");
+        RgbaImage::from_pixel(13, 9, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .expect("fixture should save");
+        let prepared = PreparedImage {
+            element_key: ElementKey(1),
+            source: 0..1,
+            label: "unaligned".to_owned(),
+            text_projection: String::new(),
+            style: TextStyle::default(),
+            recipe: Some(inspect_image(path).expect("fixture should inspect")),
+        };
+        let mut cache = RasterCache::default();
+        let mut keys = Vec::new();
+
+        for cell in [
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            PixelSize {
+                width: 10,
+                height: 6,
+            },
+        ] {
+            let (asset, columns, rows) = cache
+                .rasterize(&prepared, (4, 4), cell)
+                .expect("image should rasterize")
+                .expect("image should fit the cache");
+            assert_eq!(asset.key.pixels.width, u32::from(columns) * cell.width);
+            assert_eq!(asset.key.pixels.height, u32::from(rows) * cell.height);
+
+            let raster = RgbaImage::from_raw(
+                asset.key.pixels.width,
+                asset.key.pixels.height,
+                asset.rgba.to_vec(),
+            )
+            .expect("cached raster dimensions should match its pixels");
+            assert!(
+                raster
+                    .enumerate_pixels()
+                    .filter(|(x, y, _)| *x < 13 && *y < 9)
+                    .all(|(_, _, pixel)| pixel.0 == [10, 20, 30, 255]),
+                "cell alignment must not rescale the source content"
+            );
+            assert!(
+                raster
+                    .enumerate_pixels()
+                    .filter(|(x, y, _)| *x >= 13 || *y >= 9)
+                    .all(|(_, _, pixel)| pixel.0[3] == 0),
+                "cell alignment gaps must remain transparent"
+            );
+            keys.push(asset.key);
+        }
+
+        assert_ne!(keys[0], keys[1], "cell geometry belongs in cache identity");
+        fs::remove_dir_all(root).expect("fixture directory should be removable");
+    }
+
+    #[test]
+    fn rasterized_images_reject_oversized_aligned_canvases_before_allocation() {
+        let root = temp_dir();
+        let path = root.join("pixel.png");
+        RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .expect("fixture should save");
+        let prepared = PreparedImage {
+            element_key: ElementKey(1),
+            source: 0..1,
+            label: "pixel".to_owned(),
+            text_projection: String::new(),
+            style: TextStyle::default(),
+            recipe: Some(inspect_image(path).expect("fixture should inspect")),
+        };
+        let mut cache = RasterCache::default();
+
+        let rendered = cache
+            .rasterize(
+                &prepared,
+                (1, 1),
+                PixelSize {
+                    width: u32::from(u16::MAX),
+                    height: u32::from(u16::MAX),
+                },
+            )
+            .expect("oversized alignment should use the existing fallback path");
+
+        assert!(rendered.is_none());
+        assert_eq!(cache.used, 0);
+        fs::remove_dir_all(root).expect("fixture directory should be removable");
+    }
+
+    #[test]
+    fn generated_raster_metadata_matches_between_cache_miss_and_hit() {
+        let document = Document::parse(
+            "# Heading\n\n$x^2$\n\n| a | b |\n| --- | --- |\n| c | d |\n".to_owned(),
+        );
+        let cell = PixelSize {
+            width: 9,
+            height: 17,
+        };
+        let mut cache = RasterCache::default();
+
+        let heading_first = cache
+            .rasterize_heading(0, &document.headings()[0], 40, 20, cell)
+            .expect("heading should rasterize")
+            .expect("heading raster should exist");
+        let heading_cached = cache
+            .rasterize_heading(0, &document.headings()[0], 40, 20, cell)
+            .expect("cached heading should load")
+            .expect("cached heading raster should exist");
+        assert_eq!(
+            (heading_first.columns, heading_first.rows),
+            (heading_cached.columns, heading_cached.rows)
+        );
+
+        let math_first = cache
+            .rasterize_math(0, &document.math()[0], 40, 20, cell)
+            .expect("math should rasterize")
+            .expect("math raster should exist");
+        let math_cached = cache
+            .rasterize_math(0, &document.math()[0], 40, 20, cell)
+            .expect("cached math should load")
+            .expect("cached math raster should exist");
+        assert_eq!(
+            (math_first.columns, math_first.rows),
+            (math_cached.columns, math_cached.rows)
+        );
+
+        let table_first = cache
+            .rasterize_table(0, &document.tables()[0], 40, cell)
+            .expect("table should rasterize")
+            .expect("table raster should exist");
+        let table_cached = cache
+            .rasterize_table(0, &document.tables()[0], 40, cell)
+            .expect("cached table should load")
+            .expect("cached table raster should exist");
+        assert_eq!(
+            (table_first.columns, table_first.rows),
+            (table_cached.columns, table_cached.rows)
+        );
+        assert_eq!(table_first.source_regions, table_cached.source_regions);
     }
 
     #[test]
