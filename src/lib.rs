@@ -44,11 +44,29 @@ pub fn run(path: &Path) -> Result<()> {
 
 /// Open one Markdown document with an optional graphics-backend override.
 pub fn run_with_graphics(path: &Path, graphics: Option<GraphicsPreference>) -> Result<()> {
-    let config = config::Config::load()?;
     let document = load_document(path)?;
+    run_document_with_graphics(path, &document, graphics)
+}
+
+/// Open Markdown supplied through standard input with an optional
+/// graphics-backend override.
+pub fn run_markdown_with_graphics(
+    source: &str,
+    graphics: Option<GraphicsPreference>,
+) -> Result<()> {
+    let document = Document::parse(source.to_owned());
+    run_document_with_graphics(Path::new("<stdin>"), &document, graphics)
+}
+
+fn run_document_with_graphics(
+    path: &Path,
+    document: &Document,
+    graphics: Option<GraphicsPreference>,
+) -> Result<()> {
+    let config = config::Config::load()?;
     terminal::run(
         path,
-        &document,
+        document,
         &config,
         graphics.unwrap_or_else(|| config.graphics_preference()),
     )

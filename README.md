@@ -27,6 +27,15 @@ Run the one-file viewer from the development shell:
 nix develop -c cargo run -- examples/showcase.md
 ```
 
+Markdown can also be piped through standard input. Use either an omitted path
+or the conventional `-`; relative image paths are resolved from the current
+working directory:
+
+```console
+cat examples/showcase.md | nix develop -c cargo run --
+printf '# Hello\n' | nix develop -c cargo run -- -
+```
+
 The showcase covers headings, inline styles, nested and ordered lists, task
 lists, quotations, code, tables, math events, a horizontal rule, HTML, and an
 image diagnostic. You can also replace it with any local Markdown path.

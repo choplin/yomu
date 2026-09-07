@@ -10,7 +10,7 @@ anyhow = "1.0"
 base64 = "0.22"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 fontdue = { version = "=0.9.3", default-features = false, features = ["std"] }
 fontdb = "0.23"
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }

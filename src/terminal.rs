@@ -1,3 +1,4 @@
+use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Stdout};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
@@ -35,11 +36,10 @@ pub(crate) fn run(
     config: &Config,
     preference: GraphicsPreference,
 ) -> Result<()> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err(anyhow!(
-            "an interactive terminal is required (stdin and stdout must both be terminals)"
-        ));
+    if !io::stdout().is_terminal() {
+        return Err(anyhow!("an interactive terminal is required on stdout"));
     }
+    let _terminal_input = TerminalInput::attach()?;
 
     let heading_fonts = if config.heading_families().is_empty() {
         HeadingFonts::default()
@@ -91,6 +91,80 @@ pub(crate) fn run(
     );
     let restore_result = session.restore();
     combine_run_and_restore(run_result, restore_result)
+}
+
+struct TerminalInput {
+    #[cfg(unix)]
+    _terminal: Option<File>,
+    #[cfg(windows)]
+    _terminal: Option<File>,
+    #[cfg(windows)]
+    original: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+impl TerminalInput {
+    #[cfg(unix)]
+    fn attach() -> Result<Self> {
+        if io::stdin().is_terminal() {
+            return Ok(Self { _terminal: None });
+        }
+        let terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .context("could not open the controlling terminal for input")?;
+        Ok(Self {
+            _terminal: Some(terminal),
+        })
+    }
+
+    #[cfg(windows)]
+    fn attach() -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetStdHandle};
+
+        if io::stdin().is_terminal() {
+            return Ok(Self {
+                _terminal: None,
+                original: None,
+            });
+        }
+        let terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .context("could not open the console for input")?;
+        // SAFETY: These calls only inspect and replace the process's standard
+        // input handle. `terminal` remains alive until the original handle is
+        // restored by `Drop`.
+        let original = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if original.is_null() || original == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error()).context("could not inspect standard input");
+        }
+        let handle = terminal.as_raw_handle().cast();
+        if unsafe { SetStdHandle(STD_INPUT_HANDLE, handle) } == 0 {
+            return Err(io::Error::last_os_error()).context("could not attach console input");
+        }
+        Ok(Self {
+            _terminal: Some(terminal),
+            original: Some(original),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TerminalInput {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, SetStdHandle};
+
+        if let Some(original) = self.original {
+            // SAFETY: `original` came from `GetStdHandle` in `attach` and remains
+            // process-owned. Restoration happens before `_terminal` is closed.
+            let _ = unsafe { SetStdHandle(STD_INPUT_HANDLE, original) };
+        }
+    }
 }
 
 fn combine_run_and_restore(run_result: Result<()>, restore_result: Result<()>) -> Result<()> {

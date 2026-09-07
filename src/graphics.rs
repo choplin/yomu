@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +65,21 @@ impl CapabilityEvidence {
     }
 
     pub(crate) fn query_stdio() -> io::Result<Self> {
+        let mut input = terminal_input()?;
+        Self::query(&mut input)
+    }
+
+    #[cfg(unix)]
+    fn query(input: &mut (impl Read + std::os::fd::AsFd)) -> io::Result<Self> {
+        Self::query_inner(input)
+    }
+
+    #[cfg(windows)]
+    fn query(input: &mut (impl Read + std::os::windows::io::AsRawHandle)) -> io::Result<Self> {
+        Self::query_inner(input)
+    }
+
+    fn query_inner(input: &mut impl TerminalRead) -> io::Result<Self> {
         let options = QueryStdioOptions::default();
         let deadline = Instant::now() + options.timeout;
         let query = Parser::query(inside_tmux(), options);
@@ -73,7 +89,6 @@ impl CapabilityEvidence {
         drop(stdout);
 
         let mut parser = Parser::new();
-        let mut input = io::stdin().lock();
         let mut evidence = Self::environment_fallback();
         let mut buffer = [0u8; 256];
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -142,6 +157,28 @@ impl CapabilityEvidence {
                 .to_owned()
         })
     }
+}
+
+#[cfg(unix)]
+trait TerminalRead: Read + std::os::fd::AsFd {}
+
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsFd> TerminalRead for T {}
+
+#[cfg(windows)]
+trait TerminalRead: Read + std::os::windows::io::AsRawHandle {}
+
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsRawHandle> TerminalRead for T {}
+
+#[cfg(unix)]
+fn terminal_input() -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open("/dev/tty")
+}
+
+#[cfg(windows)]
+fn terminal_input() -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open("CONIN$")
 }
 
 pub(crate) fn select_graphics_backend(
@@ -747,19 +784,17 @@ fn stdin_ready(input: &impl std::os::fd::AsFd, timeout: Duration) -> io::Result<
 }
 
 #[cfg(windows)]
-fn stdin_ready<T>(_input: &T, timeout: Duration) -> io::Result<bool> {
-    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+fn stdin_ready(
+    input: &impl std::os::windows::io::AsRawHandle,
+    timeout: Duration,
+) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
-    // SAFETY: GetStdHandle returns a process-owned handle that remains valid for
-    // the duration of this synchronous wait; the function does not take ownership.
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `handle` was validated above and is only observed, never closed.
+    let handle = input.as_raw_handle().cast();
+    // SAFETY: `handle` is borrowed from `input`, which remains alive throughout
+    // the wait, and the function does not take ownership of it.
     match unsafe { WaitForSingleObject(handle, milliseconds) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
