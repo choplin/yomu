@@ -308,6 +308,12 @@ impl Layout {
                     style.muted = true;
                     builder.text(&projection, link.destination_source.clone(), style, false);
                 }
+                Segment::CodeBlock { index } => {
+                    let Some(code_block) = document.code_blocks().get(*index) else {
+                        continue;
+                    };
+                    builder.code_block(code_block);
+                }
                 Segment::Math { index } => {
                     let Some(math) = document.math().get(*index) else {
                         continue;
@@ -801,6 +807,30 @@ impl Builder {
         self.line_break(table.source.end, true);
     }
 
+    fn code_block(&mut self, code_block: &crate::CodeBlockElement) {
+        self.line_break(code_block.source.start, false);
+        if let Some(language) = code_block.language.as_deref() {
+            let mut label_style = code_block.style;
+            label_style.code = false;
+            label_style.muted = true;
+            self.text(
+                language,
+                code_block.source.start..code_block.source.start,
+                label_style,
+                false,
+            );
+            self.push_row(code_block.source.start);
+        }
+
+        for fragment in &code_block.fragments {
+            let Some(text) = code_block.text.get(fragment.text.clone()) else {
+                continue;
+            };
+            self.text(text, fragment.source.clone(), fragment.style, false);
+        }
+        self.line_break(code_block.source.end, true);
+    }
+
     fn push_row(&mut self, fallback: usize) {
         let source = row_source(&self.current).unwrap_or(fallback..fallback);
         self.rows.push(LayoutRow {
@@ -1058,6 +1088,152 @@ mod tests {
                     && fragment.source.end <= document.source_len()
             })
         }));
+    }
+
+    #[test]
+    fn fenced_code_language_and_token_styles_survive_layout() {
+        let markdown = "```rust extra words\nfn main() { println!(\"hello\"); }\n```\n";
+        let document = Document::parse(markdown.to_owned());
+        let layout = Layout::new(&document, 80);
+        let fragments = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .collect::<Vec<_>>();
+
+        let label = fragments
+            .iter()
+            .find(|fragment| fragment.text == "rust")
+            .expect("declared language should be visible");
+        assert!(label.style.muted);
+        assert!(!label.style.code);
+        assert!(label.source.is_empty());
+
+        let code_fragments = fragments
+            .iter()
+            .filter(|fragment| !fragment.source.is_empty())
+            .collect::<Vec<_>>();
+        assert!(code_fragments.iter().all(|fragment| fragment.style.code));
+        assert!(
+            code_fragments
+                .iter()
+                .all(|fragment| fragment.style.foreground.is_some())
+        );
+        let colors = code_fragments
+            .iter()
+            .filter_map(|fragment| fragment.style.foreground)
+            .collect::<HashSet<_>>();
+        assert!(colors.len() > 1, "Rust tokens should use multiple colors");
+    }
+
+    #[test]
+    fn unknown_code_language_falls_back_and_wrapping_keeps_source_ranges() {
+        let markdown = "```made-up-language\nlong_identifier = still_readable\n```\n";
+        let document = Document::parse(markdown.to_owned());
+        let code_block = &document.code_blocks()[0];
+        let layout = Layout::new(&document, 10);
+        let fragments = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .collect::<Vec<_>>();
+        let rendered_code = fragments
+            .iter()
+            .filter(|fragment| !fragment.source.is_empty())
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(rendered_code, code_block.text.trim_end());
+        let label = fragments
+            .iter()
+            .filter(|fragment| fragment.source.is_empty() && fragment.style.muted)
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+        assert_eq!(label, "made-up-language");
+        assert!(
+            fragments
+                .iter()
+                .filter(|fragment| !fragment.source.is_empty())
+                .all(|fragment| fragment.style.code && fragment.style.foreground.is_none())
+        );
+        assert!(layout.rows().iter().all(|row| {
+            row.fragments.iter().all(|fragment| {
+                fragment.source.is_empty()
+                    || (code_block.content_source.start <= fragment.source.start
+                        && fragment.source.end <= code_block.content_source.end)
+            })
+        }));
+    }
+
+    #[test]
+    fn inline_code_keeps_its_existing_fallback_style() {
+        let document = Document::parse("Use `inline_code` here.".to_owned());
+        let layout = Layout::new(&document, 80);
+        let inline = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .find(|fragment| fragment.text == "inline_code")
+            .expect("inline code should remain in the text layout");
+
+        assert!(inline.style.code);
+        assert_eq!(inline.style.foreground, None);
+    }
+
+    #[test]
+    fn language_label_wraps_without_losing_text_at_one_column() {
+        let document = Document::parse("```typescript\nconst x = 1;\n```\n".to_owned());
+        let layout = Layout::new(&document, 1);
+        let label = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .filter(|fragment| fragment.source.is_empty() && fragment.style.muted)
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(label, "typescript");
+    }
+
+    #[test]
+    fn indented_code_layout_maps_each_line_to_its_exact_source() {
+        let markdown = "    abc\n    def\n";
+        let document = Document::parse(markdown.to_owned());
+        let layout = Layout::new(&document, 80);
+        let fragments = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .collect::<Vec<_>>();
+        let abc = fragments
+            .iter()
+            .find(|fragment| fragment.text == "abc")
+            .expect("first code line should be rendered");
+        let def = fragments
+            .iter()
+            .find(|fragment| fragment.text == "def")
+            .expect("second code line should be rendered");
+
+        assert_eq!(&markdown[abc.source.clone()], "abc");
+        assert_eq!(&markdown[def.source.clone()], "def");
+    }
+
+    #[test]
+    fn indented_fence_layout_maps_each_line_to_its_exact_source() {
+        let markdown = "   ```rust\n   abc\n   def\n   ```\n";
+        let document = Document::parse(markdown.to_owned());
+        let layout = Layout::new(&document, 80);
+        let fragments = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .collect::<Vec<_>>();
+        let def = fragments
+            .iter()
+            .find(|fragment| fragment.text == "def")
+            .expect("second highlighted line should be rendered");
+
+        assert_eq!(&markdown[def.source.clone()], "def");
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+use crate::code::{self, HighlightedSpan};
 
 /// A half-open UTF-8 byte range in the original Markdown source.
 pub type SourceSpan = Range<usize>;
@@ -132,6 +134,43 @@ pub struct TableElement {
     pub style: TextStyle,
 }
 
+/// A fenced or indented Markdown code block with its source identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeBlockElement {
+    /// The complete fenced info string, or `None` for an indented block.
+    pub info: Option<String>,
+    /// The first whitespace-delimited word of the fenced info string.
+    pub language: Option<String>,
+    pub text: String,
+    pub source: SourceSpan,
+    /// The enclosing source range; per-fragment mapping retains any gaps inside it.
+    pub content_source: SourceSpan,
+    pub style: TextStyle,
+    pub(crate) parts: Vec<CodeBlockPart>,
+    pub(crate) fragments: Vec<CodeBlockFragment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CodeBlockPart {
+    pub text: Range<usize>,
+    pub source: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CodeBlockFragment {
+    pub text: Range<usize>,
+    pub source: SourceSpan,
+    pub style: TextStyle,
+}
+
+/// An RGB terminal text color derived from document presentation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TextColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
 /// Presentation hints derived from Markdown semantics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TextStyle {
@@ -143,6 +182,7 @@ pub struct TextStyle {
     pub link: bool,
     pub quote: bool,
     pub muted: bool,
+    pub foreground: Option<TextColor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +216,9 @@ pub(crate) enum Segment {
     Link {
         index: usize,
     },
+    CodeBlock {
+        index: usize,
+    },
 }
 
 /// Parsed Markdown content with source identity attached to every fragment.
@@ -189,6 +232,7 @@ pub struct Document {
     tables: Vec<TableElement>,
     math: Vec<MathElement>,
     links: Vec<LinkElement>,
+    code_blocks: Vec<CodeBlockElement>,
 }
 
 impl Document {
@@ -251,6 +295,11 @@ impl Document {
     pub fn links(&self) -> &[LinkElement] {
         &self.links
     }
+
+    #[must_use]
+    pub fn code_blocks(&self) -> &[CodeBlockElement] {
+        &self.code_blocks
+    }
 }
 
 #[derive(Debug)]
@@ -272,6 +321,18 @@ struct Builder {
     math: Vec<MathElement>,
     link: Option<LinkBuilder>,
     links: Vec<LinkElement>,
+    code_block: Option<CodeBlockBuilder>,
+    code_blocks: Vec<CodeBlockElement>,
+}
+
+#[derive(Debug)]
+struct CodeBlockBuilder {
+    info: Option<String>,
+    language: Option<String>,
+    text: String,
+    source: SourceSpan,
+    parts: Vec<CodeBlockPart>,
+    style: TextStyle,
 }
 
 #[derive(Debug)]
@@ -328,6 +389,29 @@ struct TableCellBuilder {
 
 impl Builder {
     fn event(&mut self, event: Event<'_>, range: SourceSpan) {
+        if self.code_block.is_some() {
+            match event {
+                Event::End(TagEnd::CodeBlock) => self.finish_code_block(range),
+                Event::Text(text) | Event::Code(text) => {
+                    if let Some(code_block) = self.code_block.as_mut() {
+                        let text_start = code_block.text.len();
+                        code_block.text.push_str(text.as_ref());
+                        let text_end = code_block.text.len();
+                        code_block.parts.push(CodeBlockPart {
+                            text: text_start..text_end,
+                            source: range.clone(),
+                        });
+                        code_block.source.end = code_block.source.end.max(range.end);
+                    }
+                }
+                _ => {
+                    if let Some(code_block) = self.code_block.as_mut() {
+                        code_block.source.end = code_block.source.end.max(range.end);
+                    }
+                }
+            }
+            return;
+        }
         if self.heading.is_some() {
             match event {
                 Event::End(TagEnd::Heading(_)) => self.finish_heading(range),
@@ -502,9 +586,27 @@ impl Builder {
                 self.style.quote = true;
                 self.synthetic_text("│ ", range.start, self.style);
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.line_break(range.start, false);
-                self.style.code = true;
+                let info = match kind {
+                    CodeBlockKind::Indented => None,
+                    CodeBlockKind::Fenced(info) => Some(info.into_string()),
+                };
+                let language = info
+                    .as_deref()
+                    .and_then(|info| info.split_whitespace().next())
+                    .filter(|language| !language.is_empty())
+                    .map(str::to_owned);
+                let mut style = self.style;
+                style.code = true;
+                self.code_block = Some(CodeBlockBuilder {
+                    info,
+                    language,
+                    text: String::new(),
+                    source: range,
+                    parts: Vec::new(),
+                    style,
+                });
             }
             Tag::HtmlBlock => {
                 self.line_break(range.start, false);
@@ -590,8 +692,7 @@ impl Builder {
                 self.line_break(range.end, true);
             }
             TagEnd::CodeBlock => {
-                self.style.code = false;
-                self.line_break(range.end, true);
+                // Code block endings are consumed while the block builder is active.
             }
             TagEnd::HtmlBlock => {
                 self.style.muted = false;
@@ -718,6 +819,43 @@ impl Builder {
         self.segments.push(Segment::Link { index });
     }
 
+    fn finish_code_block(&mut self, range: SourceSpan) {
+        let Some(mut code_block) = self.code_block.take() else {
+            return;
+        };
+        code_block.source.end = code_block.source.end.max(range.end);
+        let content_source = code_block.parts.first().map_or(
+            code_block.source.start..code_block.source.start,
+            |first| {
+                let end = code_block
+                    .parts
+                    .last()
+                    .map_or(first.source.end, |last| last.source.end);
+                first.source.start..end
+            },
+        );
+        let highlighted = code::highlight(
+            &code_block.text,
+            code_block.language.as_deref(),
+            code_block.style,
+        );
+        let fragments =
+            code_block_fragments(&code_block.parts, highlighted.as_deref(), code_block.style);
+        let index = self.code_blocks.len();
+        self.code_blocks.push(CodeBlockElement {
+            info: code_block.info,
+            language: code_block.language,
+            text: code_block.text,
+            source: code_block.source,
+            content_source,
+            style: code_block.style,
+            parts: code_block.parts,
+            fragments,
+        });
+        self.segments.push(Segment::CodeBlock { index });
+        self.line_break(range.end, true);
+    }
+
     fn finish_heading(&mut self, range: SourceSpan) {
         let Some(mut heading) = self.heading.take() else {
             return;
@@ -802,8 +940,71 @@ impl Builder {
             tables: self.tables,
             math: self.math,
             links: self.links,
+            code_blocks: self.code_blocks,
         }
     }
+}
+
+fn code_block_fragments(
+    parts: &[CodeBlockPart],
+    highlighted: Option<&[HighlightedSpan]>,
+    fallback_style: TextStyle,
+) -> Vec<CodeBlockFragment> {
+    let Some(highlighted) = highlighted else {
+        return parts
+            .iter()
+            .map(|part| CodeBlockFragment {
+                text: part.text.clone(),
+                source: part.source.clone(),
+                style: fallback_style,
+            })
+            .collect();
+    };
+
+    let mut fragments = Vec::new();
+    let mut part_index = 0usize;
+    for span in highlighted {
+        while let Some(part) = parts.get(part_index) {
+            if part.text.end <= span.range.start {
+                part_index = part_index.saturating_add(1);
+                continue;
+            }
+            if part.text.start >= span.range.end {
+                break;
+            }
+
+            let start = span.range.start.max(part.text.start);
+            let end = span.range.end.min(part.text.end);
+            if start < end {
+                fragments.push(CodeBlockFragment {
+                    text: start..end,
+                    source: map_code_part_source(part, start..end),
+                    style: span.style,
+                });
+            }
+            if part.text.end <= span.range.end {
+                part_index = part_index.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+    }
+    fragments
+}
+
+fn map_code_part_source(part: &CodeBlockPart, text: Range<usize>) -> SourceSpan {
+    if part.source.is_empty() || part.text.is_empty() {
+        return part.source.clone();
+    }
+    let text_len = part.text.end.saturating_sub(part.text.start);
+    let source_len = part.source.end.saturating_sub(part.source.start);
+    let map = |offset: usize| {
+        part.source
+            .start
+            .saturating_add(offset.saturating_mul(source_len) / text_len)
+            .min(part.source.end)
+    };
+    map(text.start.saturating_sub(part.text.start))..map(text.end.saturating_sub(part.text.start))
 }
 
 /// Locate the destination inside the link's own source text, preferring the text after its label.
@@ -942,7 +1143,8 @@ mod tests {
                 | Segment::Heading { .. }
                 | Segment::Table { .. }
                 | Segment::Math { .. }
-                | Segment::Link { .. } => None,
+                | Segment::Link { .. }
+                | Segment::CodeBlock { .. } => None,
             })
             .collect();
 
@@ -1042,6 +1244,56 @@ mod tests {
         assert!(document.tables().is_empty());
         assert!(rendered.contains("name"));
         assert!(rendered.contains("missing delimiter row"));
+    }
+
+    #[test]
+    fn fenced_code_blocks_retain_standard_info_string_language_and_source() {
+        let source = "```rust linenos=true\nfn main() {\n    println!(\"hello\");\n}\n```\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.code_blocks().len(), 1);
+        let code_block = &document.code_blocks()[0];
+        assert_eq!(code_block.info.as_deref(), Some("rust linenos=true"));
+        assert_eq!(code_block.language.as_deref(), Some("rust"));
+        assert_eq!(
+            code_block.text,
+            "fn main() {\n    println!(\"hello\");\n}\n"
+        );
+        assert_eq!(&source[code_block.source.clone()], source.trim_end());
+        assert_eq!(&source[code_block.content_source.clone()], code_block.text);
+        assert!(code_block.style.code);
+        assert!(
+            document
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::CodeBlock { index: 0 }))
+        );
+    }
+
+    #[test]
+    fn indented_and_language_free_blocks_do_not_invent_a_language() {
+        let source = "```\nplain fenced\n```\n\n    indented\n";
+        let document = Document::parse(source.to_owned());
+
+        assert_eq!(document.code_blocks().len(), 2);
+        assert_eq!(document.code_blocks()[0].info.as_deref(), Some(""));
+        assert_eq!(document.code_blocks()[0].language, None);
+        assert_eq!(document.code_blocks()[1].info, None);
+        assert_eq!(document.code_blocks()[1].language, None);
+    }
+
+    #[test]
+    fn code_block_parts_retain_source_gaps_removed_by_markdown_parsing() {
+        let source = "    abc\n    def\n";
+        let document = Document::parse(source.to_owned());
+        let code_block = &document.code_blocks()[0];
+
+        assert_eq!(code_block.text, "abc\ndef\n");
+        assert_eq!(code_block.parts.len(), 2);
+        assert_eq!(&source[code_block.parts[0].source.clone()], "abc\n");
+        assert_eq!(&source[code_block.parts[1].source.clone()], "def\n");
+        assert_eq!(&code_block.text[code_block.parts[0].text.clone()], "abc\n");
+        assert_eq!(&code_block.text[code_block.parts[1].text.clone()], "def\n");
     }
 
     #[test]

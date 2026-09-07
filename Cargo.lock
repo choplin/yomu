@@ -2143,6 +2143,7 @@ dependencies = [
  "ratatui-image",
  "resvg",
  "serde",
+ "syntect",
  "tex2typst-rs",
  "toml 0.9.12+spec-1.1.0",
  "typst",

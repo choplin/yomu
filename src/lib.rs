@@ -1,6 +1,7 @@
 //! Core document, layout, and application state for raden.
 
 mod app;
+mod code;
 mod config;
 mod document;
 mod graphics;
@@ -20,8 +21,9 @@ use anyhow::{Context, Result};
 
 pub use app::{App, Command};
 pub use document::{
-    Document, HeadingElement, ImageElement, LinkElement, MathElement, MathForm, SourceEvent,
-    SourceSpan, TableAlignment, TableCell, TableElement, TableRow, TextStyle,
+    CodeBlockElement, Document, HeadingElement, ImageElement, LinkElement, MathElement, MathForm,
+    SourceEvent, SourceSpan, TableAlignment, TableCell, TableElement, TableRow, TextColor,
+    TextStyle,
 };
 pub use graphics::GraphicsPreference;
 pub(crate) use image::{ElementKey, PixelSize, RasterAsset, RasterAssetKey, RasterCache};

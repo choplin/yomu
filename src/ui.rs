@@ -113,6 +113,9 @@ fn tui_style(source: TextStyle) -> Style {
     if source.muted {
         style = style.fg(Color::DarkGray);
     }
+    if let Some(color) = source.foreground {
+        style = style.fg(Color::Rgb(color.red, color.green, color.blue));
+    }
     style
 }
 
