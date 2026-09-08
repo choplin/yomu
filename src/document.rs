@@ -312,6 +312,7 @@ struct Builder {
     segments: Vec<Segment>,
     style: TextStyle,
     lists: Vec<ListState>,
+    pending_list_marker: Option<usize>,
     table: Option<TableBuilder>,
     tables: Vec<TableElement>,
     image: Option<ImageBuilder>,
@@ -389,6 +390,9 @@ struct TableCellBuilder {
 
 impl Builder {
     fn event(&mut self, event: Event<'_>, range: SourceSpan) {
+        if matches!(&event, Event::TaskListMarker(_)) {
+            self.discard_pending_list_marker();
+        }
         if self.code_block.is_some() {
             match event {
                 Event::End(TagEnd::CodeBlock) => self.finish_code_block(range),
@@ -485,7 +489,8 @@ impl Builder {
                 }
                 Event::TaskListMarker(checked) => {
                     if let Some(heading) = self.heading.as_mut() {
-                        heading.text.push_str(if checked { "[x] " } else { "[ ] " });
+                        heading.text.push_str(task_list_marker(checked));
+                        heading.text.push_str("  ");
                         heading.source.end = heading.source.end.max(range.end);
                     }
                 }
@@ -552,12 +557,8 @@ impl Builder {
                 self.line_break(range.end, true);
             }
             Event::TaskListMarker(checked) => {
-                self.text(
-                    if checked { "[x]" } else { "[ ]" },
-                    range.clone(),
-                    self.style,
-                );
-                self.synthetic_text(" ", range.end, self.style);
+                self.text(task_list_marker(checked), range.clone(), self.style);
+                self.synthetic_text("  ", range.end, self.style);
             }
         }
     }
@@ -625,6 +626,7 @@ impl Builder {
                         marker
                     })
                     .unwrap_or_else(|| "• ".to_owned());
+                self.pending_list_marker = Some(self.segments.len());
                 self.synthetic_text(&marker, range.start, self.style);
             }
             Tag::Table(alignments) => {
@@ -748,6 +750,23 @@ impl Builder {
                 style,
                 synthetic: true,
             });
+        }
+    }
+
+    fn discard_pending_list_marker(&mut self) {
+        let Some(index) = self.pending_list_marker.take() else {
+            return;
+        };
+        if index + 1 == self.segments.len()
+            && matches!(
+                self.segments.get(index),
+                Some(Segment::Text {
+                    synthetic: true,
+                    ..
+                })
+            )
+        {
+            self.segments.pop();
         }
     }
 
@@ -894,7 +913,8 @@ impl Builder {
             }
             Event::Html(text) | Event::InlineHtml(text) => table.push_text(text.as_ref(), range),
             Event::TaskListMarker(checked) => {
-                table.push_text(if checked { "[x] " } else { "[ ] " }, range);
+                table.push_text(task_list_marker(checked), range.clone());
+                table.push_text("  ", range);
             }
             Event::Start(Tag::Image { .. }) => table.push_text("[image: ", range),
             Event::End(TagEnd::Image) => table.push_text("]", range),
@@ -1122,14 +1142,17 @@ const fn heading_number(level: HeadingLevel) -> u8 {
     }
 }
 
+const fn task_list_marker(checked: bool) -> &'static str {
+    if checked { "☑" } else { "☐" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn enabled_extensions_keep_source_ranges() {
-        let source =
-            "# Title\n\n- [x] **bold** and ~~old~~ with $x$\n\n| a | b |\n| - | - |\n| 1 | 2 |\n";
+        let source = "# Title\n\n- [x] **bold** and ~~old~~ with $x$\n- [ ] pending\n\n| a | b |\n| - | - |\n| 1 | 2 |\n";
         let document = Document::parse(source.to_owned());
 
         let text_segments: Vec<_> = document
@@ -1148,7 +1171,33 @@ mod tests {
             })
             .collect();
 
-        assert!(text_segments.iter().any(|(text, _)| text == &"[x]"));
+        let task_markers: Vec<_> = text_segments
+            .iter()
+            .filter(|(text, _)| text == &"☑" || text == &"☐")
+            .collect();
+        assert_eq!(task_markers.len(), 2);
+        assert_eq!(task_markers[0].0, "☑");
+        assert_eq!(&source[task_markers[0].1.clone()], "[x]");
+        assert_eq!(task_markers[1].0, "☐");
+        assert_eq!(&source[task_markers[1].1.clone()], "[ ]");
+        assert!(text_segments.iter().all(|(text, _)| text != &"• "));
+
+        for (index, segment) in document.segments.iter().enumerate() {
+            let Segment::Text { text, .. } = segment else {
+                continue;
+            };
+            if text != "☑" && text != "☐" {
+                continue;
+            }
+            assert!(matches!(
+                document.segments.get(index + 1),
+                Some(Segment::Text {
+                    text,
+                    synthetic: true,
+                    ..
+                }) if text == "  "
+            ));
+        }
         assert_eq!(document.math().len(), 1);
         assert_eq!(document.math()[0].expression, "x");
         assert_eq!(document.math()[0].form, MathForm::Inline);
