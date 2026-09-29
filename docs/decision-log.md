@@ -1,7 +1,9 @@
 # Decision Log
 
-This log records architecture decisions newest first. Linked documents own the
-current rule and rationale.
+This table preserves design decisions whose historical context would otherwise
+disappear when linked documents are rewritten in place. Each row records a
+durable design rule chosen or revised among meaningful alternatives and why;
+implementation and documentation activity is not recorded. Newest first.
 
 | Date | Decision | Current documentation |
 | --- | --- | --- |

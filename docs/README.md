@@ -34,18 +34,28 @@ rejected alternatives, and only the history needed to explain that rule.
 Split files by design question, not by source module or work item. One design
 topic may constrain several modules, and one architectural unit may link to
 several design topics. When a decision changes, rewrite the design document so
-it continues to describe the present rule.
+it continues to describe the present rule. These documents are not ADRs: they
+do not accumulate dated states. The decision log preserves the superseded
+decision and why Raden revised it.
 
-## `decision-log.md`: history
+## `decision-log.md`: design decision history
 
-[`decision-log.md`](decision-log.md) records decisions newest first. Each entry
-states what changed and why, then links to the document that owns the current
-rule. It does not duplicate implementation details or the complete rationale.
+[`decision-log.md`](decision-log.md) preserves design decisions whose historical
+context would otherwise disappear when a design document is rewritten in
+place. A row records that Raden chose or revised a durable design rule among
+meaningful alternatives, summarizes why, and links to the document that owns
+the current rule and rationale.
+
+The log does not record implementation or documentation activity. Implementing,
+completing, testing, or refactoring an existing decision does not add a row;
+neither does synchronizing documentation with code or summarizing a change or
+release. If the design rule and its rationale did not change, the log does not
+change.
 
 ## Single source of truth
 
 Give every settled claim one canonical home. A top-level document may summarize
 a design rule at the depth needed for the mental model and link to its design
 document. The design document owns the exact contract. The decision log owns
-chronology. Source comments own details that are useful only while changing one
-implementation.
+the design-decision chronology that would otherwise disappear. Source comments
+own details that are useful only while changing one implementation.
