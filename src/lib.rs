@@ -11,7 +11,25 @@ mod layout;
 mod math;
 mod scene;
 mod table;
+#[cfg(unix)]
 mod terminal;
+#[cfg(not(unix))]
+mod terminal {
+    use std::path::Path;
+
+    use anyhow::{Result, bail};
+
+    use crate::{Document, GraphicsPreference, config::Config};
+
+    pub(crate) fn run(
+        _path: &Path,
+        _document: &Document,
+        _config: &Config,
+        _preference: GraphicsPreference,
+    ) -> Result<()> {
+        bail!("interactive terminal viewing is currently supported on Unix only")
+    }
+}
 mod ui;
 
 use std::fs;

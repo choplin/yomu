@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use urushi_tui_app::{KeyCode, KeyEvent};
 
 use crate::Layout;
 
@@ -19,7 +19,7 @@ impl Command {
     #[must_use]
     pub fn from_key(key: KeyEvent) -> Self {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Self::Quit,
+            KeyCode::Char('q') | KeyCode::Escape => Self::Quit,
             KeyCode::Up | KeyCode::Char('k') => Self::Up,
             KeyCode::Down | KeyCode::Char('j') => Self::Down,
             KeyCode::PageUp | KeyCode::Char('u') => Self::PageUp,
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn page_scrolling_binds_to_unmodified_d_and_u() {
-        let key = |code| Command::from_key(KeyEvent::from(code));
+        let key = |code| Command::from_key(KeyEvent::new(code));
 
         assert_eq!(key(KeyCode::Char('u')), Command::PageUp);
         assert_eq!(key(KeyCode::Char('d')), Command::PageDown);

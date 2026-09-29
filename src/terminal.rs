@@ -1,23 +1,24 @@
-use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+use urushi::View;
+use urushi_terminal::backend::native::NativeTerminal;
+use urushi_terminal::{
+    Command as TerminalCommand, CommandWriter, Event as TerminalEvent, EventSource,
+    KeyboardEnhancementQuery, Position, RawModeControl, TerminalCapabilities, TerminalOutput,
+    TerminalQuery, TerminalSize, WindowSize,
 };
-use ratatui::Terminal;
-use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::Rect;
+use urushi_tui_app::{
+    Admission, Application, Effect, Input, KeyKind, Runtime, Subscription, Surface,
+};
 
 use crate::graphics::{
-    CapabilityEvidence, GraphicsBackendKind, GraphicsPreference, GraphicsSelection, KittyBackend,
-    SixelBackend, select_graphics_backend,
+    GraphicsBackendKind, GraphicsPreference, GraphicsSelection, KittyBackend, SixelBackend,
+    select_graphics_backend,
 };
 use crate::heading::HeadingFonts;
 use crate::image::ImageCatalog;
@@ -26,9 +27,8 @@ use crate::{
     ui,
 };
 
-const INPUT_WAIT: Duration = Duration::from_millis(8);
-const INPUT_BATCH_WINDOW: Duration = Duration::from_millis(2);
-const MAX_INPUT_BATCH: usize = 64;
+const SIXEL_REDRAW: &str = "raden: sixel full redraw required";
+const GRAPHICS_FAILURE_PREFIX: &str = "raden graphics backend ";
 
 pub(crate) fn run(
     path: &Path,
@@ -39,196 +39,581 @@ pub(crate) fn run(
     if !io::stdout().is_terminal() {
         return Err(anyhow!("an interactive terminal is required on stdout"));
     }
-    let _terminal_input = TerminalInput::attach()?;
-
     let heading_fonts = if config.heading_families().is_empty() {
         HeadingFonts::default()
     } else {
         HeadingFonts::load(config.heading_families()).map_err(anyhow::Error::msg)?
     };
-    let mut session = TerminalSession::enter()?;
-    let needs_graphics = needs_graphics(document);
-    let should_probe = preference != GraphicsPreference::Text
-        && (needs_graphics || preference != GraphicsPreference::Auto);
-    let (evidence, probe_error) = if should_probe {
-        match CapabilityEvidence::query_stdio() {
-            Ok(evidence) => (evidence, None),
-            Err(error) if preference == GraphicsPreference::Auto => (
-                CapabilityEvidence::environment_fallback(),
-                Some(format!("capability query failed: {error}")),
-            ),
-            Err(error) => {
-                let restore_result = session.restore();
-                let selection_error = anyhow!("could not query graphics capabilities: {error}");
-                return combine_run_and_restore(Err(selection_error), restore_result);
+    let images = ImageCatalog::load(document, path);
+    let control = GraphicsControl::new();
+    let application = ReaderApplication {
+        path: path.to_path_buf(),
+        document: document.clone(),
+        images,
+        heading_fonts: Mutex::new(Some(heading_fonts)),
+        max_width: config.body_max_width(),
+        graphics: Arc::clone(&control),
+    };
+    let terminal = NativeTerminal::open().context("could not open the controlling terminal")?;
+    let backend = DirectGraphicsBackend::new(
+        terminal,
+        io::stdout(),
+        preference,
+        needs_graphics(document),
+        control,
+    );
+    let model = Runtime::new(application)
+        .backend(backend)
+        .bracketed_paste(false)
+        .focus_change(false)
+        .keyboard_enhancement(None)
+        .run()
+        .context("terminal application failed")?;
+    if let Some(error) = model.fatal_error {
+        Err(error).context("terminal application failed")
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GraphicsStartup {
+    kind: GraphicsBackendKind,
+    diagnostic: Option<String>,
+    queried_cell_pixels: Option<PixelSize>,
+}
+
+#[derive(Default)]
+struct GraphicsControlState {
+    startup: Option<GraphicsStartup>,
+    frame: Option<DesiredFrame>,
+    disable_requested: bool,
+}
+
+struct GraphicsControl {
+    state: Mutex<GraphicsControlState>,
+}
+
+impl GraphicsControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(GraphicsControlState::default()),
+        })
+    }
+
+    fn startup(&self) -> GraphicsStartup {
+        self.state
+            .lock()
+            .expect("graphics control poisoned")
+            .startup
+            .clone()
+            .unwrap_or(GraphicsStartup {
+                kind: GraphicsBackendKind::Text,
+                diagnostic: Some("graphics initialization was unavailable".to_owned()),
+                queried_cell_pixels: None,
+            })
+    }
+
+    fn set_startup(&self, startup: GraphicsStartup) {
+        self.state
+            .lock()
+            .expect("graphics control poisoned")
+            .startup = Some(startup);
+    }
+
+    fn publish(&self, frame: DesiredFrame) {
+        self.state.lock().expect("graphics control poisoned").frame = Some(frame);
+    }
+
+    fn take_frame(&self) -> Option<DesiredFrame> {
+        self.state
+            .lock()
+            .expect("graphics control poisoned")
+            .frame
+            .take()
+    }
+
+    fn discard_frame(&self) {
+        self.state.lock().expect("graphics control poisoned").frame = None;
+    }
+
+    fn request_disable(&self) {
+        let mut state = self.state.lock().expect("graphics control poisoned");
+        state.disable_requested = true;
+        state.frame = None;
+    }
+
+    fn take_disable_request(&self) -> bool {
+        let mut state = self.state.lock().expect("graphics control poisoned");
+        std::mem::take(&mut state.disable_requested)
+    }
+}
+
+struct DirectGraphicsBackend {
+    terminal: NativeTerminal,
+    graphics_output: Stdout,
+    preference: GraphicsPreference,
+    needs_graphics: bool,
+    control: Arc<GraphicsControl>,
+    graphics: GraphicsMode,
+    selected: bool,
+    last_generation: Option<u64>,
+    sixel_retry_generation: Option<u64>,
+}
+
+impl DirectGraphicsBackend {
+    fn new(
+        terminal: NativeTerminal,
+        graphics_output: Stdout,
+        preference: GraphicsPreference,
+        needs_graphics: bool,
+        control: Arc<GraphicsControl>,
+    ) -> Self {
+        Self {
+            terminal,
+            graphics_output,
+            preference,
+            needs_graphics,
+            control,
+            graphics: GraphicsMode::Text,
+            selected: false,
+            last_generation: None,
+            sixel_retry_generation: None,
+        }
+    }
+
+    fn select_graphics(&mut self, window: WindowSize) -> io::Result<()> {
+        if self.selected {
+            return Ok(());
+        }
+        let should_probe = self.preference != GraphicsPreference::Text
+            && (self.needs_graphics || self.preference != GraphicsPreference::Auto);
+        let capabilities = if should_probe {
+            self.terminal.terminal_capabilities()?
+        } else {
+            TerminalCapabilities::none()
+        };
+        let GraphicsSelection { backend, reason } =
+            select_graphics_backend(self.preference, capabilities, self.needs_graphics)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        self.graphics = GraphicsMode::from_kind(backend);
+        self.control.set_startup(GraphicsStartup {
+            kind: backend,
+            diagnostic: reason,
+            queried_cell_pixels: window.cell_pixels().and_then(convert_cell_pixels),
+        });
+        self.selected = true;
+        Ok(())
+    }
+
+    fn clear_before_resize(&mut self) -> io::Result<()> {
+        self.control.discard_frame();
+        self.last_generation = None;
+        self.sixel_retry_generation = None;
+        self.graphics.clear(&mut self.graphics_output)
+    }
+
+    fn flush_frame(&mut self) -> io::Result<()> {
+        if self.control.take_disable_request() {
+            if matches!(self.graphics, GraphicsMode::Kitty(_)) {
+                self.graphics.clear(&mut self.graphics_output)?;
+            }
+            self.graphics = GraphicsMode::Text;
+            self.last_generation = None;
+            self.sixel_retry_generation = None;
+        }
+        let Some(frame) = self.control.take_frame() else {
+            return self.terminal.flush();
+        };
+        if self.last_generation == Some(frame.generation) {
+            return self.terminal.flush();
+        }
+        self.terminal.flush()?;
+        if matches!(self.graphics, GraphicsMode::Sixel(_))
+            && self.sixel_retry_generation != Some(frame.generation)
+        {
+            self.graphics.clear(&mut self.graphics_output)?;
+            self.sixel_retry_generation = Some(frame.generation);
+            self.control.publish(frame);
+            return Err(io::Error::other(SIXEL_REDRAW));
+        }
+        let backend_name = self.graphics.name();
+        self.graphics
+            .render(&frame, &mut self.graphics_output)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("{GRAPHICS_FAILURE_PREFIX}{backend_name} failed: {error}"),
+                )
+            })?;
+        self.last_generation = Some(frame.generation);
+        self.sixel_retry_generation = None;
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        self.control.discard_frame();
+        self.terminal.flush()?;
+        self.graphics.clear(&mut self.graphics_output)?;
+        self.graphics = GraphicsMode::Text;
+        self.last_generation = None;
+        self.sixel_retry_generation = None;
+        Ok(())
+    }
+
+    fn observe_event(&mut self, event: &TerminalEvent) -> io::Result<()> {
+        if matches!(event, TerminalEvent::Resize(_)) {
+            self.clear_before_resize()?;
+        }
+        Ok(())
+    }
+}
+
+impl TerminalOutput for DirectGraphicsBackend {
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_frame()
+    }
+}
+
+impl CommandWriter for DirectGraphicsBackend {
+    fn write_command(&mut self, command: TerminalCommand<'_>) -> io::Result<()> {
+        if matches!(&command, TerminalCommand::SetAlternateScreen(false)) {
+            self.cleanup()?;
+        }
+        self.terminal.write_command(command)
+    }
+}
+
+impl EventSource for DirectGraphicsBackend {
+    fn read_event(&mut self) -> io::Result<TerminalEvent> {
+        let event = self.terminal.read_event()?;
+        self.observe_event(&event)?;
+        Ok(event)
+    }
+
+    fn poll_event(&mut self) -> io::Result<Option<TerminalEvent>> {
+        let event = self.terminal.poll_event()?;
+        if let Some(event) = &event {
+            self.observe_event(event)?;
+        }
+        Ok(event)
+    }
+
+    fn poll_event_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> io::Result<Option<TerminalEvent>> {
+        let event = self.terminal.poll_event_timeout(timeout)?;
+        if let Some(event) = &event {
+            self.observe_event(event)?;
+        }
+        Ok(event)
+    }
+}
+
+impl RawModeControl for DirectGraphicsBackend {
+    fn is_interactive(&self) -> bool {
+        self.terminal.is_interactive()
+    }
+
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        self.terminal.enable_raw_mode()
+    }
+
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        self.terminal.disable_raw_mode()
+    }
+}
+
+impl TerminalQuery for DirectGraphicsBackend {
+    fn terminal_size(&mut self) -> io::Result<TerminalSize> {
+        self.terminal.terminal_size()
+    }
+
+    fn cursor_position(&mut self) -> io::Result<Position> {
+        self.terminal.cursor_position()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        let window = self.terminal.window_size()?;
+        self.select_graphics(window)?;
+        Ok(window)
+    }
+
+    fn raw_mode_enabled(&mut self) -> io::Result<bool> {
+        self.terminal.raw_mode_enabled()
+    }
+
+    fn terminal_capabilities(&mut self) -> io::Result<TerminalCapabilities> {
+        self.terminal.terminal_capabilities()
+    }
+}
+
+impl KeyboardEnhancementQuery for DirectGraphicsBackend {
+    fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
+        self.terminal.supports_keyboard_enhancement()
+    }
+}
+
+struct ReaderApplication {
+    path: PathBuf,
+    document: Document,
+    images: ImageCatalog,
+    heading_fonts: Mutex<Option<HeadingFonts>>,
+    max_width: Option<u16>,
+    graphics: Arc<GraphicsControl>,
+}
+
+struct ReaderModel {
+    app: App,
+    layout: Layout,
+    surface: Surface,
+    generation: u64,
+    cell_pixels: PixelSize,
+    desired_frame: DesiredFrame,
+    graphics_kind: GraphicsBackendKind,
+    graphics_diagnostic: Option<String>,
+    diagnostic_count: usize,
+    logical_renderer: Option<LogicalRenderer>,
+    prepared_source: Option<PreparedSource>,
+    fatal_error: Option<anyhow::Error>,
+}
+
+enum Message {
+    Input(Input),
+    Surface(Surface),
+    Prepared(PreparedRender),
+    TerminalError(io::Error),
+}
+
+impl Application for ReaderApplication {
+    type Model = ReaderModel;
+    type Message = Message;
+
+    fn init(&self) -> (Self::Model, Effect<Self::Message>) {
+        let startup = self.graphics.startup();
+        let surface = Surface::new(1, 1);
+        let body = ui::viewport_areas(surface.size, self.max_width)[1];
+        let layout = Layout::with_text(&self.document, body.width, &self.images);
+        let cell_pixels = startup.queried_cell_pixels.unwrap_or(PixelSize::FALLBACK);
+        let (logical_renderer, prepared_source) = if startup.kind == GraphicsBackendKind::Text {
+            (None, None)
+        } else {
+            let heading_fonts = self
+                .heading_fonts
+                .lock()
+                .expect("heading font state poisoned")
+                .take()
+                .expect("an application is initialized only once");
+            let (renderer, source) =
+                LogicalRenderer::spawn(self.document.clone(), self.images.clone(), heading_fonts);
+            (Some(renderer), Some(source))
+        };
+        let desired_frame = empty_frame(1, cell_pixels);
+        (
+            ReaderModel {
+                app: App::default(),
+                layout,
+                surface,
+                generation: 1,
+                cell_pixels,
+                desired_frame,
+                graphics_kind: startup.kind,
+                graphics_diagnostic: startup.diagnostic,
+                diagnostic_count: self.images.diagnostics().len(),
+                logical_renderer,
+                prepared_source,
+                fatal_error: None,
+            },
+            Effect::none(),
+        )
+    }
+
+    fn update(&self, model: &mut Self::Model, message: Self::Message) -> Effect<Self::Message> {
+        match message {
+            Message::Input(Input::Key(key)) if key.kind != KeyKind::Release => {
+                let command = Command::from_key(key);
+                if command == Command::None {
+                    return Effect::none();
+                }
+                let body = ui::viewport_areas(model.surface.size, self.max_width)[1];
+                model.app.apply(command, &model.layout, body.height);
+                if model.app.should_quit() {
+                    return Effect::shutdown();
+                }
+                model.generation = model.generation.saturating_add(1);
+                update_desired_frame(model, body);
+                submit_logical_render(model, body);
+                Effect::none()
+            }
+            Message::Input(_) => Effect::none(),
+            Message::Surface(surface) => {
+                model.surface = surface;
+                model.cell_pixels = surface_cell_pixels(surface)
+                    .or_else(|| self.graphics.startup().queried_cell_pixels)
+                    .unwrap_or(PixelSize::FALLBACK);
+                let body = ui::viewport_areas(surface.size, self.max_width)[1];
+                model.layout = Layout::with_text(&self.document, body.width, &self.images);
+                model.app.clamp_viewport(&model.layout, body.height);
+                model.generation = model.generation.saturating_add(1);
+                model.desired_frame = empty_frame(model.generation, model.cell_pixels);
+                submit_logical_render(model, body);
+                Effect::none()
+            }
+            Message::Prepared(prepared) if prepared.generation == model.generation => {
+                model.layout = prepared.layout;
+                model
+                    .app
+                    .clamp_viewport(&model.layout, prepared.body.height);
+                let position = model.app.viewport_position(&model.layout);
+                model.desired_frame = if position == prepared.position {
+                    prepared.frame
+                } else {
+                    model.layout.desired_frame(
+                        position.0,
+                        position.1,
+                        prepared.body,
+                        model.generation,
+                        model.cell_pixels,
+                    )
+                };
+                Effect::none()
+            }
+            Message::Prepared(_) => Effect::none(),
+            Message::TerminalError(error) if error.to_string() == SIXEL_REDRAW => Effect::none(),
+            Message::TerminalError(error)
+                if error.to_string().starts_with(GRAPHICS_FAILURE_PREFIX) =>
+            {
+                self.fallback_to_text(model, &error);
+                Effect::none()
+            }
+            Message::TerminalError(error) => {
+                model.fatal_error = Some(error.into());
+                Effect::shutdown()
             }
         }
-    } else {
-        (CapabilityEvidence::default(), None)
-    };
-    let GraphicsSelection {
-        backend,
-        reason: selection_reason,
-    } = match select_graphics_backend(preference, evidence, needs_graphics) {
-        Ok(selection) => selection,
-        Err(error) => {
-            let restore_result = session.restore();
-            return combine_run_and_restore(Err(anyhow!(error)), restore_result);
-        }
-    };
-    let initial_diagnostic = combine_diagnostics(selection_reason, probe_error);
-    let run_result = run_loop(
-        session.terminal_mut(),
-        path,
-        document,
-        heading_fonts,
-        backend,
-        RunLoopOptions {
-            queried_cell_pixels: evidence.cell_pixels,
-            initial_diagnostic,
-            max_width: config.body_max_width(),
-        },
-    );
-    let restore_result = session.restore();
-    combine_run_and_restore(run_result, restore_result)
-}
-
-struct TerminalInput {
-    #[cfg(unix)]
-    _terminal: Option<File>,
-    #[cfg(windows)]
-    _terminal: Option<File>,
-    #[cfg(windows)]
-    original: Option<windows_sys::Win32::Foundation::HANDLE>,
-}
-
-impl TerminalInput {
-    #[cfg(unix)]
-    fn attach() -> Result<Self> {
-        if io::stdin().is_terminal() {
-            return Ok(Self { _terminal: None });
-        }
-        let terminal = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .context("could not open the controlling terminal for input")?;
-        Ok(Self {
-            _terminal: Some(terminal),
-        })
     }
 
-    #[cfg(windows)]
-    fn attach() -> Result<Self> {
-        use std::os::windows::io::AsRawHandle;
-
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetStdHandle};
-
-        if io::stdin().is_terminal() {
-            return Ok(Self {
-                _terminal: None,
-                original: None,
-            });
-        }
-        let terminal = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("CONIN$")
-            .context("could not open the console for input")?;
-        // SAFETY: These calls only inspect and replace the process's standard
-        // input handle. `terminal` remains alive until the original handle is
-        // restored by `Drop`.
-        let original = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-        if original.is_null() || original == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error()).context("could not inspect standard input");
-        }
-        let handle = terminal.as_raw_handle().cast();
-        if unsafe { SetStdHandle(STD_INPUT_HANDLE, handle) } == 0 {
-            return Err(io::Error::last_os_error()).context("could not attach console input");
-        }
-        Ok(Self {
-            _terminal: Some(terminal),
-            original: Some(original),
-        })
-    }
-}
-
-#[cfg(windows)]
-impl Drop for TerminalInput {
-    fn drop(&mut self) {
-        use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, SetStdHandle};
-
-        if let Some(original) = self.original {
-            // SAFETY: `original` came from `GetStdHandle` in `attach` and remains
-            // process-owned. Restoration happens before `_terminal` is closed.
-            let _ = unsafe { SetStdHandle(STD_INPUT_HANDLE, original) };
-        }
-    }
-}
-
-fn combine_run_and_restore(run_result: Result<()>, restore_result: Result<()>) -> Result<()> {
-    match (run_result, restore_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(run_error), Ok(())) => Err(run_error),
-        (Ok(()), Err(restore_error)) => Err(restore_error),
-        (Err(run_error), Err(restore_error)) => Err(anyhow!(
-            "{run_error:#}; terminal cleanup also failed: {restore_error:#}"
-        )),
-    }
-}
-
-fn combine_diagnostics(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        (Some(diagnostic), None) | (None, Some(diagnostic)) => Some(diagnostic),
-        (None, None) => None,
-    }
-}
-
-fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    path: &Path,
-    document: &Document,
-    heading_fonts: HeadingFonts,
-    backend: GraphicsBackendKind,
-    options: RunLoopOptions,
-) -> Result<()> {
-    let RunLoopOptions {
-        queried_cell_pixels,
-        initial_diagnostic,
-        max_width,
-    } = options;
-    let mut graphics = GraphicsMode::from_kind(backend);
-    let images = ImageCatalog::load(document, path);
-    let diagnostic_count = images.diagnostics().len();
-    let mut logical_renderer = graphics
-        .uses_rasters()
-        .then(|| LogicalRenderer::spawn(document.clone(), images.clone(), heading_fonts));
-    let context = DriveContext {
-        path,
-        document,
-        images: &images,
-        diagnostic_count,
-        queried_cell_pixels,
-        initial_diagnostic,
-        max_width,
-    };
-    let run_result = drive_loop(terminal, context, &mut logical_renderer, &mut graphics);
-    drop(logical_renderer);
-    let clear_result = graphics.clear(&mut io::stdout()).with_context(|| {
-        format!(
-            "could not clear {} graphics during shutdown",
-            graphics.name()
+    fn view(&self, model: &Self::Model) -> View {
+        self.graphics.publish(model.desired_frame.clone());
+        ui::view(
+            &self.path,
+            &model.app,
+            &model.layout,
+            &graphics_status(model),
+            model.surface.size,
+            self.max_width,
         )
-    });
-    combine_run_and_graphics_cleanup(run_result, clear_result)
+    }
+
+    fn subscriptions(&self, model: &Self::Model) -> Subscription<Self::Message> {
+        let mut subscriptions = vec![
+            Subscription::surface(Message::Surface),
+            Subscription::input(Message::Input),
+            Subscription::terminal_errors(Message::TerminalError),
+        ];
+        if let Some(source) = &model.prepared_source {
+            subscriptions.push(source.subscription());
+        }
+        Subscription::batch(subscriptions)
+    }
 }
 
-struct RunLoopOptions {
-    queried_cell_pixels: Option<PixelSize>,
-    initial_diagnostic: Option<String>,
-    max_width: Option<u16>,
+impl ReaderApplication {
+    fn fallback_to_text(&self, model: &mut ReaderModel, error: &io::Error) {
+        let failed = match model.graphics_kind {
+            GraphicsBackendKind::Kitty => "kitty",
+            GraphicsBackendKind::Sixel => "sixel",
+            GraphicsBackendKind::Text => "graphics",
+        };
+        model.graphics_kind = GraphicsBackendKind::Text;
+        model.graphics_diagnostic = Some(format!("{failed} failed: {error}"));
+        model.logical_renderer = None;
+        model.prepared_source = None;
+        self.graphics.request_disable();
+        let body = ui::viewport_areas(model.surface.size, self.max_width)[1];
+        model.layout = Layout::with_text(&self.document, body.width, &self.images);
+        model.app.clamp_viewport(&model.layout, body.height);
+        model.generation = model.generation.saturating_add(1);
+        model.desired_frame = empty_frame(model.generation, model.cell_pixels);
+    }
+}
+
+fn update_desired_frame(model: &mut ReaderModel, body: CellRect) {
+    if model.graphics_kind == GraphicsBackendKind::Text {
+        model.desired_frame = empty_frame(model.generation, model.cell_pixels);
+        return;
+    }
+    let (first, offset) = model.app.viewport_position(&model.layout);
+    model.desired_frame =
+        model
+            .layout
+            .desired_frame(first, offset, body, model.generation, model.cell_pixels);
+}
+
+fn submit_logical_render(model: &ReaderModel, body: CellRect) {
+    let Some(renderer) = &model.logical_renderer else {
+        return;
+    };
+    renderer.submit(RenderRequest {
+        generation: model.generation,
+        top_source: model.app.top_source(),
+        top_row_offset: model.app.top_row_offset(),
+        body,
+        cell_pixels: model.cell_pixels,
+    });
+}
+
+fn graphics_status(model: &ReaderModel) -> String {
+    if let Some(error) = &model.graphics_diagnostic {
+        return format!("{} ({error})", graphics_name(model.graphics_kind));
+    }
+    match (model.graphics_kind, model.diagnostic_count) {
+        (GraphicsBackendKind::Kitty, count) if count > 0 => {
+            format!("kitty ({count} image warning(s))")
+        }
+        (GraphicsBackendKind::Kitty, _) => "kitty".to_owned(),
+        (GraphicsBackendKind::Sixel, count) if count > 0 => {
+            format!("sixel experimental ({count} image warning(s))")
+        }
+        (GraphicsBackendKind::Sixel, _) => "sixel experimental".to_owned(),
+        (GraphicsBackendKind::Text, count) if count > 0 => {
+            format!("text ({count} image warning(s))")
+        }
+        (GraphicsBackendKind::Text, _) => "text".to_owned(),
+    }
+}
+
+const fn graphics_name(kind: GraphicsBackendKind) -> &'static str {
+    match kind {
+        GraphicsBackendKind::Kitty => "kitty",
+        GraphicsBackendKind::Sixel => "sixel",
+        GraphicsBackendKind::Text => "text",
+    }
+}
+
+fn surface_cell_pixels(surface: Surface) -> Option<PixelSize> {
+    let pixels = surface.cell_pixels?;
+    Some(PixelSize {
+        width: u32::try_from(pixels.width()).ok()?,
+        height: u32::try_from(pixels.height()).ok()?,
+    })
+}
+
+fn convert_cell_pixels(pixels: urushi_terminal::PixelSize) -> Option<PixelSize> {
+    Some(PixelSize {
+        width: u32::try_from(pixels.width()).ok()?,
+        height: u32::try_from(pixels.height()).ok()?,
+    })
+}
+
+fn empty_frame(generation: u64, cell_pixels: PixelSize) -> DesiredFrame {
+    DesiredFrame {
+        generation,
+        cell_pixels,
+        placements: Vec::new(),
+        assets: std::collections::HashMap::new(),
+    }
 }
 
 fn needs_graphics(document: &Document) -> bool {
@@ -236,315 +621,6 @@ fn needs_graphics(document: &Document) -> bool {
         || !document.headings().is_empty()
         || !document.tables().is_empty()
         || !document.math().is_empty()
-}
-
-struct DriveContext<'a> {
-    path: &'a Path,
-    document: &'a Document,
-    images: &'a ImageCatalog,
-    diagnostic_count: usize,
-    queried_cell_pixels: Option<PixelSize>,
-    initial_diagnostic: Option<String>,
-    max_width: Option<u16>,
-}
-
-fn drive_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    context: DriveContext<'_>,
-    logical_renderer: &mut Option<LogicalRenderer>,
-    graphics: &mut GraphicsMode,
-) -> Result<()> {
-    let DriveContext {
-        path,
-        document,
-        images,
-        diagnostic_count,
-        queried_cell_pixels,
-        initial_diagnostic,
-        max_width,
-    } = context;
-    let mut app = App::default();
-    let mut generation = 1u64;
-    let mut graphics_diagnostic = initial_diagnostic;
-    let initial_size = terminal.size().context("could not read terminal size")?;
-    let [_, initial_body, _] = ui::viewport_areas(
-        Rect::new(0, 0, initial_size.width, initial_size.height),
-        max_width,
-    );
-    let mut layout = Layout::with_text(document, initial_body.width, images);
-    submit_logical_render(
-        logical_renderer,
-        generation,
-        &app,
-        initial_size,
-        queried_cell_pixels,
-        max_width,
-    );
-    let mut dirty = true;
-    let mut pending_frame = None;
-    while !app.should_quit() {
-        if let Some(prepared) = logical_renderer
-            .as_ref()
-            .and_then(LogicalRenderer::take_latest)
-            && prepared.generation == generation
-        {
-            layout = prepared.layout;
-            app.clamp_viewport(&layout, prepared.body.height);
-            let position = app.viewport_position(&layout);
-            pending_frame = Some(if position == prepared.position {
-                prepared.frame
-            } else {
-                layout.desired_frame(
-                    position.0,
-                    position.1,
-                    prepared.body,
-                    generation,
-                    prepared.cell_pixels,
-                )
-            });
-            dirty = true;
-        }
-
-        if dirty {
-            if graphics.requires_full_redraw() {
-                terminal
-                    .clear()
-                    .context("could not clear the alternate screen for sixel redraw")?;
-            }
-            let graphics_status = graphics.status(graphics_diagnostic.as_deref(), diagnostic_count);
-            terminal
-                .draw(|frame| ui::render(frame, path, &app, &layout, &graphics_status, max_width))
-                .context("could not draw the Markdown document")?;
-            dirty = false;
-            if let Some(frame) = pending_frame.take() {
-                let backend_name = graphics.name();
-                let render_error = graphics.render(&frame, &mut io::stdout()).err();
-                if let Some(error) = render_error {
-                    let failure = GraphicsFailureContext {
-                        path,
-                        app: &mut app,
-                        document,
-                        images,
-                        max_width,
-                        diagnostic_count,
-                        backend_name,
-                        render_error: &error,
-                    };
-                    let fallback = handle_graphics_failure(
-                        terminal,
-                        graphics,
-                        logical_renderer,
-                        &mut io::stdout(),
-                        failure,
-                    )?;
-                    graphics_diagnostic = Some(fallback.diagnostic);
-                    layout = fallback.layout;
-                    pending_frame = None;
-                    dirty = false;
-                }
-            }
-        }
-
-        let events = read_input_batch(INPUT_WAIT)?;
-        if events.is_empty() {
-            continue;
-        }
-        let size = terminal.size().context("could not read terminal size")?;
-        let batch = apply_input_batch(
-            &mut app,
-            &mut layout,
-            document,
-            images,
-            size,
-            events,
-            max_width,
-        );
-        if app.should_quit() || !batch.changed {
-            continue;
-        }
-        if batch.resized {
-            graphics.clear(&mut io::stdout()).with_context(|| {
-                format!("could not clear {} before resize redraw", graphics.name())
-            })?;
-        }
-        generation = generation.saturating_add(1);
-        let size = batch.size;
-        let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height), max_width);
-        pending_frame = frame_before_logical_render(
-            batch.resized,
-            &app,
-            &layout,
-            CellRect::from(body),
-            generation,
-            cell_pixel_size(size.width, size.height, queried_cell_pixels),
-        );
-        submit_logical_render(
-            logical_renderer,
-            generation,
-            &app,
-            size,
-            queried_cell_pixels,
-            max_width,
-        );
-        dirty = true;
-    }
-    Ok(())
-}
-
-fn frame_before_logical_render(
-    resized: bool,
-    app: &App,
-    layout: &Layout,
-    body: CellRect,
-    generation: u64,
-    cell_pixels: PixelSize,
-) -> Option<DesiredFrame> {
-    if resized {
-        // The current layout is the text projection rebuilt at the new width.
-        // Wait for the logical renderer rather than re-placing old raster
-        // assets with new cell metrics after the backend was cleared.
-        return None;
-    }
-    let (first, first_row_offset) = app.viewport_position(layout);
-    Some(layout.desired_frame(first, first_row_offset, body, generation, cell_pixels))
-}
-
-fn read_input_batch(wait: Duration) -> Result<Vec<Event>> {
-    if !event::poll(wait).context("could not poll terminal input")? {
-        return Ok(Vec::new());
-    }
-    let deadline = Instant::now() + INPUT_BATCH_WINDOW;
-    let mut events = Vec::with_capacity(MAX_INPUT_BATCH);
-    loop {
-        events.push(event::read().context("could not read terminal input")?);
-        if events.len() >= MAX_INPUT_BATCH
-            || Instant::now() >= deadline
-            || !event::poll(Duration::ZERO).context("could not poll terminal input")?
-        {
-            return Ok(events);
-        }
-    }
-}
-
-fn apply_input_batch(
-    app: &mut App,
-    layout: &mut Layout,
-    document: &Document,
-    images: &ImageCatalog,
-    mut size: ratatui::layout::Size,
-    events: impl IntoIterator<Item = Event>,
-    max_width: Option<u16>,
-) -> InputBatchResult {
-    let mut result = InputBatchResult {
-        size,
-        changed: false,
-        resized: false,
-    };
-    for input in events {
-        match input {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                let command = Command::from_key(key);
-                if command == Command::None {
-                    continue;
-                }
-                let [_, body, _] =
-                    ui::viewport_areas(Rect::new(0, 0, size.width, size.height), max_width);
-                app.apply(command, layout, body.height);
-                result.changed = true;
-                if app.should_quit() {
-                    break;
-                }
-            }
-            Event::Resize(width, height) => {
-                size = ratatui::layout::Size { width, height };
-                let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, width, height), max_width);
-                *layout = Layout::with_text(document, body.width, images);
-                app.clamp_viewport(layout, body.height);
-                result.size = size;
-                result.changed = true;
-                result.resized = true;
-            }
-            _ => {}
-        }
-    }
-    result
-}
-
-struct GraphicsFailureContext<'a> {
-    path: &'a Path,
-    app: &'a mut App,
-    document: &'a Document,
-    images: &'a ImageCatalog,
-    max_width: Option<u16>,
-    diagnostic_count: usize,
-    backend_name: &'static str,
-    render_error: &'a io::Error,
-}
-
-fn handle_graphics_failure<B: Backend>(
-    terminal: &mut Terminal<B>,
-    graphics: &mut GraphicsMode,
-    logical_renderer: &mut Option<LogicalRenderer>,
-    writer: &mut impl io::Write,
-    context: GraphicsFailureContext<'_>,
-) -> Result<TextFallback> {
-    let cleanup_error = graphics.clear(writer).err();
-    *graphics = GraphicsMode::Text;
-    *logical_renderer = None;
-    let size = terminal
-        .size()
-        .map_err(|error| anyhow!("could not read terminal size for text fallback: {error}"))?;
-    let [_, body, _] =
-        ui::viewport_areas(Rect::new(0, 0, size.width, size.height), context.max_width);
-    let layout = Layout::with_text(context.document, body.width, context.images);
-    context.app.clamp_viewport(&layout, body.height);
-    let diagnostic = graphics_failure_diagnostic(
-        context.backend_name,
-        context.render_error,
-        cleanup_error.as_ref(),
-    );
-    terminal
-        .clear()
-        .map_err(|error| anyhow!("could not clear before text fallback: {error}"))?;
-    let status = graphics.status(Some(&diagnostic), context.diagnostic_count);
-    terminal
-        .draw(|frame| {
-            ui::render(
-                frame,
-                context.path,
-                context.app,
-                &layout,
-                &status,
-                context.max_width,
-            )
-        })
-        .map_err(|error| anyhow!("could not redraw text fallback: {error}"))?;
-    Ok(TextFallback { layout, diagnostic })
-}
-
-#[derive(Debug)]
-struct TextFallback {
-    layout: Layout,
-    diagnostic: String,
-}
-
-fn submit_logical_render(
-    renderer: &Option<LogicalRenderer>,
-    generation: u64,
-    app: &App,
-    size: ratatui::layout::Size,
-    queried_cell_pixels: Option<PixelSize>,
-    max_width: Option<u16>,
-) {
-    let Some(renderer) = renderer else { return };
-    let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, size.width, size.height), max_width);
-    renderer.submit(RenderRequest {
-        generation,
-        top_source: app.top_source(),
-        top_row_offset: app.top_row_offset(),
-        body: CellRect::from(body),
-        cell_pixels: cell_pixel_size(size.width, size.height, queried_cell_pixels),
-    });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -556,42 +632,63 @@ struct RenderRequest {
     cell_pixels: PixelSize,
 }
 
-#[derive(Debug)]
 struct PreparedRender {
     generation: u64,
     layout: Layout,
     frame: DesiredFrame,
     position: (usize, u16),
     body: CellRect,
-    cell_pixels: PixelSize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InputBatchResult {
-    size: ratatui::layout::Size,
-    changed: bool,
-    resized: bool,
-}
-
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct LatestRequest {
     request: Option<RenderRequest>,
     shutdown: bool,
 }
 
-#[derive(Debug)]
 struct LogicalRenderer {
     mailbox: Arc<(Mutex<LatestRequest>, Condvar)>,
-    result: Arc<Mutex<Option<PreparedRender>>>,
     handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct PreparedSource {
+    receiver: Arc<Mutex<Option<Receiver<PreparedRender>>>>,
+}
+
+impl PreparedSource {
+    fn subscription(&self) -> Subscription<Message> {
+        let receiver = Arc::clone(&self.receiver);
+        Subscription::run_blocking_with(
+            "raden-logical-renderer",
+            Admission::latest(),
+            move |sender| {
+                let Some(receiver) = receiver
+                    .lock()
+                    .expect("logical renderer receiver poisoned")
+                    .take()
+                else {
+                    return;
+                };
+                while let Ok(prepared) = receiver.recv() {
+                    if sender.blocking_send(Message::Prepared(prepared)).is_err() {
+                        break;
+                    }
+                }
+            },
+        )
+    }
+}
+
 impl LogicalRenderer {
-    fn spawn(document: Document, images: ImageCatalog, heading_fonts: HeadingFonts) -> Self {
+    fn spawn(
+        document: Document,
+        images: ImageCatalog,
+        heading_fonts: HeadingFonts,
+    ) -> (Self, PreparedSource) {
         let mailbox = Arc::new((Mutex::new(LatestRequest::default()), Condvar::new()));
         let worker_mailbox = Arc::clone(&mailbox);
-        let result = Arc::new(Mutex::new(None));
-        let worker_result = Arc::clone(&result);
+        let (result_tx, result_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let mut cache = RasterCache::with_heading_fonts(heading_fonts);
             loop {
@@ -637,45 +734,37 @@ impl LogicalRenderer {
                     .expect("logical renderer mailbox poisoned")
                     .request
                     .is_some();
-                if !newer_pending {
-                    *worker_result
-                        .lock()
-                        .expect("logical renderer result poisoned") = Some(PreparedRender {
-                        generation: request.generation,
-                        layout,
-                        frame,
-                        position,
-                        body: request.body,
-                        cell_pixels: request.cell_pixels,
-                    });
+                if !newer_pending
+                    && result_tx
+                        .send(PreparedRender {
+                            generation: request.generation,
+                            layout,
+                            frame,
+                            position,
+                            body: request.body,
+                        })
+                        .is_err()
+                {
+                    return;
                 }
             }
         });
-        Self {
-            mailbox,
-            result,
-            handle: Some(handle),
-        }
+        (
+            Self {
+                mailbox,
+                handle: Some(handle),
+            },
+            PreparedSource {
+                receiver: Arc::new(Mutex::new(Some(result_rx))),
+            },
+        )
     }
 
     fn submit(&self, request: RenderRequest) {
         let (lock, ready) = &*self.mailbox;
         let mut state = lock.lock().expect("logical renderer mailbox poisoned");
-        state.replace(request);
+        state.request = Some(request);
         ready.notify_one();
-    }
-
-    fn take_latest(&self) -> Option<PreparedRender> {
-        self.result
-            .lock()
-            .expect("logical renderer result poisoned")
-            .take()
-    }
-}
-
-impl LatestRequest {
-    fn replace(&mut self, request: RenderRequest) {
-        self.request = Some(request);
     }
 }
 
@@ -687,34 +776,9 @@ impl Drop for LogicalRenderer {
         state.request = None;
         ready.notify_one();
         drop(state);
-        // Decoders do not expose cooperative cancellation. Detach an in-flight
-        // decode so quitting never waits for stale logical work to finish.
+        // Rasterizers do not expose cooperative cancellation. Detach an
+        // in-flight render so quitting never waits for stale work to finish.
         drop(self.handle.take());
-    }
-}
-
-impl From<Rect> for CellRect {
-    fn from(rect: Rect) -> Self {
-        Self {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-        }
-    }
-}
-
-fn combine_run_and_graphics_cleanup(
-    run_result: Result<()>,
-    cleanup_result: Result<()>,
-) -> Result<()> {
-    match (run_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(run_error), Ok(())) => Err(run_error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(run_error), Err(cleanup_error)) => Err(anyhow!(
-            "{run_error:#}; graphics cleanup also failed: {cleanup_error:#}"
-        )),
     }
 }
 
@@ -734,15 +798,7 @@ impl GraphicsMode {
         }
     }
 
-    fn uses_rasters(&self) -> bool {
-        !matches!(self, Self::Text)
-    }
-
-    fn requires_full_redraw(&self) -> bool {
-        matches!(self, Self::Sixel(_))
-    }
-
-    fn name(&self) -> &'static str {
+    const fn name(&self) -> &'static str {
         match self {
             Self::Kitty(_) => "kitty",
             Self::Sixel(_) => "sixel",
@@ -765,157 +821,6 @@ impl GraphicsMode {
             Self::Text => Ok(()),
         }
     }
-
-    fn status(&self, error: Option<&str>, diagnostic_count: usize) -> String {
-        if let Some(error) = error {
-            return format!("{} ({error})", self.name());
-        }
-        match self {
-            Self::Kitty(_) if diagnostic_count > 0 => {
-                format!("kitty ({diagnostic_count} image warning(s))")
-            }
-            Self::Kitty(_) => "kitty".to_owned(),
-            Self::Sixel(_) if diagnostic_count > 0 => {
-                format!("sixel experimental ({diagnostic_count} image warning(s))")
-            }
-            Self::Sixel(_) => "sixel experimental".to_owned(),
-            Self::Text if diagnostic_count > 0 => {
-                format!("text ({diagnostic_count} image warning(s))")
-            }
-            Self::Text => "text".to_owned(),
-        }
-    }
-}
-
-fn graphics_failure_diagnostic(
-    backend: &str,
-    render_error: &io::Error,
-    cleanup_error: Option<&io::Error>,
-) -> String {
-    match cleanup_error {
-        Some(cleanup_error) => {
-            format!("{backend} failed: {render_error}; cleanup also failed: {cleanup_error}")
-        }
-        None => format!("{backend} failed: {render_error}"),
-    }
-}
-
-fn cell_pixel_size(columns: u16, rows: u16, queried_cell_pixels: Option<PixelSize>) -> PixelSize {
-    if let Some(cell_pixels) = queried_cell_pixels {
-        return cell_pixels;
-    }
-    crossterm::terminal::window_size()
-        .ok()
-        .and_then(|window| {
-            let width = u32::from(window.width).checked_div(u32::from(columns.max(1)))?;
-            let height = u32::from(window.height).checked_div(u32::from(rows.max(1)))?;
-            (width > 0 && height > 0).then_some(PixelSize { width, height })
-        })
-        .unwrap_or(PixelSize::FALLBACK)
-}
-
-struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    cursor_needs_restoring: bool,
-    alternate_screen_active: bool,
-    raw_mode_active: bool,
-}
-
-impl TerminalSession {
-    fn enter() -> Result<Self> {
-        enable_raw_mode().context("could not enable terminal raw mode")?;
-        let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
-            return match cleanup_setup(&mut stdout) {
-                Ok(()) => Err(error).context("could not enter alternate screen"),
-                Err(cleanup_error) => Err(error).context(format!(
-                    "could not enter alternate screen; cleanup also failed: {cleanup_error:#}"
-                )),
-            };
-        }
-
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = match Terminal::new(backend) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                let mut stdout = io::stdout();
-                return match cleanup_setup(&mut stdout) {
-                    Ok(()) => Err(error).context("could not initialize terminal"),
-                    Err(cleanup_error) => Err(error).context(format!(
-                        "could not initialize terminal; cleanup also failed: {cleanup_error:#}"
-                    )),
-                };
-            }
-        };
-
-        Ok(Self {
-            terminal,
-            cursor_needs_restoring: true,
-            alternate_screen_active: true,
-            raw_mode_active: true,
-        })
-    }
-
-    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
-        &mut self.terminal
-    }
-
-    fn restore(&mut self) -> Result<()> {
-        let mut failures = Vec::new();
-
-        if self.cursor_needs_restoring {
-            match self.terminal.show_cursor() {
-                Ok(()) => self.cursor_needs_restoring = false,
-                Err(error) => failures.push(format!("could not restore terminal cursor: {error}")),
-            }
-        }
-
-        if self.alternate_screen_active {
-            match execute!(self.terminal.backend_mut(), LeaveAlternateScreen) {
-                Ok(()) => self.alternate_screen_active = false,
-                Err(error) => failures.push(format!("could not leave alternate screen: {error}")),
-            }
-        }
-
-        if self.raw_mode_active {
-            match disable_raw_mode() {
-                Ok(()) => self.raw_mode_active = false,
-                Err(error) => {
-                    failures.push(format!("could not disable terminal raw mode: {error}"))
-                }
-            }
-        }
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow!(failures.join("; ")))
-        }
-    }
-}
-
-fn cleanup_setup(stdout: &mut Stdout) -> Result<()> {
-    let mut failures = Vec::new();
-    if let Err(error) = execute!(stdout, LeaveAlternateScreen) {
-        failures.push(format!("could not leave alternate screen: {error}"));
-    }
-    if let Err(error) = disable_raw_mode() {
-        failures.push(format!("could not disable terminal raw mode: {error}"));
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!(failures.join("; ")))
-    }
-}
-
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        if let Err(error) = self.restore() {
-            eprintln!("raden: terminal cleanup failed: {error:#}");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -932,357 +837,34 @@ mod tests {
     }
 
     #[test]
-    fn explicit_sixel_override_is_experimental_and_uses_rasters() {
-        let graphics = GraphicsMode::from_kind(GraphicsBackendKind::Sixel);
-
-        assert!(matches!(graphics, GraphicsMode::Sixel(_)));
-        assert!(graphics.uses_rasters());
-        assert!(graphics.requires_full_redraw());
-        assert_eq!(graphics.status(None, 0), "sixel experimental");
-    }
-
-    #[test]
-    fn text_selection_does_not_start_an_explicit_graphics_backend() {
-        let graphics = GraphicsMode::from_kind(GraphicsBackendKind::Text);
-
-        assert!(matches!(graphics, GraphicsMode::Text));
-    }
-
-    #[test]
-    fn status_keeps_the_active_backend_when_reporting_probe_failure() {
-        let graphics = GraphicsMode::from_kind(GraphicsBackendKind::Kitty);
-
-        assert_eq!(
-            graphics.status(Some("capability query failed: injected"), 0),
-            "kitty (capability query failed: injected)"
-        );
-    }
-
-    #[test]
-    fn resize_waits_for_new_rasters_instead_of_replacing_stale_assets() {
-        let document = Document::parse("$x^2$".to_owned());
-        let layout = Layout::new(&document, 80);
-        let body = CellRect {
-            x: 0,
-            y: 1,
-            width: 80,
-            height: 20,
+    fn direct_frame_tracks_scrolling_before_a_new_raster_finishes() {
+        let document = Document::parse("first\n\nsecond\n\nthird".to_owned());
+        let layout = Layout::new(&document, 20);
+        let mut model = ReaderModel {
+            app: App::default(),
+            layout,
+            surface: Surface::new(20, 4),
+            generation: 2,
+            cell_pixels: PixelSize::FALLBACK,
+            desired_frame: empty_frame(1, PixelSize::FALLBACK),
+            graphics_kind: GraphicsBackendKind::Kitty,
+            graphics_diagnostic: None,
+            diagnostic_count: 0,
+            logical_renderer: None,
+            prepared_source: None,
+            fatal_error: None,
         };
-
-        assert!(
-            frame_before_logical_render(
-                true,
-                &App::default(),
-                &layout,
-                body,
-                2,
-                PixelSize {
-                    width: 10,
-                    height: 20,
-                },
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn graphics_cleanup_failure_is_reported_without_hiding_render_failure() {
-        let render = io::Error::other("render broke");
-        let cleanup = io::Error::other("clear broke");
-
-        let diagnostic = graphics_failure_diagnostic("sixel", &render, Some(&cleanup));
-
-        assert!(diagnostic.contains("sixel failed: render broke"));
-        assert!(diagnostic.contains("cleanup also failed: clear broke"));
-    }
-
-    #[test]
-    fn reports_both_run_and_cleanup_failures() {
-        let error = combine_run_and_restore(
-            Err(anyhow!("input failed")),
-            Err(anyhow!("raw mode stayed active")),
-        )
-        .expect_err("both failures must be reported");
-        let message = format!("{error:#}");
-
-        assert!(message.contains("input failed"));
-        assert!(message.contains("raw mode stayed active"));
-    }
-
-    #[test]
-    fn reports_both_run_and_graphics_cleanup_failures() {
-        let error = combine_run_and_graphics_cleanup(
-            Err(anyhow!("input failed")),
-            Err(anyhow!("Kitty delete failed")),
-        )
-        .expect_err("both failures must be reported");
-        let message = format!("{error:#}");
-
-        assert!(message.contains("input failed"));
-        assert!(message.contains("Kitty delete failed"));
-    }
-
-    #[test]
-    fn logical_mailbox_keeps_only_the_latest_generation() {
-        let request = |generation| RenderRequest {
-            generation,
-            top_source: generation as usize,
-            top_row_offset: 0,
-            body: CellRect {
+        model.app.apply(Command::Down, &model.layout, 2);
+        update_desired_frame(
+            &mut model,
+            CellRect {
                 x: 0,
                 y: 1,
-                width: 80,
-                height: 22,
+                width: 20,
+                height: 2,
             },
-            cell_pixels: PixelSize::FALLBACK,
-        };
-        let mut mailbox = LatestRequest::default();
-
-        mailbox.replace(request(1));
-        mailbox.replace(request(2));
-        mailbox.replace(request(3));
-
-        let pending = mailbox
-            .request
-            .expect("latest request should remain pending");
-        assert_eq!(pending.generation, 3);
-        assert_eq!(pending.top_source, 3);
-    }
-
-    #[test]
-    fn repeated_keys_are_applied_in_one_input_batch_without_losing_distance() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-        let source = (0..100)
-            .map(|index| format!("line {index}\n\n"))
-            .collect::<String>();
-        let document = Document::parse(source);
-        let images = ImageCatalog::load(&document, Path::new("doc.md"));
-        let mut batched_layout = Layout::with_text(&document, 80, &images);
-        let mut batched = App::default();
-        let repeat = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Char('j'),
-            KeyModifiers::NONE,
-            KeyEventKind::Repeat,
-        ));
-        let events = std::iter::repeat_n(repeat, 20).collect::<Vec<_>>();
-        let size = ratatui::layout::Size {
-            width: 80,
-            height: 24,
-        };
-
-        let result = apply_input_batch(
-            &mut batched,
-            &mut batched_layout,
-            &document,
-            &images,
-            size,
-            events,
-            None,
-        );
-        let mut sequential = App::default();
-        for _ in 0..20 {
-            sequential.apply(Command::Down, &batched_layout, 22);
-        }
-
-        assert_eq!(
-            result,
-            InputBatchResult {
-                size,
-                changed: true,
-                resized: false,
-            }
-        );
-        assert_eq!(batched.top_source(), sequential.top_source());
-        assert_eq!(batched.top_row_offset(), sequential.top_row_offset());
-    }
-
-    #[test]
-    fn resize_input_reclamps_the_last_viewport_after_reflow() {
-        let source = (0..40)
-            .map(|index| format!("paragraph {index} wraps at the narrow width\n\n"))
-            .collect::<String>();
-        let document = Document::parse(source);
-        let images = ImageCatalog::load(&document, Path::new("doc.md"));
-        let initial_size = ratatui::layout::Size {
-            width: 20,
-            height: 8,
-        };
-        let mut layout = Layout::with_text(&document, initial_size.width, &images);
-        let mut app = App::default();
-        let [_, initial_body, _] = ui::viewport_areas(
-            Rect::new(0, 0, initial_size.width, initial_size.height),
-            None,
-        );
-        app.apply(Command::End, &layout, initial_body.height);
-
-        let resized = apply_input_batch(
-            &mut app,
-            &mut layout,
-            &document,
-            &images,
-            initial_size,
-            [Event::Resize(80, 12)],
-            None,
-        );
-        let [_, resized_body, _] = ui::viewport_areas(
-            Rect::new(0, 0, resized.size.width, resized.size.height),
-            None,
         );
 
-        assert!(resized.resized);
-        assert_eq!(app.viewport_percent(&layout, resized_body.height), 100);
-    }
-
-    #[test]
-    fn resize_reflows_to_the_centered_body_width() {
-        let source = (0..30)
-            .map(|index| format!("paragraph {index} keeps its source anchor while resizing\n\n"))
-            .collect::<String>();
-        let document = Document::parse(source);
-        let images = ImageCatalog::load(&document, Path::new("doc.md"));
-        let initial_size = ratatui::layout::Size {
-            width: 80,
-            height: 12,
-        };
-        let mut layout = Layout::with_text(&document, initial_size.width, &images);
-        let mut app = App::default();
-        app.apply(Command::Down, &layout, 10);
-        let source_anchor = app.top_source();
-
-        let resized = apply_input_batch(
-            &mut app,
-            &mut layout,
-            &document,
-            &images,
-            initial_size,
-            [Event::Resize(140, 16)],
-            Some(100),
-        );
-        let [_, body, _] = ui::viewport_areas(Rect::new(0, 0, 140, 16), Some(100));
-
-        assert!(resized.resized);
-        assert_eq!(body, Rect::new(20, 1, 100, 14));
-        assert_eq!(layout.width(), 100);
-        assert_eq!(app.top_source(), source_anchor);
-        assert_eq!(
-            layout.rows()[layout.row_for_source(source_anchor)]
-                .source
-                .start,
-            source_anchor
-        );
-    }
-
-    #[test]
-    fn graphics_failure_rebuilds_large_headings_as_text() {
-        let document = Document::parse("# Readable heading\n".to_owned());
-        let images = ImageCatalog::load(&document, Path::new("doc.md"));
-        let mut graphics = GraphicsMode::Kitty(KittyBackend::new());
-        let mut renderer = None;
-        let mut cleanup = Vec::new();
-        let mut app = App::default();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24))
-            .expect("test terminal should be created");
-        let render_error = io::Error::other("render broke");
-        let fallback = handle_graphics_failure(
-            &mut terminal,
-            &mut graphics,
-            &mut renderer,
-            &mut cleanup,
-            GraphicsFailureContext {
-                path: Path::new("doc.md"),
-                app: &mut app,
-                document: &document,
-                images: &images,
-                max_width: None,
-                diagnostic_count: 0,
-                backend_name: "kitty",
-                render_error: &render_error,
-            },
-        )
-        .expect("text fallback should be redrawn");
-        let rendered = fallback
-            .layout
-            .rows()
-            .iter()
-            .flat_map(|row| row.fragments.iter())
-            .map(|fragment| fragment.text.as_str())
-            .collect::<String>();
-
-        assert!(matches!(graphics, GraphicsMode::Text));
-        assert!(renderer.is_none());
-        assert!(fallback.diagnostic.contains("kitty failed: render broke"));
-        assert!(rendered.contains("Readable heading"));
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(screen.contains("Readable heading"));
-    }
-
-    #[test]
-    fn sixel_failure_clears_before_resetting_and_relayout_to_text() {
-        let document = Document::parse(
-            "before the heading\n\n# Readable heading\n\nafter the heading\n".to_owned(),
-        );
-        let images = ImageCatalog::load(&document, Path::new("doc.md"));
-        let graphics_layout = Layout::with_text(&document, 24, &images);
-        let mut app = App::default();
-        app.apply(Command::Down, &graphics_layout, 10);
-        let source_anchor = app.top_source();
-        let mut graphics = GraphicsMode::Sixel(SixelBackend::new());
-        let mut renderer = None;
-        let mut cleanup = Vec::new();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(24, 12))
-            .expect("test terminal should be created");
-        let render_error = io::Error::other("render broke");
-        let fallback = handle_graphics_failure(
-            &mut terminal,
-            &mut graphics,
-            &mut renderer,
-            &mut cleanup,
-            GraphicsFailureContext {
-                path: Path::new("doc.md"),
-                app: &mut app,
-                document: &document,
-                images: &images,
-                max_width: None,
-                diagnostic_count: 0,
-                backend_name: "sixel",
-                render_error: &render_error,
-            },
-        )
-        .expect("text fallback should be redrawn");
-
-        assert_eq!(cleanup, b"\x1b[2J\x1b[H");
-        assert!(matches!(graphics, GraphicsMode::Text));
-        assert!(renderer.is_none());
-        assert_eq!(app.top_source(), source_anchor);
-        assert_eq!(
-            fallback.layout.rows()[fallback.layout.row_for_source(source_anchor)]
-                .source
-                .start,
-            source_anchor
-        );
-        assert!(fallback.diagnostic.contains("sixel failed: render broke"));
-        assert!(
-            fallback
-                .layout
-                .rows()
-                .iter()
-                .flat_map(|row| &row.fragments)
-                .any(|fragment| fragment.text.contains("Readable heading"))
-        );
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(screen.contains("Readable heading"));
+        assert_eq!(model.desired_frame.generation, 2);
     }
 }
