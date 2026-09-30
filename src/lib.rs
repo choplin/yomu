@@ -46,7 +46,7 @@ pub use document::{
 pub use graphics::GraphicsPreference;
 pub(crate) use image::{ElementKey, PixelSize, RasterAsset, RasterAssetKey, RasterCache};
 pub use layout::{Layout, LayoutFragment, LayoutRow};
-pub(crate) use scene::{CellRect, DesiredFrame, GraphicPlacement, GraphicSourceRegion};
+pub(crate) use scene::CellRect;
 
 /// Load and parse a UTF-8 Markdown document from disk.
 pub fn load_document(path: &Path) -> Result<Document> {

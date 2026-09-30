@@ -6,11 +6,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::document::{Document, Segment};
 use crate::image::{ImageCatalog, MAX_IMAGE_ROWS};
-use crate::scene::GraphicSourceRegion;
-use crate::{
-    CellRect, DesiredFrame, ElementKey, GraphicPlacement, MathForm, PixelSize, RasterAsset,
-    RasterCache, SourceSpan, TextStyle,
-};
+use crate::{ElementKey, MathForm, PixelSize, RasterAsset, RasterCache, SourceSpan, TextStyle};
 
 const MAX_RASTERIZED_HEADINGS: usize = 8;
 const MAX_LAYOUT_HEADING_BYTES: usize = 32 * 1024 * 1024;
@@ -39,14 +35,28 @@ pub struct LayoutRow {
 }
 
 #[derive(Clone, Debug)]
-struct LayoutGraphic {
+pub(crate) struct LayoutGraphic {
+    pub(crate) element_key: ElementKey,
+    pub(crate) columns: u16,
+    pub(crate) rows: u16,
+    pub(crate) asset: Arc<RasterAsset>,
+    pub(crate) fallback: String,
+    pub(crate) column: u16,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedGraphic {
     element_key: ElementKey,
-    source: SourceSpan,
     columns: u16,
     rows: u16,
     asset: Arc<RasterAsset>,
-    source_regions: Vec<GraphicSourceRegion>,
-    column: u16,
+}
+
+/// Raster assets prepared off the application thread for one presentation context.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreparedGraphics {
+    graphics: HashMap<ElementKey, PreparedGraphic>,
+    failures: HashMap<ElementKey, String>,
 }
 
 /// Width-dependent terminal layout derived from a source-ranged document.
@@ -54,7 +64,182 @@ struct LayoutGraphic {
 pub struct Layout {
     width: usize,
     rows: Vec<LayoutRow>,
-    graphics: Vec<LayoutGraphic>,
+    pub(crate) graphics: Vec<LayoutGraphic>,
+}
+
+impl PreparedGraphics {
+    pub(crate) fn prepare(
+        document: &Document,
+        width: u16,
+        height: u16,
+        images: &ImageCatalog,
+        cache: &mut RasterCache,
+        cell_pixels: PixelSize,
+        focus_source: usize,
+    ) -> Self {
+        let mut prepared = Self::default();
+        let mut selected_headings = document.headings().iter().enumerate().collect::<Vec<_>>();
+        selected_headings.sort_by_key(|(_, heading)| heading.source.start.abs_diff(focus_source));
+        let selected_headings = selected_headings
+            .into_iter()
+            .take(MAX_RASTERIZED_HEADINGS)
+            .map(|(index, _)| index)
+            .collect::<HashSet<_>>();
+        let mut selected_tables = document.tables().iter().enumerate().collect::<Vec<_>>();
+        selected_tables.sort_by_key(|(_, table)| table.source.start.abs_diff(focus_source));
+        let selected_tables = selected_tables
+            .into_iter()
+            .take(MAX_RASTERIZED_TABLES)
+            .map(|(index, _)| index)
+            .collect::<HashSet<_>>();
+        let mut heading_bytes = 0usize;
+        let mut table_bytes = 0usize;
+        let mut math_bytes = 0usize;
+
+        for segment in &document.segments {
+            match segment {
+                Segment::Image { index } => {
+                    let Some(image) = images.get(*index).filter(|image| image.can_render()) else {
+                        continue;
+                    };
+                    match cache.rasterize(
+                        image,
+                        (width.max(1), height.clamp(1, MAX_IMAGE_ROWS)),
+                        cell_pixels,
+                    ) {
+                        Ok(Some((asset, columns, rows))) => {
+                            prepared.insert(image.element_key, columns, rows, asset)
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            prepared.failures.insert(image.element_key, error);
+                        }
+                    };
+                }
+                Segment::Heading { index } if selected_headings.contains(index) => {
+                    let Some(heading) = document.headings().get(*index) else {
+                        continue;
+                    };
+                    let key = crate::heading::HeadingPlan::element_key(*index);
+                    match cache.rasterize_heading(
+                        *index,
+                        heading,
+                        width.max(1),
+                        height,
+                        cell_pixels,
+                    ) {
+                        Ok(Some(rendered)) => {
+                            let bytes = rendered.asset.rgba.len();
+                            if heading_bytes.saturating_add(bytes) > MAX_LAYOUT_HEADING_BYTES {
+                                prepared.failures.insert(
+                                    key,
+                                    format!(
+                                        "heading raster needs {bytes} bytes but the layout budget has {} of {MAX_LAYOUT_HEADING_BYTES} bytes remaining",
+                                        MAX_LAYOUT_HEADING_BYTES.saturating_sub(heading_bytes)
+                                    ),
+                                );
+                            } else {
+                                heading_bytes = heading_bytes.saturating_add(bytes);
+                                prepared.insert(
+                                    rendered.element_key,
+                                    rendered.columns,
+                                    rendered.rows,
+                                    rendered.asset,
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            prepared.failures.insert(key, error);
+                        }
+                    }
+                }
+                Segment::Table { index } if selected_tables.contains(index) => {
+                    let Some(table) = document.tables().get(*index) else {
+                        continue;
+                    };
+                    let key = crate::table::TablePlan::element_key(*index);
+                    match cache.rasterize_table(*index, table, width.max(1), cell_pixels) {
+                        Ok(Some(rendered)) => {
+                            let bytes = rendered.asset.rgba.len();
+                            if let Err(error) = reserve_table_bytes(&mut table_bytes, bytes) {
+                                prepared.failures.insert(key, error);
+                            } else {
+                                prepared.insert(
+                                    rendered.element_key,
+                                    rendered.columns,
+                                    rendered.rows,
+                                    rendered.asset,
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            prepared.failures.insert(key, error);
+                        }
+                    }
+                }
+                Segment::Math { index } => {
+                    let Some(math) = document.math().get(*index) else {
+                        continue;
+                    };
+                    let key = crate::math::MathPlan::element_key(*index);
+                    match cache.rasterize_math(*index, math, width.max(1), height, cell_pixels) {
+                        Ok(Some(rendered)) => {
+                            let bytes = rendered.asset.rgba.len();
+                            if math_bytes.saturating_add(bytes) > MAX_LAYOUT_MATH_BYTES {
+                                prepared.failures.insert(
+                                    key,
+                                    format!(
+                                        "math raster needs {bytes} bytes but the layout budget has {} of {MAX_LAYOUT_MATH_BYTES} bytes remaining",
+                                        MAX_LAYOUT_MATH_BYTES.saturating_sub(math_bytes)
+                                    ),
+                                );
+                            } else {
+                                math_bytes = math_bytes.saturating_add(bytes);
+                                prepared.insert(
+                                    rendered.element_key,
+                                    rendered.columns,
+                                    rendered.rows,
+                                    rendered.asset,
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            prepared.failures.insert(key, error);
+                        }
+                    }
+                }
+                Segment::Text { .. }
+                | Segment::Break { .. }
+                | Segment::Rule { .. }
+                | Segment::Heading { .. }
+                | Segment::Table { .. }
+                | Segment::Link { .. }
+                | Segment::CodeBlock { .. } => {}
+            }
+        }
+        prepared
+    }
+
+    fn insert(
+        &mut self,
+        element_key: ElementKey,
+        columns: u16,
+        rows: u16,
+        asset: Arc<RasterAsset>,
+    ) {
+        self.graphics.insert(
+            element_key,
+            PreparedGraphic {
+                element_key,
+                columns,
+                rows,
+                asset,
+            },
+        );
+    }
 }
 
 impl Layout {
@@ -67,6 +252,16 @@ impl Layout {
         Self::build(document, width, Some(images), None)
     }
 
+    pub(crate) fn with_prepared(
+        document: &Document,
+        width: u16,
+        images: &ImageCatalog,
+        graphics: &PreparedGraphics,
+    ) -> Self {
+        Self::build(document, width, Some(images), Some(graphics))
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_graphics(
         document: &Document,
         width: u16,
@@ -76,49 +271,26 @@ impl Layout {
         cell_pixels: PixelSize,
         focus_source: usize,
     ) -> Self {
-        Self::build(
+        let graphics = PreparedGraphics::prepare(
             document,
             width,
-            Some(images),
-            Some((cache, cell_pixels, height, focus_source)),
-        )
+            height,
+            images,
+            cache,
+            cell_pixels,
+            focus_source,
+        );
+        Self::with_prepared(document, width, images, &graphics)
     }
 
     fn build(
         document: &Document,
         width: u16,
         images: Option<&ImageCatalog>,
-        mut graphics: Option<(&mut RasterCache, PixelSize, u16, usize)>,
+        graphics: Option<&PreparedGraphics>,
     ) -> Self {
         let width = usize::from(width.max(1));
         let mut builder = Builder::new(width);
-        let selected_headings = graphics
-            .as_ref()
-            .map(|(_, _, _, focus_source)| {
-                let mut indices = document.headings().iter().enumerate().collect::<Vec<_>>();
-                indices.sort_by_key(|(_, heading)| heading.source.start.abs_diff(*focus_source));
-                indices
-                    .into_iter()
-                    .take(MAX_RASTERIZED_HEADINGS)
-                    .map(|(index, _)| index)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-        let selected_tables = graphics
-            .as_ref()
-            .map(|(_, _, _, focus_source)| {
-                let mut indices = document.tables().iter().enumerate().collect::<Vec<_>>();
-                indices.sort_by_key(|(_, table)| table.source.start.abs_diff(*focus_source));
-                indices
-                    .into_iter()
-                    .take(MAX_RASTERIZED_TABLES)
-                    .map(|(index, _)| index)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-        let mut heading_bytes = 0usize;
-        let mut table_bytes = 0usize;
-        let mut math_bytes = 0usize;
         for segment in &document.segments {
             match segment {
                 Segment::Text {
@@ -131,42 +303,27 @@ impl Layout {
                 Segment::Rule { source, style } => builder.rule(source.clone(), *style),
                 Segment::Image { index } => {
                     let prepared = images.and_then(|catalog| catalog.get(*index));
-                    let mut raster_error = None;
-                    let rendered = match (prepared, graphics.as_mut()) {
-                        (Some(image), Some((cache, cell_pixels, available_rows, _)))
-                            if image.can_render() =>
-                        {
-                            match cache.rasterize(
-                                image,
-                                (
-                                    u16::try_from(width).unwrap_or(u16::MAX),
-                                    (*available_rows).clamp(1, MAX_IMAGE_ROWS),
-                                ),
-                                *cell_pixels,
-                            ) {
-                                Ok(Some((asset, columns, rows))) => {
-                                    builder.image(
-                                        image.element_key,
-                                        image.source.clone(),
-                                        columns,
-                                        rows,
-                                        asset,
-                                        Vec::new(),
-                                    );
-                                    true
-                                }
-                                Ok(None) => false,
-                                Err(error) => {
-                                    raster_error = Some(error);
-                                    false
-                                }
-                            }
-                        }
-                        _ => false,
-                    };
+                    let key = prepared.map(|image| image.element_key);
+                    let rendered = key
+                        .and_then(|key| graphics.and_then(|graphics| graphics.graphics.get(&key)))
+                        .map(|graphic| {
+                            let image = prepared.expect("a prepared graphic has image metadata");
+                            builder.image(
+                                graphic.element_key,
+                                image.source.clone(),
+                                graphic.columns,
+                                graphic.rows,
+                                Arc::clone(&graphic.asset),
+                                image.text_projection.clone(),
+                            );
+                        })
+                        .is_some();
                     if !rendered {
+                        let raster_error = key.and_then(|key| {
+                            graphics.and_then(|graphics| graphics.failures.get(&key))
+                        });
                         let fallback = prepared
-                            .map(|image| match raster_error.as_deref() {
+                            .map(|image| match raster_error {
                                 Some(error) => image.failure_projection(error),
                                 None => image.text_projection.clone(),
                             })
@@ -202,46 +359,20 @@ impl Layout {
                     let Some(heading) = document.headings().get(*index) else {
                         continue;
                     };
-                    let mut raster_error = None;
-                    let rendered = match graphics.as_mut() {
-                        Some((cache, cell_pixels, available_rows, _))
-                            if selected_headings.contains(index) =>
-                        {
-                            match cache.rasterize_heading(
-                                *index,
-                                heading,
-                                u16::try_from(width).unwrap_or(u16::MAX),
-                                *available_rows,
-                                *cell_pixels,
-                            ) {
-                                Ok(rendered) => rendered,
-                                Err(error) => {
-                                    raster_error = Some(error);
-                                    None
-                                }
-                            }
-                        }
-                        Some(_) | None => None,
-                    };
-                    let rendered = rendered.filter(|rendered| {
-                        let bytes = rendered.asset.rgba.len();
-                        if heading_bytes.saturating_add(bytes) > MAX_LAYOUT_HEADING_BYTES {
-                            false
-                        } else {
-                            heading_bytes = heading_bytes.saturating_add(bytes);
-                            true
-                        }
-                    });
+                    let key = crate::heading::HeadingPlan::element_key(*index);
+                    let rendered = graphics.and_then(|graphics| graphics.graphics.get(&key));
                     if let Some(rendered) = rendered {
                         builder.image(
                             rendered.element_key,
                             heading.source.clone(),
                             rendered.columns,
                             rendered.rows,
-                            rendered.asset,
-                            Vec::new(),
+                            Arc::clone(&rendered.asset),
+                            heading.text.clone(),
                         );
                     } else {
+                        let raster_error =
+                            graphics.and_then(|graphics| graphics.failures.get(&key));
                         let fallback = raster_error.map_or_else(
                             || heading.text.clone(),
                             |error| {
@@ -255,45 +386,21 @@ impl Layout {
                     let Some(table) = document.tables().get(*index) else {
                         continue;
                     };
-                    let mut raster_error = None;
-                    let rendered = match graphics.as_mut() {
-                        Some((cache, cell_pixels, _, _)) if selected_tables.contains(index) => {
-                            match cache.rasterize_table(
-                                *index,
-                                table,
-                                u16::try_from(width).unwrap_or(u16::MAX),
-                                *cell_pixels,
-                            ) {
-                                Ok(rendered) => rendered,
-                                Err(error) => {
-                                    raster_error = Some(error);
-                                    None
-                                }
-                            }
-                        }
-                        Some(_) | None => None,
-                    };
-                    let rendered = rendered.filter(|rendered| {
-                        let bytes = rendered.asset.rgba.len();
-                        match reserve_table_bytes(&mut table_bytes, bytes) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                raster_error = Some(error);
-                                false
-                            }
-                        }
-                    });
+                    let key = crate::table::TablePlan::element_key(*index);
+                    let rendered = graphics.and_then(|graphics| graphics.graphics.get(&key));
                     if let Some(rendered) = rendered {
                         builder.image(
                             rendered.element_key,
                             table.source.clone(),
                             rendered.columns,
                             rendered.rows,
-                            rendered.asset,
-                            rendered.source_regions,
+                            Arc::clone(&rendered.asset),
+                            table_projection(table),
                         );
                     } else {
-                        builder.table_text(table, raster_error.as_deref());
+                        let raster_error =
+                            graphics.and_then(|graphics| graphics.failures.get(&key));
+                        builder.table_text(table, raster_error.map(String::as_str));
                     }
                 }
                 Segment::Link { index } => {
@@ -318,58 +425,30 @@ impl Layout {
                     let Some(math) = document.math().get(*index) else {
                         continue;
                     };
-                    let mut raster_error = None;
-                    let available_columns = width;
-                    let rendered = match graphics.as_mut() {
-                        Some((cache, cell_pixels, available_rows, _)) => {
-                            match cache.rasterize_math(
-                                *index,
-                                math,
-                                u16::try_from(available_columns).unwrap_or(u16::MAX),
-                                *available_rows,
-                                *cell_pixels,
-                            ) {
-                                Ok(rendered) => rendered,
-                                Err(error) => {
-                                    raster_error = Some(error);
-                                    None
-                                }
-                            }
-                        }
-                        None => None,
-                    };
-                    let rendered = rendered.filter(|rendered| {
-                        let bytes = rendered.asset.rgba.len();
-                        if math_bytes.saturating_add(bytes) > MAX_LAYOUT_MATH_BYTES {
-                            raster_error = Some(format!(
-                                "math raster needs {bytes} bytes but the layout budget has {} of {MAX_LAYOUT_MATH_BYTES} bytes remaining",
-                                MAX_LAYOUT_MATH_BYTES.saturating_sub(math_bytes)
-                            ));
-                            false
-                        } else {
-                            math_bytes = math_bytes.saturating_add(bytes);
-                            true
-                        }
-                    });
+                    let key = crate::math::MathPlan::element_key(*index);
+                    let rendered = graphics.and_then(|graphics| graphics.graphics.get(&key));
                     if let Some(rendered) = rendered {
                         match math.form {
                             MathForm::Inline => builder.inline_image(
                                 rendered.element_key,
                                 math.source.clone(),
                                 math.style,
-                                rendered.columns,
-                                rendered.rows,
-                                rendered.asset,
+                                (rendered.columns, rendered.rows),
+                                Arc::clone(&rendered.asset),
+                                math.text_projection(),
                             ),
                             MathForm::Display => builder.centered_image(
                                 rendered.element_key,
                                 math.source.clone(),
                                 rendered.columns,
                                 rendered.rows,
-                                rendered.asset,
+                                Arc::clone(&rendered.asset),
+                                math.text_projection(),
                             ),
                         }
                     } else {
+                        let raster_error =
+                            graphics.and_then(|graphics| graphics.failures.get(&key));
                         let projection = raster_error.map_or_else(
                             || math.text_projection(),
                             |error| {
@@ -399,91 +478,10 @@ impl Layout {
         &self.rows
     }
 
-    #[must_use]
-    pub fn desired_frame(
-        &self,
-        first_row: usize,
-        first_row_offset: u16,
-        body: CellRect,
-        generation: u64,
-        cell_pixels: PixelSize,
-    ) -> DesiredFrame {
-        let mut placements = Vec::new();
-        let mut assets = HashMap::new();
-        let mut y = body.y;
-        let bottom = body.y.saturating_add(body.height);
-        for (visible_index, row) in self.rows.iter().skip(first_row).enumerate() {
-            if y >= bottom {
-                break;
-            }
-            let row_offset = if visible_index == 0 {
-                first_row_offset.min(row.height.saturating_sub(1))
-            } else {
-                0
-            };
-            let remaining_height = row.height.saturating_sub(row_offset);
-            for graphic in row
-                .graphics
-                .iter()
-                .filter_map(|index| self.graphics.get(*index))
-            {
-                if row_offset >= graphic.rows {
-                    continue;
-                }
-                let graphic_remaining = graphic.rows.saturating_sub(row_offset);
-                let visible_height = graphic_remaining.min(bottom.saturating_sub(y));
-                let available_width = body.width.saturating_sub(graphic.column);
-                let width = graphic.columns.min(available_width);
-                let target = CellRect {
-                    x: body.x.saturating_add(graphic.column),
-                    y,
-                    width: graphic.columns,
-                    height: graphic.rows,
-                };
-                let clip = CellRect {
-                    x: body.x.saturating_add(graphic.column),
-                    y,
-                    width,
-                    height: visible_height,
-                };
-                placements.push(GraphicPlacement {
-                    element_key: graphic.element_key,
-                    asset_key: graphic.asset.key,
-                    target,
-                    clip,
-                    source_y: u32::from(row_offset).saturating_mul(cell_pixels.height),
-                    source: graphic.source.clone(),
-                    source_regions: graphic
-                        .source_regions
-                        .iter()
-                        .filter_map(|region| {
-                            let bottom = region.target.y.saturating_add(region.target.height);
-                            if bottom <= row_offset {
-                                return None;
-                            }
-                            let top = region.target.y.max(row_offset);
-                            Some(GraphicSourceRegion {
-                                target: CellRect {
-                                    x: region.target.x,
-                                    y: top.saturating_sub(row_offset),
-                                    width: region.target.width,
-                                    height: bottom.saturating_sub(top),
-                                },
-                                source: region.source.clone(),
-                            })
-                        })
-                        .collect(),
-                });
-                assets.insert(graphic.asset.key, Arc::clone(&graphic.asset));
-            }
-            y = y.saturating_add(remaining_height).min(bottom);
-        }
-        DesiredFrame {
-            generation,
-            cell_pixels,
-            placements,
-            assets,
-        }
+    pub(crate) fn graphics_for_row(&self, row: &LayoutRow) -> impl Iterator<Item = &LayoutGraphic> {
+        row.graphics
+            .iter()
+            .filter_map(|index| self.graphics.get(*index))
     }
 
     #[must_use]
@@ -512,6 +510,24 @@ fn reserve_table_bytes(used: &mut usize, incoming: usize) -> Result<(), String> 
     }
     *used = used.saturating_add(incoming);
     Ok(())
+}
+
+fn table_projection(table: &crate::TableElement) -> String {
+    table
+        .rows
+        .iter()
+        .map(|row| {
+            format!(
+                "│ {} │",
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" │ ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug)]
@@ -686,7 +702,7 @@ impl Builder {
         columns: u16,
         rows: u16,
         asset: Arc<RasterAsset>,
-        source_regions: Vec<GraphicSourceRegion>,
+        fallback: String,
     ) {
         if !self.current.is_empty() {
             self.push_row(source.start);
@@ -694,11 +710,10 @@ impl Builder {
         let graphic = self.graphics.len();
         self.graphics.push(LayoutGraphic {
             element_key,
-            source: source.clone(),
             columns,
             rows,
             asset,
-            source_regions,
+            fallback,
             column: 0,
         });
         self.rows.push(LayoutRow {
@@ -717,6 +732,7 @@ impl Builder {
         columns: u16,
         rows: u16,
         asset: Arc<RasterAsset>,
+        fallback: String,
     ) {
         if !self.current.is_empty() {
             self.push_row(source.start);
@@ -726,11 +742,10 @@ impl Builder {
             u16::try_from(self.width.saturating_sub(usize::from(columns)) / 2).unwrap_or(u16::MAX);
         self.graphics.push(LayoutGraphic {
             element_key,
-            source: source.clone(),
             columns,
             rows,
             asset,
-            source_regions: Vec::new(),
+            fallback,
             column,
         });
         self.rows.push(LayoutRow {
@@ -747,10 +762,11 @@ impl Builder {
         element_key: ElementKey,
         source: SourceSpan,
         style: TextStyle,
-        columns: u16,
-        rows: u16,
+        cells: (u16, u16),
         asset: Arc<RasterAsset>,
+        fallback: String,
     ) {
+        let (columns, rows) = cells;
         let columns_usize = usize::from(columns);
         if self.cell_width > 0 && self.cell_width.saturating_add(columns_usize) > self.width {
             self.push_row(source.start);
@@ -759,11 +775,10 @@ impl Builder {
         let graphic = self.graphics.len();
         self.graphics.push(LayoutGraphic {
             element_key,
-            source: source.clone(),
             columns,
             rows,
             asset,
-            source_regions: Vec::new(),
+            fallback,
             column,
         });
         self.current_graphics.push(graphic);
@@ -927,37 +942,18 @@ mod tests {
             .iter()
             .map(|fragment| fragment.text.as_str())
             .collect::<String>();
-        let frame = layout.desired_frame(
-            layout.row_for_source(document.math()[0].source.start),
-            0,
-            CellRect {
-                x: 0,
-                y: 0,
-                width: 80,
-                height: 20,
-            },
-            1,
-            cell,
-        );
+        let graphic = layout
+            .graphics_for_row(row)
+            .next()
+            .expect("inline math should retain its image component");
 
         assert!(text.starts_with("before "));
         assert!(text.ends_with(" after"));
-        assert_eq!(frame.placements.len(), 1);
-        assert!(frame.placements[0].target.x > 0);
-        assert_eq!(frame.placements[0].source, document.math()[0].source);
-        assert_eq!(
-            frame.placements[0]
-                .source_at(frame.placements[0].target.x, frame.placements[0].target.y),
-            document.math()[0].source
-        );
+        assert!(graphic.column > 0);
     }
 
     #[test]
     fn mixed_height_inline_graphics_clip_within_each_asset_when_scrolled() {
-        let cell = PixelSize {
-            width: 1,
-            height: 1,
-        };
         let asset = |seed: u8, height: u32| {
             let key = crate::RasterAssetKey {
                 content_hash: [seed; 32],
@@ -970,26 +966,36 @@ mod tests {
             })
         };
         let mut builder = Builder::new(20);
-        builder.inline_image(ElementKey(1), 0..3, TextStyle::default(), 2, 1, asset(1, 1));
-        builder.inline_image(ElementKey(2), 3..6, TextStyle::default(), 2, 2, asset(2, 2));
+        builder.inline_image(
+            ElementKey(1),
+            0..3,
+            TextStyle::default(),
+            (2, 1),
+            asset(1, 1),
+            "one".to_owned(),
+        );
+        builder.inline_image(
+            ElementKey(2),
+            3..6,
+            TextStyle::default(),
+            (2, 2),
+            asset(2, 2),
+            "two".to_owned(),
+        );
         let layout = builder.finish(6);
-        let body = CellRect {
-            x: 0,
-            y: 0,
-            width: 20,
-            height: 2,
-        };
-
-        let full = layout.desired_frame(0, 0, body, 1, cell);
-        assert_eq!(full.placements.len(), 2);
-        assert_eq!(full.placements[0].clip.height, 1);
-        assert_eq!(full.placements[1].clip.height, 2);
-
-        let scrolled = layout.desired_frame(0, 1, body, 2, cell);
-        assert_eq!(scrolled.placements.len(), 1);
-        assert_eq!(scrolled.placements[0].element_key, ElementKey(2));
-        assert_eq!(scrolled.placements[0].source_y, 1);
-        assert_eq!(scrolled.placements[0].clip.height, 1);
+        let graphics = layout
+            .graphics_for_row(&layout.rows()[0])
+            .collect::<Vec<_>>();
+        assert_eq!(graphics.len(), 2);
+        assert_eq!(
+            (graphics[0].element_key, graphics[0].rows),
+            (ElementKey(1), 1)
+        );
+        assert_eq!(
+            (graphics[1].element_key, graphics[1].rows),
+            (ElementKey(2), 2)
+        );
+        assert_eq!(layout.rows()[0].height, 2);
     }
 
     #[test]
@@ -1002,26 +1008,11 @@ mod tests {
             height: 16,
         };
         let layout = Layout::with_graphics(&supported, 80, 20, &catalog, &mut cache, cell, 0);
-        let frame = layout.desired_frame(
-            0,
-            0,
-            CellRect {
-                x: 0,
-                y: 0,
-                width: 80,
-                height: 20,
-            },
-            1,
-            cell,
-        );
-        let placement = frame
-            .placements
+        let graphic = layout
+            .graphics
             .first()
-            .expect("display math should produce a placement");
-        assert_eq!(
-            placement.target.x,
-            (80_u16.saturating_sub(placement.target.width)) / 2
-        );
+            .expect("display math should produce an image component");
+        assert_eq!(graphic.column, (80_u16.saturating_sub(graphic.columns)) / 2);
 
         let invalid = Document::parse("before $\\unknowncommand{x}$ after".to_owned());
         let invalid_catalog = ImageCatalog::load(&invalid, std::path::Path::new("doc.md"));
@@ -1434,112 +1425,22 @@ mod tests {
             height: 16,
         };
         let layout = Layout::with_graphics(&document, 48, 20, &catalog, &mut cache, cell, 0);
-        let table_source = document.tables()[0].source.clone();
-        let frame = layout.desired_frame(
-            layout.row_for_source(table_source.start),
-            0,
-            CellRect {
-                x: 0,
-                y: 0,
-                width: 48,
-                height: 20,
-            },
-            1,
-            cell,
-        );
-        assert_eq!(frame.placements.len(), 1);
-        assert_eq!(frame.placements[0].source, table_source);
-        assert_eq!(frame.placements[0].source_regions.len(), 6);
-        assert_eq!(
-            frame.placements[0].source_at(1, 0),
-            document.tables()[0].rows[0].cells[0].source
-        );
-        let last_region = frame.placements[0]
-            .source_regions
-            .last()
-            .expect("body cell region exists");
-        assert_eq!(
-            frame.placements[0].source_at(last_region.target.x, last_region.target.y),
-            document.tables()[0].rows[1].cells[2].source
-        );
-        let body_region = frame.placements[0].source_regions[3].clone();
-        let scrolled = layout.desired_frame(
-            layout.row_for_source(table_source.start),
-            body_region.target.y,
-            CellRect {
-                x: 0,
-                y: 0,
-                width: 48,
-                height: 20,
-            },
-            2,
-            cell,
-        );
-        assert_eq!(
-            scrolled.placements[0].source_at(body_region.target.x, 0),
-            document.tables()[0].rows[1].cells[0].source
-        );
-        assert!(frame.placements[0].target.height > 1);
-        assert!(
-            frame.assets[&frame.placements[0].asset_key]
-                .rgba
-                .iter()
-                .any(|channel| *channel != 255)
-        );
+        let graphic = layout
+            .graphics
+            .first()
+            .expect("table should produce an image component");
+        assert!(graphic.rows > 1);
+        assert!(graphic.asset.rgba.iter().any(|channel| *channel != 255));
+        let original_key = graphic.asset.key;
 
-        let cached = Layout::with_graphics(&document, 48, 20, &catalog, &mut cache, cell, 0)
-            .desired_frame(
-                layout.row_for_source(table_source.start),
-                0,
-                CellRect {
-                    x: 0,
-                    y: 0,
-                    width: 48,
-                    height: 20,
-                },
-                2,
-                cell,
-            );
-        assert_eq!(
-            cached.placements[0].asset_key,
-            frame.placements[0].asset_key
-        );
+        let cached = Layout::with_graphics(&document, 48, 20, &catalog, &mut cache, cell, 0);
+        assert_eq!(cached.graphics[0].asset.key, original_key);
 
-        let resized = Layout::with_graphics(&document, 64, 20, &catalog, &mut cache, cell, 0)
-            .desired_frame(
-                layout.row_for_source(table_source.start),
-                0,
-                CellRect {
-                    x: 0,
-                    y: 0,
-                    width: 64,
-                    height: 20,
-                },
-                3,
-                cell,
-            );
-        assert_eq!(
-            resized.placements[0].asset_key,
-            frame.placements[0].asset_key
-        );
+        let resized = Layout::with_graphics(&document, 64, 20, &catalog, &mut cache, cell, 0);
+        assert_eq!(resized.graphics[0].asset.key, original_key);
 
-        let narrowed = Layout::with_graphics(&document, 40, 20, &catalog, &mut cache, cell, 0)
-            .desired_frame(
-                layout.row_for_source(table_source.start),
-                0,
-                CellRect {
-                    x: 0,
-                    y: 0,
-                    width: 40,
-                    height: 20,
-                },
-                4,
-                cell,
-            );
-        assert_ne!(
-            narrowed.placements[0].asset_key,
-            frame.placements[0].asset_key
-        );
+        let narrowed = Layout::with_graphics(&document, 40, 20, &catalog, &mut cache, cell, 0);
+        assert_ne!(narrowed.graphics[0].asset.key, original_key);
     }
 
     #[test]
@@ -1629,39 +1530,16 @@ mod tests {
             .position(|row| !row.graphics.is_empty())
             .expect("layout should contain graphic row");
         let graphic_row = &layout.rows()[graphic_index];
+        let graphic = layout
+            .graphics_for_row(graphic_row)
+            .next()
+            .expect("graphic row should retain its image component");
         let before = markdown.find("before").expect("fixture contains before");
         let after = markdown.find("after").expect("fixture contains after");
-        let frame = layout.desired_frame(
-            layout.row_for_source(image_source.start),
-            0,
-            CellRect {
-                x: 7,
-                y: 1,
-                width: 10,
-                height: 10,
-            },
-            1,
-            cell,
-        );
 
         assert_eq!(graphic_row.source, image_source);
-        assert_eq!(frame.placements[0].source, image_source);
-        assert_eq!(frame.placements[0].target.x, 7);
-        assert_eq!(frame.placements[0].clip.x, 7);
-        let clipped = layout.desired_frame(
-            graphic_index,
-            1,
-            CellRect {
-                x: 0,
-                y: 1,
-                width: 10,
-                height: 10,
-            },
-            2,
-            cell,
-        );
-        assert_eq!(clipped.placements[0].source_y, 1);
-        assert_eq!(clipped.placements[0].clip.height, 3);
+        assert_eq!(graphic.column, 0);
+        assert_eq!(graphic.rows, 4);
         assert!(layout.row_for_source(before) < graphic_index);
         assert!(layout.row_for_source(after) > graphic_index);
         let narrow = Layout::with_graphics(&document, 3, 10, &catalog, &mut cache, cell, 0);
@@ -1691,23 +1569,8 @@ mod tests {
         };
         let mut cache = RasterCache::default();
         let layout = Layout::with_graphics(&document, 24, 20, &catalog, &mut cache, cell, 0);
-        let frame = layout.desired_frame(
-            0,
-            0,
-            CellRect {
-                x: 0,
-                y: 0,
-                width: 24,
-                height: 20,
-            },
-            1,
-            cell,
-        );
-
-        assert_eq!(frame.placements.len(), 2);
-        assert_eq!(frame.placements[0].source, document.headings()[0].source);
-        assert_eq!(frame.placements[1].source, document.headings()[1].source);
-        assert_ne!(frame.placements[0].asset_key, frame.placements[1].asset_key);
+        assert_eq!(layout.graphics.len(), 2);
+        assert_ne!(layout.graphics[0].asset.key, layout.graphics[1].asset.key);
 
         let text_layout = Layout::new(&document, 80);
         let rendered = text_layout

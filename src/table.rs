@@ -7,8 +7,7 @@ use typst_as_lib::TypstEngine;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    CellRect, ElementKey, GraphicSourceRegion, PixelSize, RasterAssetKey, TableAlignment,
-    TableElement,
+    ElementKey, PixelSize, RasterAssetKey, TableAlignment, TableElement,
     image::{cell_aligned_size, pad_to_cell_grid},
 };
 
@@ -119,52 +118,6 @@ impl TablePlan {
 
     pub(crate) fn element_key(index: usize) -> ElementKey {
         ElementKey((1_u64 << 62) | (index as u64 + 1))
-    }
-
-    pub(crate) fn source_regions(
-        table: &TableElement,
-        rendered_columns: u16,
-        rendered_rows: u16,
-        cell_pixels: PixelSize,
-    ) -> Vec<GraphicSourceRegion> {
-        let columns = table.alignments.len().max(
-            table
-                .rows
-                .iter()
-                .map(|row| row.cells.len())
-                .max()
-                .unwrap_or(0),
-        );
-        if columns == 0 || table.rows.is_empty() {
-            return Vec::new();
-        }
-        let widths = column_widths(table, columns, usize::from(rendered_columns.max(1)));
-        let logical_heights = logical_row_heights(table, &widths, cell_pixels);
-        let logical_total = logical_heights.iter().sum::<usize>().max(1);
-        let mut regions = Vec::new();
-        let mut logical_y = 0usize;
-        for (row, row_height) in table.rows.iter().zip(logical_heights) {
-            let y = scale_cells(logical_y, logical_total, rendered_rows);
-            logical_y = logical_y.saturating_add(row_height);
-            let bottom = scale_cells(logical_y, logical_total, rendered_rows);
-            let mut x = 0u16;
-            for (column, cell) in row.cells.iter().enumerate() {
-                let width = u16::try_from(widths.get(column).copied().unwrap_or(1))
-                    .unwrap_or(u16::MAX)
-                    .min(rendered_columns.saturating_sub(x));
-                regions.push(GraphicSourceRegion {
-                    target: CellRect {
-                        x,
-                        y,
-                        width,
-                        height: bottom.saturating_sub(y).max(1),
-                    },
-                    source: cell.source.clone(),
-                });
-                x = x.saturating_add(width);
-            }
-        }
-        regions
     }
 
     pub(crate) fn render(mut self, cell_pixels: PixelSize) -> Result<(Self, RgbaImage), String> {
@@ -439,12 +392,6 @@ fn wrap_text(text: &str, width_pixels: f32) -> Result<Vec<String>, String> {
         previous = Some(character);
     }
     Ok(lines)
-}
-
-fn scale_cells(value: usize, total: usize, rendered: u16) -> u16 {
-    u16::try_from(value.saturating_mul(usize::from(rendered)) / total.max(1))
-        .unwrap_or(rendered)
-        .min(rendered)
 }
 
 fn escape_typst_string(text: &str) -> String {

@@ -7,13 +7,11 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
-base64 = "0.22"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 fontdue = { version = "=0.9.3", default-features = false, features = ["std"] }
 fontdb = "0.23"
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-icy_sixel = "=0.5.1"
 percent-encoding = "2.3"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 resvg = { version = "=0.47.0", default-features = false }
@@ -27,5 +25,6 @@ typst-assets = { version = "=0.15.1", features = ["fonts"] }
 typst-svg = "=0.15.0"
 unicode-width = "0.2"
 urushi = { path = "../urushi/urushi" }
+urushi-graphics = { path = "../urushi/urushi-graphics" }
 urushi-terminal = { path = "../urushi/urushi-terminal" }
-urushi-tui-app = { path = "../urushi/urushi-tui-app", default-features = false }
+urushi-tui-app = { path = "../urushi/urushi-tui-app", default-features = false, features = ["graphics"] }

@@ -52,33 +52,29 @@ that produced its input text. Synthetic fragments map to their triggering
 source position. Specialized elements keep their enclosing range rather than
 inventing ranges from rendered pixels.
 
-A table raster additionally carries `GraphicSourceRegion` values for its cells.
-Hit-testing a position inside a known region returns that cell's source range;
-positions outside those regions return the table's enclosing range. Cropping a
-graphic to the viewport crops these regions in cell coordinates without
-changing their source ranges.
-
 An inline graphic participates in its logical text row. A block graphic owns a
 row whose `height` is its terminal-cell height. `top_row_offset` identifies
 which cell-height band of that row is first visible, so tall graphics can be
 scrolled one terminal row at a time without losing the element's source anchor.
 
-## Re-layout and asynchronous rendering
+## Re-layout and asynchronous preparation
 
-The application always has a synchronous text layout. A graphics-enhanced
-layout may be produced on the logical-renderer thread. Each request includes the
-current generation, source anchor, body rectangle, and cell-pixel size.
+`ReaderModel` does not store a `Layout`. The application View derives one from
+the current document, surface, source anchor, and prepared raster assets. A
+resize therefore changes the next projection directly instead of replacing one
+stored layout with another.
 
-The worker keeps only the latest pending request. Before publishing a result it
-checks whether a newer request is waiting, and the application accepts a
-published result only if its generation equals the current generation. When
-the enhanced layout arrives, the application resolves the saved source anchor
-against it and derives a new desired frame. This prevents an earlier resize or
-scroll computation from moving the current viewport backward.
+Raster preparation runs as `Effect::perform_latest`. Each request captures the
+current generation, source focus, body rectangle, and cell-pixel size, and its
+completion carries only prepared assets and element-level failures. The
+application accepts a completion only when its generation is still current.
+The next `view` combines those assets with the current source anchor and derives
+the layout; stale work can neither replace geometry nor move the viewport.
 
-Rasterizers do not provide cooperative cancellation. Dropping the renderer
-therefore detaches in-flight work instead of delaying quit; generation checks
-prevent that abandoned result from entering application state.
+Rasterizers do not provide cooperative cancellation. Already-running blocking
+work may finish after replacement, but Urushi suppresses its completion and the
+application generation guard prevents obsolete queued work from starting its
+expensive phase.
 
 ## Rejected alternatives
 
@@ -102,9 +98,9 @@ diagnostics, and formulas need different heights from their rasters. Clipping
 them to the old rectangle would discard reviewable content. Raden instead
 rebuilds layout and preserves the source anchor.
 
-### Apply every completed background render
+### Apply every completed preparation
 
 Background work can finish out of order relative to resize and input. Applying
-every result would let stale geometry replace current state. Latest-pending
-admission plus generation validation makes freshness explicit without coupling
-rasterizers to cancellation.
+every result would let assets prepared for stale geometry enter current state.
+Latest-only replacement plus generation validation makes freshness explicit
+without coupling rasterizers to cancellation.

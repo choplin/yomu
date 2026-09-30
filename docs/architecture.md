@@ -1,22 +1,18 @@
 # Architecture
 
 This document is the starting point for developers changing Raden. It explains
-how Markdown source becomes a source-aware terminal view, where text and raster
-rendering separate, how the terminal runtime coordinates them, and which
-invariants changes must preserve.
+how Markdown source becomes a source-aware Urushi view and which responsibilities
+remain application-specific.
 
-Raden is a single Rust package with both a library and a CLI binary. The
-top-level [`README`](../README.md) explains the product and its user-visible
-behavior. This document describes the implementation that currently exists.
-Precise rules for source identity and graphics degradation live in
+Raden is one Rust package with a library and CLI binary. The top-level
+[`README`](../README.md) describes user-visible behavior. Precise rules for
+source identity and graphics degradation live in
 [`design/source-anchored-layout.md`](design/source-anchored-layout.md) and
-[`design/graphics-fallback.md`](design/graphics-fallback.md). Decision history
-lives in [`decision-log.md`](decision-log.md).
+[`design/graphics-fallback.md`](design/graphics-fallback.md). The history of the
+design decisions those documents record lives in
+[`decision-log.md`](decision-log.md).
 
 ## Architecture at a glance
-
-Raden keeps ordinary text in the terminal's cell renderer and overlays only
-understanding-critical elements as terminal graphics:
 
 ```text
 file or stdin
@@ -31,189 +27,151 @@ text projection         raster preparation
      |                  image / heading / table / math
      +-----------+-----------+
                  v
-        Layout: terminal rows + source identity
+        Layout: rows + source identity
                  |
-          +------+------+
-          |             |
-          v             v
-     Urushi View    DesiredFrame
-     text cells     raster assets + placements
-          |             |
-          +------+------+
                  v
-        one terminal presentation
+        Urushi View + Image components
+                 |
+                 v
+ urushi-tui-app graphics presentation
+       cells + Kitty/Sixel lifecycle
 ```
 
-The split is intentional. `Layout` is the shared geometric truth for both text
-and graphics. `DesiredFrame` carries what graphics should be visible, without
-encoding how Kitty or sixel realizes it. The terminal backend combines the
-Urushi cell frame and Raden's graphics overlay at flush time.
+Raden owns Markdown meaning, source-aware navigation, raster preparation, and
+application state. Urushi owns the terminal session, event delivery, effects,
+view resolution, cell-frame commit, graphics protocol selection and lifecycle,
+failure recovery, and cleanup.
 
 ## Core representations and ownership
 
 ### Source document
 
-[`src/document.rs`](../src/document.rs) owns the semantic interpretation of
-Markdown. `Document::parse` enables the supported pulldown-cmark extensions and
-retains every parser event's half-open UTF-8 byte range. Its `Segment` sequence
-is the ordered input to layout; specialized collections retain the data needed
-for images, H1/H2 headings, tables, math, links, and code blocks.
-
-`Document` does not resolve image paths, choose a terminal backend, measure a
-viewport, or create terminal commands. Its lasting responsibility is to keep
-renderable meaning attached to source identity.
+[`src/document.rs`](../src/document.rs) parses Markdown and retains each
+pulldown-cmark event's half-open UTF-8 source range. Its ordered segments and
+specialized collections preserve the data needed for images, headings, tables,
+math, links, and code blocks. It does not inspect terminal capabilities or
+produce terminal commands.
 
 ### Projection and layout
 
 [`src/layout.rs`](../src/layout.rs) owns width-dependent projection into
-terminal rows. It wraps styled text, maps each fragment back to a source span,
-and reserves cell rectangles for raster elements. The same builder can produce
-a complete text layout or a graphics-enhanced layout.
+terminal rows. It wraps styled text, maps fragments back to source spans, and
+reserves cell geometry for prepared raster elements. `Layout` is a transient
+View-construction value: `ReaderModel` never stores one. Each call to `view`
+derives the current layout from the document, surface, navigation state, and
+the prepared raster assets currently in the model.
 
-Every rich element therefore has a readable text outcome. Images have labels
-and diagnostics, math retains its delimiters, tables retain every cell, and
-headings retain their text. Raster generation may change row height, so a
-graphics-to-text transition rebuilds the layout rather than substituting text
-inside an old rectangle. The exact contract is in
-[`design/graphics-fallback.md`](design/graphics-fallback.md).
-
-`Layout::desired_frame` derives only the visible graphics scene. It clips each
-placement to the viewport, retains its full target rectangle and source range,
-and supplies the raster assets referenced by that frame.
+Every rich element retains a readable fallback. Images keep labels and
+diagnostics, headings keep their text, tables keep their cells, and math keeps
+its source notation. Raster and text projections may have different heights,
+so every derived layout resolves the viewport from its source anchor.
 
 ### Raster preparation
 
-[`src/image.rs`](../src/image.rs) owns local-image admission and the shared
-`RasterCache`. It confines image paths to the Markdown file's directory,
-validates formats and resource bounds, decodes accepted files, and scales RGBA
-assets to the terminal cell grid. The cache also coordinates the specialized
-rasterizers:
+[`src/image.rs`](../src/image.rs) owns local-image admission and the shared,
+byte-bounded `RasterCache`. It confines paths to the Markdown directory,
+validates formats and resource limits, and prepares cell-aligned RGBA. The same
+cache coordinates:
 
-- [`src/heading.rs`](../src/heading.rs) selects configured fonts with the
-  embedded Noto Sans JP fallback and rasterizes H1/H2 typography;
-- [`src/table.rs`](../src/table.rs) converts bounded, structured table data to
-  Typst, then SVG and RGBA;
-- [`src/math.rs`](../src/math.rs) converts supported TeX through Typst, then SVG
-  and RGBA; and
-- [`src/code.rs`](../src/code.rs) remains on the text path and adds syntax
-  colors to source-mapped code fragments.
+- [`src/heading.rs`](../src/heading.rs) for H1/H2 typography;
+- [`src/table.rs`](../src/table.rs) for bounded Typst table rendering;
+- [`src/math.rs`](../src/math.rs) for TeX-to-Typst math rendering; and
+- ordinary local images decoded by `image`.
 
-Raster identity includes the inputs that affect pixels, including content,
-target geometry, fonts or render settings where applicable, and a rasterizer
-version. The shared cache owns RGBA reuse and a byte-bounded LRU policy;
-protocol-specific caches remain inside their graphics backends.
+Raster identities include every input that changes pixels. Protocol upload and
+encoded-band caches are not Raden state; they are owned by `urushi-graphics`.
 
-### Reading state and cell UI
+### Reading state and View construction
 
-[`src/app.rs`](../src/app.rs) owns Reading-mode commands and viewport state.
-The canonical viewport position is a source span plus an offset within a
-possibly multi-row element, not an absolute rendered row. This lets
-[`src/terminal.rs`](../src/terminal.rs) replace the layout after resize or
-graphics degradation while keeping the same logical content near the top.
+[`src/app.rs`](../src/app.rs) owns source-anchored viewport navigation. A
+position is a source span plus an offset inside a multi-row element rather than
+an absolute rendered row, so it survives resize and asynchronous raster
+preparation.
 
-[`src/ui.rs`](../src/ui.rs) projects the current layout into an Urushi `View`.
-It owns the header, centered body width, footer, text styles, and the visible
-cell rows. It does not emit Kitty or sixel commands.
+[`src/ui.rs`](../src/ui.rs) converts the layout into one Urushi `View`. Text and
+`urushi_graphics::Image` components share the same row geometry. An Urushi
+vertical `Viewport` performs clipping, including the source crop of a partially
+visible image. Raden emits no Kitty or Sixel commands.
 
-### Runtime and terminal ownership
+### Application and runtime
 
-[`src/terminal.rs`](../src/terminal.rs) is the integration boundary. It owns the
-`urushi-tui-app` application, opens the native controlling terminal, selects a
-graphics backend from observed capabilities and configuration, and coordinates
-cell drawing with graphics output.
+[`src/terminal.rs`](../src/terminal.rs) defines Raden's
+`urushi_tui_app::Application`: `ReaderModel`, `Message`, `init`, `update`,
+`view`, and `subscriptions`. These are application-domain TEA values. The
+runtime owns their execution.
 
-Text layouts are available synchronously. When graphics are enabled, a
-dedicated `LogicalRenderer` thread owns the raster cache and computes enhanced
-layouts. Its mailbox retains only the latest request, and a completed render is
-accepted only when its generation matches the current model. Expensive stale
-work may finish, but it cannot replace a newer viewport or surface state.
+Surface and input observations arrive through subscriptions. Expensive raster
+work is returned as `Effect::perform_latest`; it runs outside the update thread,
+and its generation is checked before its prepared assets may enter the model.
+Layout remains a projection performed while building the View. The application
+does not own a worker thread, channel, event loop, draw scheduler, terminal
+session, or presentation side channel.
 
-`DirectGraphicsBackend` is the single presentation boundary. Urushi owns the
-terminal session, events, cell drawing, and restoration through that backend;
-Raden intercepts resize and flush boundaries to clear or present graphics in
-the same terminal lifecycle.
-
-### Graphics backends
-
-[`src/scene.rs`](../src/scene.rs) defines the backend-neutral desired scene:
-cell rectangles, stable element and raster identities, source mappings, and the
-assets needed by one frame. [`src/graphics.rs`](../src/graphics.rs) owns backend
-selection and protocol mechanics.
-
-Kitty is retained-mode: it caches uploaded assets, reconciles desired
-placements, reuses uploads, and deletes stale placements and unused images.
-Sixel is immediate-mode: it caches encoded cell-height bands, but clears and
-repaints the complete visible scene because portable partial deletion is not a
-reliable contract. Text is the no-graphics projection, not a fake graphics
-protocol.
+The production entry point opens Urushi's native controlling-terminal backend
+and passes it to `Runtime`. With the `graphics` feature enabled,
+`Runtime::graphics` selects text, Kitty, or Sixel from the requested preference
+and observed terminal evidence. `urushi-tui-app` resolves the application View
+once and commits its cell frame and image scene together.
 
 ## Representative flows
 
 ### Open and initial render
 
-1. [`src/main.rs`](../src/main.rs) resolves a file or standard input and an
-   optional graphics override.
-2. [`src/lib.rs`](../src/lib.rs) parses the source and loads configuration.
-3. The terminal backend enters its managed session, obtains window and
-   capability evidence, and chooses Kitty, sixel, or text.
-4. The application immediately creates a text layout. If graphics are active,
-   it also submits the current source anchor and surface geometry to the logical
-   renderer.
-5. Urushi draws the text view; the terminal backend overlays the matching
-   `DesiredFrame` during flush.
+1. The CLI resolves file or standard-input Markdown and an optional graphics
+   preference.
+2. Raden parses the document and loads configuration and local-image metadata.
+3. Urushi enters the terminal session, observes geometry and capabilities, and
+   selects the graphics presentation.
+4. The initial `Surface` message causes Raden to return a latest-only raster
+   effect when graphics have not been explicitly disabled.
+5. The effect completion adds prepared assets to the model. `view` derives a
+   layout containing Urushi Image components, and Urushi commits cells and
+   graphics from that same resolved View.
 
 ### Scroll and resize
 
-A key becomes a `Command`, and `App` advances through rendered cell heights
-while storing the resulting source anchor. Scrolling changes the desired
-visible placements without reparsing the document.
+A key becomes a Raden `Command`, and `App` advances through the currently
+derived layout's cell heights while retaining only a source anchor in the
+model. The next `view` derives layout again from that updated state. Raden also
+returns a latest-only effect so near-viewport raster preparation follows the
+new focus.
 
-On resize, the terminal backend first invalidates graphics occupancy. The
-application rebuilds a text layout at the new width, clamps the source-anchored
-viewport, increments the generation, and requests a new enhanced layout. A
-stale generation is ignored. The detailed positioning rule is in
-[`design/source-anchored-layout.md`](design/source-anchored-layout.md).
+On resize, Raden clears assets tied to the old geometry and requests new
+preparation. The next `view` derives the new-width text projection until those
+assets arrive. Urushi owns presentation invalidation, graphics clearing, and
+redraw against the accepted surface snapshot. A stale effect generation cannot
+enter the model.
 
 ### Graphics failure
 
-An element-level decode, conversion, rasterization, or budget failure produces
-that element's text projection and a concise diagnostic. A backend write
-failure disables the graphics mode, clears what can be cleared, rebuilds the
-whole document through the text path at the current source anchor, and keeps
-the terminal session alive. An unavailable explicitly requested backend fails
-startup instead of silently selecting another backend.
+Element preparation failures select that element's text projection. Protocol
+selection, writes, recovery, and cleanup are Urushi responsibilities. A graphics
+write failure disables graphics in the Urushi presenter, redraws the same View's
+text fallbacks, and reports the diagnostic through the terminal-error
+subscription. An explicitly requested unavailable protocol fails startup.
 
 ## Binding invariants
 
-- Source byte ranges, not display rows, are the stable identity across wrapping,
-  resize, and graphics changes.
-- A complete readable text projection exists independently of terminal graphics
-  support and rasterization success.
-- `Layout` owns cell geometry; protocol backends consume `DesiredFrame` and do
-  not decide document layout.
-- Raster assets are aligned to terminal-cell pixels before placement, so the
-  protocol does not silently rescale a logically sized element.
-- Capability evidence is observed before automatic backend selection; the
-  order is Kitty, sixel, then text.
-- Raster work and caches are bounded. Elements outside the near-viewport raster
-  set or beyond resource limits remain complete text rather than disappearing.
-- Only the current render generation may replace the application layout.
-- Terminal graphics are cleared on resize, degradation, and session cleanup so
-  stale placements do not survive their owning frame.
+- Source byte ranges, not display rows, are stable across wrapping and resize.
+- Every rasterized element supplies a readable Urushi Image fallback.
+- `Layout` owns application geometry; Urushi owns View clipping and physical
+  presentation.
+- Raster assets are aligned to terminal-cell pixels before becoming Image
+  components.
+- `ReaderModel` stores application state and prepared assets, never a `Layout`.
+- Raster work and caches are bounded, and only the current generation may add
+  prepared assets to the model.
+- `update` requests expensive work through effects and performs no terminal I/O.
+- Kitty/Sixel selection, state, commit, fallback, resize, and cleanup remain one
+  `urushi-tui-app` presentation lifecycle.
 
 ## Where changes begin
 
-Changes to Markdown meaning begin in `document.rs`, then follow the affected
-segment through `layout.rs` and its source-mapping tests. A new rasterized
-element additionally needs a bounded raster plan, cache identity and ownership
-in `image.rs`, a text projection, scene placement, and failure coverage.
+Markdown meaning begins in `document.rs`, then follows the affected segment
+through `layout.rs`. Raster changes begin in `image.rs` and the specialized
+rasterizer. Navigation belongs in `app.rs`; message handling and effects belong
+in `terminal.rs`; View composition belongs in `ui.rs`.
 
-Changes to navigation begin in `app.rs`; terminal event wiring belongs in
-`terminal.rs`, and visible chrome belongs in `ui.rs`. Changes to backend
-selection or protocol lifecycle begin in `graphics.rs` and must be integrated
-through `DirectGraphicsBackend` so resize, flush, fallback, and cleanup remain
-one lifecycle.
-
-Tests live beside the owning modules. Pure parsing, layout, cache, scene, and
-state behavior is covered there; actual terminal-protocol behavior still
-requires the real-terminal checks documented in the top-level README.
+Graphics protocol behavior belongs in the Urushi workspace, not Raden. A new
+rasterized Raden element needs bounded preparation, stable asset and placement
+keys, a readable fallback, and an `ImagePresentation` in the View.

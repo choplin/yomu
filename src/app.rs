@@ -12,14 +12,12 @@ pub enum Command {
     PageDown,
     Home,
     End,
-    Quit,
 }
 
 impl Command {
     #[must_use]
     pub fn from_key(key: KeyEvent) -> Self {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Escape => Self::Quit,
             KeyCode::Up | KeyCode::Char('k') => Self::Up,
             KeyCode::Down | KeyCode::Char('j') => Self::Down,
             KeyCode::PageUp | KeyCode::Char('u') => Self::PageUp,
@@ -37,7 +35,6 @@ pub struct App {
     top_source: usize,
     top_source_end: usize,
     top_row_offset: u16,
-    quit: bool,
 }
 
 impl App {
@@ -72,11 +69,6 @@ impl App {
             .unwrap_or(100)
     }
 
-    #[must_use]
-    pub fn should_quit(&self) -> bool {
-        self.quit
-    }
-
     pub fn apply(&mut self, command: Command, layout: &Layout, viewport_height: u16) {
         let rows = layout.rows();
         let (current, offset) = self.viewport_position(layout);
@@ -96,10 +88,6 @@ impl App {
             Command::PageDown => move_down_cells(rows, current, offset, page),
             Command::Home => (0, 0),
             Command::End => (last, rows[last].height.saturating_sub(1)),
-            Command::Quit => {
-                self.quit = true;
-                return;
-            }
         };
         self.set_position(
             rows,

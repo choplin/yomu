@@ -66,7 +66,6 @@ pub(crate) struct TableRaster {
     pub element_key: ElementKey,
     pub columns: u16,
     pub rows: u16,
-    pub source_regions: Vec<crate::scene::GraphicSourceRegion>,
 }
 
 #[derive(Clone, Debug)]
@@ -596,7 +595,6 @@ impl RasterCache {
                 element_key: TablePlan::element_key(index),
                 columns,
                 rows,
-                source_regions: TablePlan::source_regions(table, columns, rows, cell_pixels),
             }));
         }
         if let Some(error) = self.failures.get(&identity) {
@@ -644,13 +642,11 @@ impl RasterCache {
         }
         self.table_keys.insert(identity, plan.key);
         self.used = self.used.saturating_add(bytes);
-        let source_regions = TablePlan::source_regions(table, columns, rows, cell_pixels);
         Ok(Some(TableRaster {
             asset,
             element_key: plan.element_key,
             columns,
             rows,
-            source_regions,
         }))
     }
 
@@ -922,19 +918,7 @@ mod tests {
             };
             let layout =
                 crate::Layout::with_graphics(&document, 10, 10, &catalog, &mut cache, cell, 0);
-            let frame = layout.desired_frame(
-                0,
-                0,
-                crate::CellRect {
-                    x: 0,
-                    y: 1,
-                    width: 10,
-                    height: 10,
-                },
-                1,
-                cell,
-            );
-            assert_eq!(frame.placements.len(), 1, "{name} should reach the scene");
+            assert_eq!(layout.graphics.len(), 1, "{name} should reach the view");
             fs::remove_file(path).expect("fixture should be removable");
         }
 
@@ -1189,11 +1173,10 @@ mod tests {
             (table_first.columns, table_first.rows),
             (table_cached.columns, table_cached.rows)
         );
-        assert_eq!(table_first.source_regions, table_cached.source_regions);
     }
 
     #[test]
-    fn desired_frame_owns_raster_after_cache_eviction() {
+    fn urushi_image_owns_raster_after_cache_eviction() {
         let root = temp_dir();
         let prepared = |key| {
             let path = root.join(format!("frame-{key}.png"));
@@ -1223,14 +1206,13 @@ mod tests {
             .expect("first asset should decode")
             .expect("first asset should fit");
         let first_key = first.key;
-        let mut assets = HashMap::new();
-        assets.insert(first_key, first);
-        let frame = crate::DesiredFrame {
-            generation: 1,
-            cell_pixels: cell,
-            placements: Vec::new(),
-            assets,
-        };
+        let image = urushi_graphics::Image::rgba(
+            urushi::Key::of(&ElementKey(1)),
+            urushi::Key::of(&first_key),
+            urushi_graphics::PixelSize::new(first_key.pixels.width, first_key.pixels.height),
+            first.rgba.clone(),
+        )
+        .expect("cache assets are checked RGBA rasters");
 
         cache
             .rasterize(&prepared(2), (4, 2), cell)
@@ -1238,7 +1220,7 @@ mod tests {
             .expect("second asset should evict first");
 
         assert!(!cache.contains(first_key));
-        assert_eq!(frame.assets[&first_key].rgba.len(), 32);
+        assert_eq!(image.raster().bytes().len(), 32);
         fs::remove_dir_all(root).expect("fixture directory should be removable");
     }
 

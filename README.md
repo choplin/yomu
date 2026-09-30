@@ -48,11 +48,10 @@ frame. Image paths are resolved
 relative to the Markdown file's directory; remote URLs, absolute paths, paths
 that escape that directory, unsupported formats, oversized images, and decode
 failures stay readable as an inline diagnostic. Without a usable graphics
-backend, the same elements use their alt-text projection and the footer reports
-why raden degraded to text.
+presentation, the same elements use their text projection.
 
 Level-one and level-two headings also render as larger rasterized typography in
-Kitty or through the experimental sixel backend. They use an embedded Noto Sans
+Kitty or through Sixel. They use an embedded Noto Sans
 JP font so Japanese and Latin text render
 consistently; level-three through level-six headings remain terminal text.
 Unsupported terminals and rasterization failures retain readable heading text.
@@ -84,7 +83,7 @@ families can be resolved. Use a Nerd Font `Mono` family when its glyphs should
 retain terminal-like spacing.
 
 GFM tables render through an embedded Typst-to-SVG-to-RGBA pipeline in the
-selected Kitty or experimental sixel backend. Their canvas is transparent so
+selected Kitty or Sixel presentation. Their canvas is transparent so
 the terminal background remains visible. Column widths fit
 parsed cell content up to a deterministic cap and
 only expand as far as needed, bounded by the viewport; wide cells wrap instead

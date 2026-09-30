@@ -1895,12 +1895,10 @@ name = "raden"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "blake3",
  "clap",
  "fontdb",
  "fontdue",
- "icy_sixel",
  "image",
  "percent-encoding",
  "pulldown-cmark",
@@ -1915,6 +1913,7 @@ dependencies = [
  "typst-svg",
  "unicode-width",
  "urushi",
+ "urushi-graphics",
  "urushi-terminal",
  "urushi-tui-app",
 ]
@@ -3254,6 +3253,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "urushi-graphics"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "icy_sixel",
+ "urushi",
+ "urushi-terminal",
+]
+
+[[package]]
 name = "urushi-terminal"
 version = "0.1.0"
 dependencies = [
@@ -3279,6 +3288,7 @@ dependencies = [
  "libc",
  "tokio",
  "urushi",
+ "urushi-graphics",
  "urushi-terminal",
  "urushi-tui",
 ]
@@ -3763,3 +3773,7 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "urushi-prompt"
+version = "0.1.0"
