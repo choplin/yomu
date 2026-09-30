@@ -3235,6 +3235,8 @@ dependencies = [
 [[package]]
 name = "urushi"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e1cdc045a6ef6c403956f285a56ceef9649f0d484c54ba77fd2244e58c2de52"
 dependencies = [
  "unicode-segmentation",
  "unicode-width",
@@ -3245,6 +3247,8 @@ dependencies = [
 [[package]]
 name = "urushi-derive"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "358c037f9b816c6470f84807b8b9cd2964c7040b4c334191336d0729ead552c9"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3255,6 +3259,8 @@ dependencies = [
 [[package]]
 name = "urushi-graphics"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa7702df49221001541578822a596978f39b9ff696d7015a07e8da00ceaaafec"
 dependencies = [
  "base64",
  "icy_sixel",
@@ -3265,6 +3271,8 @@ dependencies = [
 [[package]]
 name = "urushi-terminal"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff160c7938f29469f78d06a47e10e76ef71952bf2c48be8721ee29a47d049b10"
 dependencies = [
  "libc",
  "terminal_size",
@@ -3273,6 +3281,8 @@ dependencies = [
 [[package]]
 name = "urushi-tui"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ec5e5bea57331de7bf23a5745cf37af29d426feaf3a7fb296e1986471e4bb28"
 dependencies = [
  "compact_str",
  "unicode-width",
@@ -3283,6 +3293,8 @@ dependencies = [
 [[package]]
 name = "urushi-tui-app"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c733596115403ab9327cc40d918d5d444054bc765ff61c16cc0fec495d432b0"
 dependencies = [
  "futures-core",
  "libc",
@@ -3773,7 +3785,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "urushi-prompt"
-version = "0.1.0"
