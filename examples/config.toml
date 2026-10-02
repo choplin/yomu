@@ -1,0 +1,14 @@
+# Copy this file to ${XDG_CONFIG_HOME:-$HOME/.config}/raden/config.toml.
+theme = "custom"
+
+[view]
+# Set to 0 to use the full terminal width.
+max_width = 100
+
+[graphics]
+# One of: auto, kitty, sixel, text.
+renderer = "auto"
+
+[theme_overrides.palette]
+# Config-local overrides are applied after the selected Theme.
+accent = "#ff87d7"

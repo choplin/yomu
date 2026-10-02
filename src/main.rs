@@ -18,6 +18,10 @@ struct Cli {
     /// Graphics backend selection. Auto prefers Kitty, then sixel, then text.
     #[arg(long, value_enum)]
     graphics: Option<GraphicsPreference>,
+
+    /// Theme name, such as builtin:dark, builtin:light, builtin:plain, or a user Theme.
+    #[arg(long)]
+    theme: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -33,22 +37,24 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.path {
-        Some(path) if path.as_os_str() != "-" => raden::run_with_graphics(&path, cli.graphics),
-        Some(_) => run_stdin(cli.graphics),
-        None if !io::stdin().is_terminal() => run_stdin(cli.graphics),
+        Some(path) if path.as_os_str() != "-" => {
+            raden::run_with_options(&path, cli.graphics, cli.theme.as_deref())
+        }
+        Some(_) => run_stdin(cli.graphics, cli.theme.as_deref()),
+        None if !io::stdin().is_terminal() => run_stdin(cli.graphics, cli.theme.as_deref()),
         None => Err(anyhow!(
             "no Markdown input; pass a file path or pipe Markdown to standard input"
         )),
     }
 }
 
-fn run_stdin(graphics: Option<GraphicsPreference>) -> Result<()> {
+fn run_stdin(graphics: Option<GraphicsPreference>, theme: Option<&str>) -> Result<()> {
     let mut source = String::new();
     io::stdin()
         .lock()
         .read_to_string(&mut source)
         .context("could not read Markdown from standard input")?;
-    raden::run_markdown_with_graphics(&source, graphics)
+    raden::run_markdown_with_options(&source, graphics, theme)
 }
 
 #[cfg(test)]
@@ -69,5 +75,13 @@ mod tests {
         let cli = Cli::try_parse_from(["raden", "-"]).expect("dash should parse as a path");
 
         assert_eq!(cli.path, Some(PathBuf::from("-")));
+    }
+
+    #[test]
+    fn theme_override_is_parsed() {
+        let cli = Cli::try_parse_from(["raden", "--theme", "builtin:plain", "doc.md"])
+            .expect("Theme override should parse");
+
+        assert_eq!(cli.theme.as_deref(), Some("builtin:plain"));
     }
 }

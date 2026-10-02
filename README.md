@@ -47,8 +47,7 @@ Graphics or sixel when the terminal reports support. GIFs use their first
 frame. Image paths are resolved
 relative to the Markdown file's directory; remote URLs, absolute paths, paths
 that escape that directory, unsupported formats, oversized images, and decode
-failures stay readable as an inline diagnostic. Without a usable graphics
-presentation, the same elements use their text projection.
+failures stay readable as an inline diagnostic. Without usable graphics, the same elements use their text fallback.
 
 Level-one and level-two headings also render as larger rasterized typography in
 Kitty or through Sixel. They use an embedded Noto Sans
@@ -58,17 +57,102 @@ Unsupported terminals and rasterization failures retain readable heading text.
 The bundled font is licensed under the SIL Open Font License 1.1; see
 `assets/fonts/OFL-NotoSansJP.txt`.
 
-To use the same monospace or Nerd Font as the terminal, create
-`$XDG_CONFIG_HOME/raden/config.toml` (or `~/.config/raden/config.toml` when
-`XDG_CONFIG_HOME` is unset):
+Create `$XDG_CONFIG_HOME/raden/config.toml` (or
+`~/.config/raden/config.toml` when `XDG_CONFIG_HOME` is unset) to select a
+Theme and configure the reader:
 
 ```toml
+theme = "builtin:dark"
+
 [view]
 max_width = 100
-
-[heading]
-families = ["JetBrainsMono Nerd Font Mono"]
 ```
+
+### Themes and element rendering
+
+Raden ships `builtin:dark`, `builtin:light`, and `builtin:plain`. Select one in
+`config.toml` or override the selection for one invocation:
+
+```console
+nix develop -c cargo run -- --theme builtin:light examples/showcase.md
+```
+
+`builtin:plain` uses terminal text for every rich element. `builtin:auto` is
+also available: it asks Urushi to classify the observed terminal background
+and falls back to the dark Theme when the terminal cannot report one. Theme
+selection does not change graphics backend selection.
+
+The main config may override only the fields it needs. CLI `--theme` replaces
+the selected base Theme while these overrides still apply:
+
+```toml
+theme = "builtin:dark"
+
+[theme_overrides.palette]
+accent = "#ff87d7"
+
+[theme_overrides.styles.app.header]
+foreground = "accent"
+
+[theme_overrides.styles.document.heading.h1]
+renderer = "text"
+
+[theme_overrides.styles.document.heading.h1.text]
+foreground = "accent"
+bold = true
+```
+
+See [`examples/config.toml`](examples/config.toml) for a complete application
+configuration.
+
+User Themes are TOML files in
+`${XDG_CONFIG_HOME:-$HOME/.config}/raden/themes/`. The filename without
+`.toml` is the selection name; no duplicate name field is required:
+
+[`examples/themes/custom.toml`](examples/themes/custom.toml) is a complete,
+copyable Theme file covering the palette and every app/document role.
+
+Resolution applies internal defaults, the single `extends` chain, the selected
+Theme, then `theme_overrides`. Tables merge recursively, scalar values replace,
+and arrays replace as a whole. Rich elements merge their fields while the
+`renderer` stays the same; changing `renderer` replaces the complete variant.
+An empty `font_families` array clears an inherited font list. `none` clears a
+supported foreground or background.
+Inheritance cycles, unknown keys, invalid colors or palette references, and
+out-of-range raster values stop startup with a configuration error.
+
+`styles.app` contains `header`, `footer`, and `diagnostic`. Document styling is
+split by Markdown meaning rather than by the current renderer: `body`,
+`paragraph`, `heading.base` plus `heading.h1` through `heading.h6`,
+`emphasis`, `strong`, `strikethrough`, link label/destination, inline code,
+code-block body/language label, quote body/marker, list and task markers, rule,
+table cell/header/border, inline/display math, image, and inline/block HTML.
+Text style supports foreground/background, bold, italic, underline,
+strikethrough, dim, and reverse. Text projections that need terminal notation
+also expose prefix/suffix or fixed marker text. Fixed marker sections use
+`text`; ordered-list numbering keeps the source number and configures its
+`suffix`. Thematic rules use the single-cell `character`, and table text follows
+the `cell` / `header` / `border` roles used by Urushi tables. Raden's
+source-mapped table projection keeps its `left`, `column`, and `right` boundary
+text inside the `border` section. Rasterized tables use the same three roles;
+their header text style overlays the cell style, while `border.color` is
+independent. Rasterized heading font overrides use `rasterized.font_families`.
+
+Styles are semantic overlays: body first, then block context, code syntax,
+inline semantics, and auxiliary marker/destination/border roles. Later roles
+replace only fields they set. Table headers therefore inherit unspecified cell
+fields. `styles.document.code_block.text` owns the block's default foreground
+and background; `palette.code_block` contains only named syntax-token colors.
+Palette keys such as `inline_code` are referenced explicitly from style color
+fields rather than being applied implicitly.
+
+Raster-capable elements accept `renderer = "text" | "rasterized"`. Every such
+element has a `text` section. The text renderer uses it directly; the
+rasterized renderer adds a sibling `rasterized` section and retains `text` as
+its readable fallback. Omitting an element inherits the selected Theme's
+complete variant.
+See [`docs/theme.md`](docs/theme.md) for the complete ownership
+and resolution contract.
 
 The document body defaults to at most 100 terminal cells and is centered when
 the terminal is wider. Set `view.max_width` to another positive cell count to
@@ -77,10 +161,10 @@ terminals always use all available columns. The header and footer remain at
 terminal width. Invalid values, including negative numbers and non-integers,
 cause config loading to fail with a parse error.
 
-Installed font families are tried in order, followed by the embedded Noto Sans
-JP fallback. Unavailable families are skipped unless none of the configured
-families can be resolved. Use a Nerd Font `Mono` family when its glyphs should
-retain terminal-like spacing.
+Heading `rasterized.font_families` are tried in order, followed by the embedded
+Noto Sans JP fallback. Unavailable families are skipped unless none of the
+configured families can be resolved. Use a Nerd Font `Mono` family when its
+glyphs should retain terminal-like spacing.
 
 GFM tables render through an embedded Typst-to-SVG-to-RGBA pipeline in the
 selected Kitty or Sixel presentation. Their canvas is transparent so
@@ -112,9 +196,8 @@ transparent pixels above and below them to prevent vertical clipping.
 The renderer embeds Typst's bundled New Computer Modern fonts and exposes no
 Typst package, network, or filesystem resolver. Raster cache identity includes
 the formula, inline/display form, target geometry, foreground render setting,
-bundled fonts, converter version, and rasterizer version, so resize cannot reuse
-stale pixels. The current viewer uses a fixed dark-palette foreground; adaptive
-light/dark theme selection is not yet a configuration surface.
+bundled fonts, converter version, rasterizer version, and resolved Theme
+identity, so resize or Theme changes cannot reuse stale pixels.
 
 The evidenced MVP subset includes ordinary symbols and relations, Greek
 letters, superscripts and subscripts, fractions, roots, sums, integrals,
@@ -143,7 +226,7 @@ stored in the config file:
 
 ```toml
 [graphics]
-backend = "auto"
+renderer = "auto"
 ```
 
 The command-line option takes precedence over the config file. The footer shows

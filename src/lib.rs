@@ -13,6 +13,7 @@ mod scene;
 mod table;
 #[cfg(unix)]
 mod terminal;
+mod theme;
 #[cfg(not(unix))]
 mod terminal {
     use std::path::Path;
@@ -26,6 +27,7 @@ mod terminal {
         _document: &Document,
         _config: &Config,
         _preference: GraphicsPreference,
+        _theme: Option<&str>,
     ) -> Result<()> {
         bail!("interactive terminal viewing is currently supported on Unix only")
     }
@@ -63,7 +65,17 @@ pub fn run(path: &Path) -> Result<()> {
 /// Open one Markdown document with an optional graphics-backend override.
 pub fn run_with_graphics(path: &Path, graphics: Option<GraphicsPreference>) -> Result<()> {
     let document = load_document(path)?;
-    run_document_with_graphics(path, &document, graphics)
+    run_document_with_options(path, &document, graphics, None)
+}
+
+/// Open one Markdown document with optional graphics and Theme overrides.
+pub fn run_with_options(
+    path: &Path,
+    graphics: Option<GraphicsPreference>,
+    theme: Option<&str>,
+) -> Result<()> {
+    let document = load_document(path)?;
+    run_document_with_options(path, &document, graphics, theme)
 }
 
 /// Open Markdown supplied through standard input with an optional
@@ -73,13 +85,24 @@ pub fn run_markdown_with_graphics(
     graphics: Option<GraphicsPreference>,
 ) -> Result<()> {
     let document = Document::parse(source.to_owned());
-    run_document_with_graphics(Path::new("<stdin>"), &document, graphics)
+    run_document_with_options(Path::new("<stdin>"), &document, graphics, None)
 }
 
-fn run_document_with_graphics(
+/// Open Markdown supplied through standard input with optional graphics and Theme overrides.
+pub fn run_markdown_with_options(
+    source: &str,
+    graphics: Option<GraphicsPreference>,
+    theme: Option<&str>,
+) -> Result<()> {
+    let document = Document::parse(source.to_owned());
+    run_document_with_options(Path::new("<stdin>"), &document, graphics, theme)
+}
+
+fn run_document_with_options(
     path: &Path,
     document: &Document,
     graphics: Option<GraphicsPreference>,
+    theme: Option<&str>,
 ) -> Result<()> {
     let config = config::Config::load()?;
     terminal::run(
@@ -87,6 +110,7 @@ fn run_document_with_graphics(
         document,
         &config,
         graphics.unwrap_or_else(|| config.graphics_preference()),
+        theme,
     )
 }
 

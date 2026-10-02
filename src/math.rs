@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use typst::layout::Abs;
 use typst_as_lib::TypstEngine;
 
+use crate::theme::RasterizedMath;
 use crate::{ElementKey, MathElement, MathForm, PixelSize, RasterAssetKey};
 
 const INLINE_ROWS: u16 = 1;
@@ -11,7 +12,6 @@ const INLINE_VERTICAL_GUTTER: u32 = 1;
 const MAX_EXPRESSION_BYTES: usize = 16 * 1024;
 const MAX_RASTER_BYTES: u64 = 64 * 1024 * 1024;
 const MATH_RASTERIZER_VERSION: u16 = 6;
-const FOREGROUND: &str = "#d8dee9";
 static FONT_IDENTITY: OnceLock<[u8; 32]> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -26,12 +26,14 @@ pub(crate) struct MathPlan {
 }
 
 impl MathPlan {
-    pub(crate) fn build(
+    pub(crate) fn build_themed(
         index: usize,
         math: &MathElement,
         available_columns: u16,
         available_rows: u16,
         cell_pixels: PixelSize,
+        style: &RasterizedMath,
+        theme_identity: [u8; 32],
     ) -> Result<Self, String> {
         if math.expression.trim().is_empty() {
             return Err("math expression is empty".to_owned());
@@ -44,17 +46,22 @@ impl MathPlan {
         }
         let converted = tex2typst_rs::tex2typst(&math.expression)
             .map_err(|error| format!("TeX conversion failed: {error}"))?;
-        let font_points = match math.form {
-            MathForm::Inline => 11,
-            MathForm::Display => 16,
-        };
+        let font_points = style.font_points;
+        let foreground = hex(style.foreground.rgb);
         let source = format!(
-            "#set page(width: auto, height: auto, margin: 1pt, fill: none)\n#set text(size: {font_points}pt, fill: rgb(\"{FOREGROUND}\"))\n${converted}$\n"
+            "#set page(width: auto, height: auto, margin: 1pt, fill: none)\n#set text(size: {font_points}pt, fill: rgb(\"{foreground}\"))\n${converted}$\n"
         );
-        let rows = effective_rows(math.form, available_rows);
+        let rows = effective_rows(math.form, available_rows, style.max_rows);
         let available_pixels =
             u32::from(available_columns.max(1)).saturating_mul(cell_pixels.width.max(1));
-        let identity = Self::cache_identity(math, available_columns, available_rows, cell_pixels);
+        let identity = Self::cache_identity_themed(
+            math,
+            available_columns,
+            available_rows,
+            cell_pixels,
+            style,
+            theme_identity,
+        );
         Ok(Self {
             key: RasterAssetKey {
                 content_hash: identity,
@@ -73,11 +80,13 @@ impl MathPlan {
         })
     }
 
-    pub(crate) fn cache_identity(
+    pub(crate) fn cache_identity_themed(
         math: &MathElement,
         available_columns: u16,
         available_rows: u16,
         cell_pixels: PixelSize,
+        style: &RasterizedMath,
+        theme_identity: [u8; 32],
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"tex2typst-rs-0.4.1");
@@ -89,13 +98,66 @@ impl MathPlan {
             MathForm::Display => 1,
         }]);
         hasher.update(&available_columns.to_le_bytes());
-        hasher.update(&effective_rows(math.form, available_rows).to_le_bytes());
+        hasher.update(&effective_rows(math.form, available_rows, style.max_rows).to_le_bytes());
         hasher.update(&cell_pixels.width.to_le_bytes());
         hasher.update(&cell_pixels.height.to_le_bytes());
-        hasher.update(FOREGROUND.as_bytes());
+        hasher.update(&style.foreground.rgb);
+        hasher.update(&style.font_points.to_bits().to_le_bytes());
+        hasher.update(&style.max_rows.to_le_bytes());
+        hasher.update(&theme_identity);
         hasher.update(math.expression.as_bytes());
         hasher.update(font_identity());
         *hasher.finalize().as_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build(
+        index: usize,
+        math: &MathElement,
+        available_columns: u16,
+        available_rows: u16,
+        cell_pixels: PixelSize,
+    ) -> Result<Self, String> {
+        let theme = crate::theme::Theme::builtin_dark();
+        let element = match math.form {
+            MathForm::Inline => &theme.document.math.inline,
+            MathForm::Display => &theme.document.math.display,
+        };
+        Self::build_themed(
+            index,
+            math,
+            available_columns,
+            available_rows,
+            cell_pixels,
+            element
+                .rasterized()
+                .expect("built-in math should be rasterized"),
+            theme.identity,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_identity(
+        math: &MathElement,
+        available_columns: u16,
+        available_rows: u16,
+        cell_pixels: PixelSize,
+    ) -> [u8; 32] {
+        let theme = crate::theme::Theme::builtin_dark();
+        let element = match math.form {
+            MathForm::Inline => &theme.document.math.inline,
+            MathForm::Display => &theme.document.math.display,
+        };
+        Self::cache_identity_themed(
+            math,
+            available_columns,
+            available_rows,
+            cell_pixels,
+            element
+                .rasterized()
+                .expect("built-in math should be rasterized"),
+            theme.identity,
+        )
     }
 
     pub(crate) fn element_key(index: usize) -> ElementKey {
@@ -190,12 +252,17 @@ fn font_identity() -> &'static [u8; 32] {
     })
 }
 
-fn effective_rows(form: MathForm, available_rows: u16) -> u16 {
+fn effective_rows(form: MathForm, available_rows: u16, max_rows: u16) -> u16 {
     match form {
         MathForm::Inline => INLINE_ROWS,
         MathForm::Display => DISPLAY_ROWS,
     }
+    .min(max_rows.max(1))
     .min(available_rows.max(1))
+}
+
+fn hex(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
 }
 
 fn validate_raster(width: u32, height: u32) -> Result<(), String> {

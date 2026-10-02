@@ -6,6 +6,7 @@ remain application-specific.
 
 Raden is one Rust package with a library and CLI binary. The top-level
 [`README`](../README.md) describes user-visible behavior. Precise rules for
+Theme ownership and resolution live in [`theme.md`](theme.md). Precise rules for
 source identity and graphics degradation live in
 [`design/source-anchored-layout.md`](design/source-anchored-layout.md) and
 [`design/graphics-fallback.md`](design/graphics-fallback.md). The history of the
@@ -19,6 +20,8 @@ file or stdin
      |
      v
 Document: semantic elements + UTF-8 source spans
+     |
+     +---- Theme: resolved app/document roles + raster policy
      |
      +-----------------------+
      |                       |
@@ -37,8 +40,9 @@ text projection         raster preparation
        cells + Kitty/Sixel lifecycle
 ```
 
-Raden owns Markdown meaning, source-aware navigation, raster preparation, and
-application state. Urushi owns the terminal session, event delivery, effects,
+Raden owns Markdown meaning, source-aware navigation, raster preparation,
+application-semantic Theme roles, and application state. Urushi owns the
+terminal session, background observation and light/dark classification, event delivery, effects,
 view resolution, cell-frame commit, graphics protocol selection and lifecycle,
 failure recovery, and cleanup.
 
@@ -55,7 +59,7 @@ produce terminal commands.
 ### Projection and layout
 
 [`src/layout.rs`](../src/layout.rs) owns width-dependent projection into
-terminal rows. It wraps styled text, maps fragments back to source spans, and
+terminal rows. It wraps text, maps fragments back to source spans, and
 reserves cell geometry for prepared raster elements. `Layout` is a transient
 View-construction value: `ReaderModel` never stores one. Each call to `view`
 derives the current layout from the document, surface, navigation state, and
@@ -65,6 +69,26 @@ Every rich element retains a readable fallback. Images keep labels and
 diagnostics, headings keep their text, tables keep their cells, and math keeps
 its source notation. Raster and text projections may have different heights,
 so every derived layout resolves the viewport from its source anchor.
+
+### Theme resolution
+
+[`src/theme.rs`](../src/theme.rs) owns Raden's serializable partial Theme
+schema, built-in Themes, single inheritance, recursive merge, validation, and
+the complete `Theme` consumed by rendering. App roles and Markdown
+roles remain Raden concepts. Terminal colors lower to Urushi `TextStyle`, while
+heading, table, math, and image raster parameters remain typed Raden data.
+Resolved rich-element styles are element-specific sum types: text or
+rasterized content with an explicit readable fallback. The partial merge model
+does not leak a presentation flag or an inactive render branch into runtime.
+See [`theme.md`](theme.md) for the complete Theme ownership and resolution
+model.
+
+[`src/config.rs`](../src/config.rs) discovers user Themes next to `config.toml`
+and applies config overrides after the selected Theme. Automatic light/dark
+selection queries the terminal once through Urushi and uses Urushi's
+`ThemeMode` classification; Raden does not duplicate the query or luminance
+policy. Graphics capability, backend selection, viewport width, cache capacity,
+and safety limits are outside Theme.
 
 ### Raster preparation
 
@@ -78,7 +102,8 @@ cache coordinates:
 - [`src/math.rs`](../src/math.rs) for TeX-to-Typst math rendering; and
 - ordinary local images decoded by `image`.
 
-Raster identities include every input that changes pixels. Protocol upload and
+Raster identities include every input that changes pixels and the resolved
+Theme identity. Protocol upload and
 encoded-band caches are not Raden state; they are owned by `urushi-graphics`.
 
 ### Reading state and View construction
@@ -117,9 +142,10 @@ once and commits its cell frame and image scene together.
 
 ### Open and initial render
 
-1. The CLI resolves file or standard-input Markdown and an optional graphics
-   preference.
-2. Raden parses the document and loads configuration and local-image metadata.
+1. The CLI resolves file or standard-input Markdown plus optional graphics and
+   Theme selections.
+2. Raden parses the document, loads configuration, resolves one validated
+   Theme, and loads local-image metadata.
 3. Urushi enters the terminal session, observes geometry and capabilities, and
    selects the graphics presentation.
 4. The initial `Surface` message causes Raden to return a latest-only raster
@@ -154,6 +180,10 @@ subscription. An explicitly requested unavailable protocol fails startup.
 
 - Source byte ranges, not display rows, are stable across wrapping and resize.
 - Every rasterized element supplies a readable Urushi Image fallback.
+- `renderer = "text"` prevents preparation for that element; other modes
+  never weaken its readable fallback.
+- Rendering consumes one validated `Theme`; override configuration does
+  not reach layout, UI, or rasterizers.
 - `Layout` owns application geometry; Urushi owns View clipping and physical
   presentation.
 - Raster assets are aligned to terminal-cell pixels before becoming Image

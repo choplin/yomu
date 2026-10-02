@@ -50,17 +50,13 @@ impl LinkElement {
                 .is_some_and(|address| address == label)
     }
 
-    /// The subdued destination shown after the label, or `None` when it would duplicate it.
+    /// The destination shown after the label, or `None` when it would duplicate it.
     #[must_use]
     pub fn destination_projection(&self) -> Option<String> {
         if self.destination.is_empty() || self.is_collapsed() {
             return None;
         }
-        Some(if self.has_label {
-            format!(" <{}>", self.destination)
-        } else {
-            format!("<{}>", self.destination)
-        })
+        Some(self.destination.clone())
     }
 }
 
@@ -171,17 +167,64 @@ pub struct TextColor {
     pub blue: u8,
 }
 
+/// Semantic kind of a list marker before Theme projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListMarkerKind {
+    Unordered,
+    Ordered,
+    TaskChecked,
+    TaskUnchecked,
+}
+
+/// Whether raw HTML appeared inline or as a block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HtmlKind {
+    Inline,
+    Block,
+}
+
+/// Theme-independent semantic role assigned to highlighted code.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SyntaxRole {
+    Comment,
+    Variable,
+    Number,
+    TypeName,
+    String,
+    Support,
+    Function,
+    Keyword,
+    Deprecated,
+}
+
 /// Presentation hints derived from Markdown semantics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TextStyle {
     pub heading: Option<u8>,
+    pub paragraph: bool,
     pub emphasis: bool,
     pub strong: bool,
     pub strikethrough: bool,
     pub code: bool,
     pub link: bool,
     pub quote: bool,
+    pub quote_marker: bool,
+    pub list_item: bool,
+    pub list_depth: u8,
+    pub list_marker: Option<ListMarkerKind>,
     pub muted: bool,
+    pub block_code: bool,
+    pub code_label: bool,
+    pub rule: bool,
+    pub table: bool,
+    pub table_header: bool,
+    pub table_border: bool,
+    pub math: Option<MathForm>,
+    pub image: bool,
+    pub link_destination: bool,
+    pub standalone_link_destination: bool,
+    pub html: Option<HtmlKind>,
+    pub(crate) syntax_role: Option<SyntaxRole>,
     pub foreground: Option<TextColor>,
 }
 
@@ -543,7 +586,7 @@ impl Builder {
             }
             Event::Html(text) | Event::InlineHtml(text) => {
                 let mut style = self.style;
-                style.muted = true;
+                style.html = style.html.or(Some(HtmlKind::Inline));
                 self.text(text.as_ref(), range, style);
             }
             Event::FootnoteReference(label) => {
@@ -557,35 +600,38 @@ impl Builder {
                 self.line_break(range.end, true);
             }
             Event::TaskListMarker(checked) => {
-                self.text(task_list_marker(checked), range.clone(), self.style);
-                self.synthetic_text("  ", range.end, self.style);
+                let mut style = self.style;
+                style.list_marker = Some(if checked {
+                    ListMarkerKind::TaskChecked
+                } else {
+                    ListMarkerKind::TaskUnchecked
+                });
+                self.text(task_list_marker(checked), range, style);
             }
         }
     }
 
     fn start(&mut self, tag: Tag<'_>, range: SourceSpan) {
         match tag {
-            Tag::Paragraph => {}
+            Tag::Paragraph => self.style.paragraph = true,
             Tag::Heading { level, .. } => {
                 self.line_break(range.start, false);
                 let level = heading_number(level);
-                if level <= 2 {
-                    let mut style = self.style;
-                    style.heading = Some(level);
-                    self.heading = Some(HeadingBuilder {
-                        level,
-                        text: String::new(),
-                        source: range,
-                        style,
-                    });
-                } else {
-                    self.style.heading = Some(level);
-                }
+                let mut style = self.style;
+                style.heading = Some(level);
+                self.heading = Some(HeadingBuilder {
+                    level,
+                    text: String::new(),
+                    source: range,
+                    style,
+                });
             }
             Tag::BlockQuote(_) => {
                 self.line_break(range.start, false);
                 self.style.quote = true;
-                self.synthetic_text("│ ", range.start, self.style);
+                let mut marker = self.style;
+                marker.quote_marker = true;
+                self.synthetic_text("│ ", range.start, marker);
             }
             Tag::CodeBlock(kind) => {
                 self.line_break(range.start, false);
@@ -611,33 +657,40 @@ impl Builder {
             }
             Tag::HtmlBlock => {
                 self.line_break(range.start, false);
-                self.style.muted = true;
+                self.style.html = Some(HtmlKind::Block);
             }
             Tag::List(start) => self.lists.push(ListState { next: start }),
             Tag::Item => {
                 self.line_break(range.start, false);
-                let marker = self
+                self.style.list_item = true;
+                self.style.list_depth =
+                    u8::try_from(self.lists.len().saturating_sub(1)).unwrap_or(u8::MAX);
+                let (marker, kind) = self
                     .lists
                     .last_mut()
                     .and_then(|list| list.next.as_mut())
                     .map(|number| {
-                        let marker = format!("{number}. ");
+                        let marker = number.to_string();
                         *number = number.saturating_add(1);
-                        marker
+                        (marker, ListMarkerKind::Ordered)
                     })
-                    .unwrap_or_else(|| "• ".to_owned());
+                    .unwrap_or_else(|| ("• ".to_owned(), ListMarkerKind::Unordered));
                 self.pending_list_marker = Some(self.segments.len());
-                self.synthetic_text(&marker, range.start, self.style);
+                let mut style = self.style;
+                style.list_marker = Some(kind);
+                self.synthetic_text(&marker, range.start, style);
             }
             Tag::Table(alignments) => {
                 self.line_break(range.start, false);
+                let mut style = self.style;
+                style.table = true;
                 self.table = Some(TableBuilder {
                     alignments: alignments.into_iter().map(TableAlignment::from).collect(),
                     rows: Vec::new(),
                     row: None,
                     cell: None,
                     source: range,
-                    style: self.style,
+                    style,
                 });
             }
             Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
@@ -661,12 +714,14 @@ impl Builder {
             Tag::Image {
                 dest_url, title, ..
             } => {
+                let mut style = self.style;
+                style.image = true;
                 self.image = Some(ImageBuilder {
                     destination: dest_url.into_string(),
                     title: title.into_string(),
                     alt: String::new(),
                     source: range,
-                    style: self.style,
+                    style,
                 });
             }
             Tag::FootnoteDefinition(label) => {
@@ -684,7 +739,10 @@ impl Builder {
 
     fn end(&mut self, tag: TagEnd, range: SourceSpan) {
         match tag {
-            TagEnd::Paragraph => self.line_break(range.end, true),
+            TagEnd::Paragraph => {
+                self.style.paragraph = false;
+                self.line_break(range.end, true);
+            }
             TagEnd::Heading(_) => {
                 self.style.heading = None;
                 self.line_break(range.end, true);
@@ -697,14 +755,19 @@ impl Builder {
                 // Code block endings are consumed while the block builder is active.
             }
             TagEnd::HtmlBlock => {
-                self.style.muted = false;
+                self.style.html = None;
                 self.line_break(range.end, true);
             }
             TagEnd::List(_) => {
                 self.lists.pop();
                 self.line_break(range.end, true);
             }
-            TagEnd::Item => self.line_break(range.end, false),
+            TagEnd::Item => {
+                let outer_depth = self.lists.len().saturating_sub(2);
+                self.style.list_item = !self.lists.is_empty() && self.lists.len() > 1;
+                self.style.list_depth = u8::try_from(outer_depth).unwrap_or(u8::MAX);
+                self.line_break(range.end, false);
+            }
             TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell => {}
             TagEnd::Emphasis => self.style.emphasis = false,
             TagEnd::Strong => self.style.strong = false,
@@ -772,10 +835,9 @@ impl Builder {
 
     /// Record a thematic break as a width-independent element resolved at layout time.
     fn rule(&mut self, source: SourceSpan) {
-        self.segments.push(Segment::Rule {
-            source,
-            style: self.style,
-        });
+        let mut style = self.style;
+        style.rule = true;
+        self.segments.push(Segment::Rule { source, style });
     }
 
     fn line_break(&mut self, source: usize, blank: bool) {
@@ -805,11 +867,13 @@ impl Builder {
 
     fn math(&mut self, expression: &str, form: MathForm, source: SourceSpan) {
         let index = self.math.len();
+        let mut style = self.style;
+        style.math = Some(form);
         self.math.push(MathElement {
             expression: expression.to_owned(),
             form,
             source,
-            style: self.style,
+            style,
         });
         self.segments.push(Segment::Math { index });
     }
@@ -1182,20 +1246,16 @@ mod tests {
         assert_eq!(&source[task_markers[1].1.clone()], "[ ]");
         assert!(text_segments.iter().all(|(text, _)| text != &"• "));
 
-        for (index, segment) in document.segments.iter().enumerate() {
-            let Segment::Text { text, .. } = segment else {
+        for segment in &document.segments {
+            let Segment::Text { text, style, .. } = segment else {
                 continue;
             };
             if text != "☑" && text != "☐" {
                 continue;
             }
             assert!(matches!(
-                document.segments.get(index + 1),
-                Some(Segment::Text {
-                    text,
-                    synthetic: true,
-                    ..
-                }) if text == "  "
+                style.list_marker,
+                Some(ListMarkerKind::TaskChecked | ListMarkerKind::TaskUnchecked)
             ));
         }
         assert_eq!(document.math().len(), 1);
@@ -1355,7 +1415,14 @@ mod tests {
         assert_eq!(image.destination, "assets/diagram.png");
         assert_eq!(image.alt, "diagram alt");
         assert_eq!(image.title, "Diagram");
-        assert_eq!(image.style, TextStyle::default());
+        assert_eq!(
+            image.style,
+            TextStyle {
+                paragraph: true,
+                image: true,
+                ..TextStyle::default()
+            }
+        );
         assert_eq!(
             &source[image.source.clone()],
             "![diagram alt](assets/diagram.png \"Diagram\")"
@@ -1381,7 +1448,7 @@ mod tests {
         assert!(!link.is_collapsed());
         assert_eq!(
             link.destination_projection().as_deref(),
-            Some(" <https://example.com/a?b=c#d>")
+            Some("https://example.com/a?b=c#d")
         );
         assert_eq!(
             &source[link.source.clone()],
@@ -1496,7 +1563,7 @@ mod tests {
         let source = "# **Large** 漆\n\n## Second level\n\n### Terminal text\n";
         let document = Document::parse(source.to_owned());
 
-        assert_eq!(document.headings().len(), 2);
+        assert_eq!(document.headings().len(), 3);
         assert_eq!(document.headings()[0].level, 1);
         assert_eq!(document.headings()[0].text, "Large 漆");
         assert_eq!(
@@ -1511,11 +1578,14 @@ mod tests {
                 .iter()
                 .any(|segment| matches!(segment, Segment::Heading { index: 0 }))
         );
-        assert!(document.segments.iter().any(|segment| matches!(
-            segment,
-            Segment::Text { text, style, .. }
-                if text == "Terminal text" && style.heading == Some(3)
-        )));
+        assert_eq!(document.headings()[2].level, 3);
+        assert_eq!(document.headings()[2].text, "Terminal text");
+        assert!(
+            document
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::Heading { index: 2 }))
+        );
     }
 
     #[test]

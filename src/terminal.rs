@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use urushi::View;
-use urushi_terminal::backend::native::NativeTerminal;
+use urushi_terminal::{TerminalQuery, backend::native::NativeTerminal};
 use urushi_tui_app::{
     Application, Effect, Input, KeyCode, KeyKind, Runtime, Subscription, Surface,
 };
@@ -22,15 +22,39 @@ pub(crate) fn run(
     document: &Document,
     config: &Config,
     preference: GraphicsPreference,
+    theme_name: Option<&str>,
 ) -> Result<()> {
     if !io::stdout().is_terminal() {
         return Err(anyhow!("an interactive terminal is required on stdout"));
     }
-    let heading_fonts = if config.heading_families().is_empty() {
-        HeadingFonts::default()
+    let mut terminal = NativeTerminal::open().context("could not open the controlling terminal")?;
+    let background = if config.needs_terminal_background(theme_name) {
+        terminal
+            .terminal_background()
+            .context("could not query terminal background for automatic Theme selection")?
     } else {
-        HeadingFonts::load(config.heading_families()).map_err(anyhow::Error::msg)?
+        None
     };
+    let theme = config.resolve_theme(theme_name, background)?;
+    let mut loaded_font_stacks = Vec::<(Vec<String>, HeadingFonts)>::new();
+    let mut heading_fonts = Vec::with_capacity(6);
+    for level in 1..=6 {
+        let Some(raster_style) = theme.document.headings.level(level).rasterized() else {
+            heading_fonts.push(HeadingFonts::default());
+            continue;
+        };
+        let families = &raster_style.font_families;
+        if let Some((_, fonts)) = loaded_font_stacks
+            .iter()
+            .find(|(loaded_families, _)| loaded_families == families)
+        {
+            heading_fonts.push(fonts.clone());
+        } else {
+            let fonts = HeadingFonts::load(families).map_err(anyhow::Error::msg)?;
+            loaded_font_stacks.push((families.to_vec(), fonts.clone()));
+            heading_fonts.push(fonts);
+        }
+    }
     let application = ReaderApplication {
         path: path.to_path_buf(),
         document: document.clone(),
@@ -40,8 +64,8 @@ pub(crate) fn run(
         max_width: config.body_max_width(),
         rasterize: preference != GraphicsPreference::Text,
         graphics_label: preference_label(preference),
+        theme,
     };
-    let terminal = NativeTerminal::open().context("could not open the controlling terminal")?;
     Runtime::new(application)
         .backend(terminal)
         .graphics(preference.into())
@@ -62,6 +86,7 @@ struct ReaderApplication {
     max_width: Option<u16>,
     rasterize: bool,
     graphics_label: &'static str,
+    theme: crate::theme::Theme,
 }
 
 struct ReaderModel {
@@ -149,6 +174,7 @@ impl Application for ReaderApplication {
             &status,
             model.surface.size,
             self.max_width,
+            &self.theme,
         )
     }
 
@@ -165,8 +191,16 @@ impl ReaderApplication {
     fn layout(&self, model: &ReaderModel) -> Layout {
         let body = ui::viewport_areas(model.surface.size, self.max_width)[1];
         model.prepared_graphics.as_ref().map_or_else(
-            || Layout::with_text(&self.document, body.width, &self.images),
-            |graphics| Layout::with_prepared(&self.document, body.width, &self.images, graphics),
+            || Layout::with_text_themed(&self.document, body.width, &self.images, &self.theme),
+            |graphics| {
+                Layout::with_prepared_themed(
+                    &self.document,
+                    body.width,
+                    &self.images,
+                    graphics,
+                    &self.theme,
+                )
+            },
         )
     }
 
@@ -182,6 +216,7 @@ impl ReaderApplication {
         latest_generation.store(generation, Ordering::Release);
         let cell_pixels = model.cell_pixels;
         let focus_source = model.app.top_source();
+        let theme = self.theme.clone();
         Effect::perform_latest("raden-rasterize", move || {
             if latest_generation.load(Ordering::Acquire) != generation {
                 return Message::Prepared(None);
@@ -192,12 +227,12 @@ impl ReaderApplication {
             }
             let graphics = PreparedGraphics::prepare(
                 &document,
-                body.width,
-                body.height,
+                (body.width, body.height),
                 &images,
                 &mut cache,
                 cell_pixels,
                 focus_source,
+                &theme,
             );
             Message::Prepared(Some(PreparedGraphicsResult {
                 generation,
@@ -208,15 +243,18 @@ impl ReaderApplication {
 
     fn graphics_status(&self, model: &ReaderModel) -> String {
         if let Some(error) = &model.terminal_diagnostic {
-            return format!("terminal warning ({error})");
+            return format!("terminal warning ({error}); theme {}", self.theme.name);
         }
         let warnings = self.images.diagnostics().len();
         if warnings == 0 {
-            format!("graphics {}", self.graphics_label)
+            format!(
+                "graphics {}; theme {}",
+                self.graphics_label, self.theme.name
+            )
         } else {
             format!(
-                "graphics {} ({warnings} image warning(s))",
-                self.graphics_label
+                "graphics {} ({warnings} image warning(s)); theme {}",
+                self.graphics_label, self.theme.name,
             )
         }
     }

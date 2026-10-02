@@ -1,0 +1,290 @@
+# Copy this file to ${XDG_CONFIG_HOME:-$HOME/.config}/raden/themes/custom.toml.
+extends = "builtin:dark"
+
+[palette]
+text = "#d8dee9"
+muted = "bright_black"
+accent = "cyan"
+secondary = "blue"
+inline_code = "yellow"
+surface = "black"
+border = "#8290a5"
+error = "bright_red"
+
+[palette.code_block]
+# Syntax-token foregrounds only. Code-block text/background live in
+# styles.document.code_block.text.
+comment = "#65737e"
+variable = "#bf616a"
+number = "#d08770"
+type_name = "#ebcb8b"
+string = "#a3be8c"
+support = "#96b5b4"
+function = "#8fa1b3"
+keyword = "#b48ead"
+deprecated = "#ab7967"
+
+[styles.app.header]
+foreground = "accent"
+background = "none"
+bold = true
+italic = false
+underline = false
+strikethrough = false
+dim = false
+reverse = false
+
+[styles.app.footer]
+foreground = "muted"
+background = "none"
+bold = false
+italic = false
+underline = false
+strikethrough = false
+dim = false
+reverse = false
+
+[styles.app.diagnostic]
+foreground = "error"
+background = "none"
+bold = false
+italic = false
+underline = false
+strikethrough = false
+dim = false
+reverse = false
+
+# Text styles are overlays. They apply in this order: body, block context,
+# code syntax, inline semantics, then auxiliary markers/destinations/borders.
+# A later role replaces only the fields it explicitly sets.
+[styles.document.body]
+foreground = "text"
+background = "surface"
+
+[styles.document.paragraph]
+foreground = "text"
+
+[styles.document.heading.base]
+# H1-H6 text overlays this shared projection.
+bold = true
+prefix = ""
+suffix = ""
+
+[styles.document.heading.h1]
+renderer = "rasterized"
+
+[styles.document.heading.h1.text]
+foreground = "accent"
+prefix = ""
+suffix = ""
+
+[styles.document.heading.h1.rasterized]
+foreground = "accent"
+scale = 2.0
+underline = true
+stroke_radius = 2
+font_families = []
+
+[styles.document.heading.h2]
+renderer = "rasterized"
+
+[styles.document.heading.h2.text]
+foreground = "secondary"
+prefix = ""
+suffix = ""
+
+[styles.document.heading.h2.rasterized]
+foreground = "secondary"
+scale = 1.5
+underline = true
+stroke_radius = 1
+font_families = []
+
+[styles.document.heading.h3]
+renderer = "text"
+
+[styles.document.heading.h3.text]
+foreground = "secondary"
+prefix = ""
+suffix = ""
+
+[styles.document.heading.h4]
+renderer = "text"
+
+[styles.document.heading.h4.text]
+foreground = "secondary"
+prefix = ""
+suffix = ""
+
+[styles.document.heading.h5]
+renderer = "text"
+
+[styles.document.heading.h5.text]
+foreground = "secondary"
+prefix = ""
+suffix = ""
+
+[styles.document.heading.h6]
+renderer = "text"
+
+[styles.document.heading.h6.text]
+foreground = "secondary"
+prefix = ""
+suffix = ""
+
+[styles.document.emphasis]
+italic = true
+
+[styles.document.strong]
+bold = true
+
+[styles.document.strikethrough]
+strikethrough = true
+
+[styles.document.link.label]
+foreground = "secondary"
+underline = true
+
+[styles.document.link.destination]
+foreground = "muted"
+prefix = " <"
+suffix = ">"
+
+[styles.document.link.standalone_destination]
+foreground = "muted"
+prefix = "<"
+suffix = ">"
+
+[styles.document.inline_code]
+foreground = "inline_code"
+prefix = ""
+suffix = ""
+
+[styles.document.code_block.text]
+foreground = "text"
+background = "surface"
+
+[styles.document.code_block.label]
+foreground = "muted"
+prefix = ""
+suffix = ""
+
+[styles.document.quote.text]
+italic = true
+
+[styles.document.quote.marker]
+foreground = "muted"
+text = "│ "
+
+[styles.document.list]
+indent_cells = 2
+
+[styles.document.list.item]
+foreground = "text"
+
+[styles.document.list.unordered]
+foreground = "accent"
+text = "• "
+
+[styles.document.list.ordered]
+foreground = "accent"
+# The Markdown source number is retained; this text follows it.
+suffix = ". "
+
+[styles.document.list.task_checked]
+foreground = "green"
+text = "[✓] "
+
+[styles.document.list.task_unchecked]
+foreground = "muted"
+text = "[ ] "
+
+[styles.document.rule]
+foreground = "muted"
+character = "─"
+
+[styles.document.table]
+renderer = "rasterized"
+
+[styles.document.table.text.cell]
+foreground = "text"
+
+[styles.document.table.text.header]
+# Header overlays cell, so omitted fields inherit the cell style.
+foreground = "text"
+bold = true
+
+[styles.document.table.text.border]
+foreground = "muted"
+left = "│ "
+column = " │ "
+right = " │"
+
+[styles.document.table.rasterized]
+font_points = 10.0
+horizontal_inset_points = 5.0
+vertical_inset_points = 3.0
+rule_gap_points = 5.0
+
+[styles.document.table.rasterized.cell]
+foreground = "text"
+background = "none"
+bold = false
+italic = false
+underline = false
+strikethrough = false
+
+[styles.document.table.rasterized.header]
+# Rasterized header also overlays rasterized cell.
+foreground = "text"
+background = "none"
+bold = true
+italic = false
+underline = false
+strikethrough = false
+
+[styles.document.table.rasterized.border]
+color = "border"
+
+[styles.document.math.inline]
+renderer = "rasterized"
+
+[styles.document.math.inline.text]
+foreground = "inline_code"
+prefix = ""
+suffix = ""
+
+[styles.document.math.inline.rasterized]
+foreground = "text"
+font_points = 11.0
+max_rows = 1
+
+[styles.document.math.display]
+renderer = "rasterized"
+
+[styles.document.math.display.text]
+foreground = "inline_code"
+prefix = ""
+suffix = ""
+
+[styles.document.math.display.rasterized]
+foreground = "text"
+font_points = 16.0
+max_rows = 4
+
+[styles.document.image]
+renderer = "rasterized"
+
+[styles.document.image.text]
+foreground = "muted"
+prefix = "[image: "
+suffix = "]"
+
+[styles.document.image.rasterized]
+max_rows = 20
+
+[styles.document.html.inline]
+foreground = "muted"
+
+[styles.document.html.block]
+foreground = "muted"

@@ -1,10 +1,11 @@
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use fontdb::{Database, Family, Query, Stretch, Style, Weight};
 use fontdue::{Font, FontSettings};
 use image::{Rgba, RgbaImage};
 
+use crate::theme::RasterizedHeading;
 use crate::{ElementKey, HeadingElement, PixelSize, RasterAssetKey};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansJP.ttf");
@@ -30,8 +31,9 @@ struct LoadedFont {
     family: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct HeadingFonts {
-    configured: Vec<LoadedFont>,
+    configured: Arc<[LoadedFont]>,
     identity: [u8; 32],
 }
 
@@ -54,7 +56,7 @@ impl fmt::Debug for HeadingFonts {
 impl Default for HeadingFonts {
     fn default() -> Self {
         Self {
-            configured: Vec::new(),
+            configured: Arc::from([]),
             identity: font_hash(),
         }
     }
@@ -115,7 +117,7 @@ impl HeadingFonts {
         }
         hash.update(FONT_BYTES);
         Ok(Self {
-            configured,
+            configured: configured.into(),
             identity: *hash.finalize().as_bytes(),
         })
     }
@@ -160,7 +162,7 @@ pub(crate) struct HeadingPlan {
     font_pixels: f32,
     color: [u8; 3],
     stroke_radius: u32,
-    underline: (u32, u32, u32, u32),
+    underline: Option<(u32, u32, u32, u32)>,
 }
 
 impl HeadingPlan {
@@ -169,18 +171,29 @@ impl HeadingPlan {
         available_columns: u16,
         cell_pixels: PixelSize,
         fonts: &HeadingFonts,
+        style: &RasterizedHeading,
+        theme_identity: [u8; 32],
     ) -> Result<[u8; 32], String> {
         validate_heading_length(heading)?;
         let width = raster_width(available_columns, cell_pixels);
         let mut hash = blake3::Hasher::new();
         hash.update(&fonts.identity);
-        hash.update(b"heading-dark-v1");
+        hash.update(b"heading-theme-v1");
         hash.update(&[heading.level]);
         hash.update(heading.text.as_bytes());
         hash.update(&width.to_le_bytes());
         hash.update(&cell_pixels.width.to_le_bytes());
         hash.update(&cell_pixels.height.to_le_bytes());
         hash.update(&HEADING_RASTERIZER_VERSION.to_le_bytes());
+        hash.update(&style.foreground.rgb);
+        hash.update(&style.scale.to_bits().to_le_bytes());
+        hash.update(&[u8::from(style.underline)]);
+        hash.update(&style.stroke_radius.to_le_bytes());
+        for family in &style.font_families {
+            hash.update(&(family.len() as u64).to_le_bytes());
+            hash.update(family.as_bytes());
+        }
+        hash.update(&theme_identity);
         Ok(*hash.finalize().as_bytes())
     }
 
@@ -195,12 +208,21 @@ impl HeadingPlan {
         available_columns: u16,
         cell_pixels: PixelSize,
     ) -> Result<Self, String> {
+        let theme = crate::theme::Theme::builtin_dark();
+        let style = theme
+            .document
+            .headings
+            .level(heading.level)
+            .rasterized()
+            .expect("built-in raster heading should have raster settings");
         Self::build_with_fonts(
             index,
             heading,
             available_columns,
             cell_pixels,
             &HeadingFonts::default(),
+            style,
+            theme.identity,
         )
     }
 
@@ -210,13 +232,21 @@ impl HeadingPlan {
         available_columns: u16,
         cell_pixels: PixelSize,
         fonts: &HeadingFonts,
+        style: &RasterizedHeading,
+        theme_identity: [u8; 32],
     ) -> Result<Self, String> {
-        let identity =
-            Self::cache_identity_with_fonts(heading, available_columns, cell_pixels, fonts)?;
+        let identity = Self::cache_identity_with_fonts(
+            heading,
+            available_columns,
+            cell_pixels,
+            fonts,
+            style,
+            theme_identity,
+        )?;
         let character_count = heading.text.chars().count();
         let width = raster_width(available_columns, cell_pixels);
-        let scale = if heading.level == 1 { 2.0 } else { 1.5 };
-        let stroke_radius = if heading.level == 1 { 2 } else { 1 };
+        let scale = style.scale;
+        let stroke_radius = style.stroke_radius;
         let font_pixels = (cell_pixels.height.max(1) as f32 * scale).max(16.0);
         let horizontal_padding = if width > cell_pixels.width.max(1).saturating_mul(2) {
             cell_pixels.width.max(1)
@@ -338,18 +368,14 @@ impl HeadingPlan {
             rows: cells_for(height, cell_pixels.height),
             glyphs,
             font_pixels,
-            color: if heading.level == 1 {
-                [70, 210, 225]
-            } else {
-                [105, 155, 245]
-            },
+            color: style.foreground.rgb,
             stroke_radius,
-            underline: (
+            underline: style.underline.then_some((
                 underline_start,
                 underline_end,
                 underline_y,
                 underline_thickness,
-            ),
+            )),
         })
     }
 
@@ -378,7 +404,9 @@ impl HeadingPlan {
                 }
             }
         }
-        draw_underline(&mut canvas, self.underline, self.color);
+        if let Some(underline) = self.underline {
+            draw_underline(&mut canvas, underline, self.color);
+        }
         Ok(canvas)
     }
 }
@@ -688,6 +716,13 @@ mod tests {
                 height: 16,
             },
             &fonts,
+            crate::theme::Theme::builtin_dark()
+                .document
+                .headings
+                .level(1)
+                .rasterized()
+                .expect("built-in H1 should be rasterized"),
+            crate::theme::Theme::builtin_dark().identity,
         )
         .expect("configured font should rasterize the heading");
 

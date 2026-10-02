@@ -7,6 +7,7 @@ implementation and documentation activity is not recorded. Newest first.
 
 | Date | Decision | Current documentation |
 | --- | --- | --- |
+| 2026-10-01 | Defined Raden Theme as a typed application-semantic layer over Urushi: partial files and config overrides resolve to one validated app/document style tree, while Urushi retains terminal background classification, style primitives, capability lowering, and graphics lifecycle. | [`architecture.md`](architecture.md), [`theme.md`](theme.md) |
 | 2026-09-30 | Kept width-dependent `Layout` out of the TEA model: effects prepare only raster assets, while `view` derives layout from the current document, surface, navigation state, and prepared assets. | [`architecture.md`](architecture.md), [`design/source-anchored-layout.md`](design/source-anchored-layout.md), [`design/graphics-fallback.md`](design/graphics-fallback.md) |
 | 2026-09-29 | Moved the complete TUI and terminal-graphics lifecycle to `urushi-tui-app`: Raden now emits one View containing Urushi Image components and requests raster preparation through latest-only effects. Removed Raden's direct backend, protocol implementations, desired-scene side channel, and worker thread. | [`architecture.md`](architecture.md), [`design/graphics-fallback.md`](design/graphics-fallback.md) |
 | 2026-09-08 | Accepted Markdown from standard input while resolving relative image paths from the current working directory, preserving the same parsed-document and terminal-viewing path as file input. | [`architecture.md`](architecture.md) |

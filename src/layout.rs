@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::document::{Document, Segment};
 use crate::image::{ImageCatalog, MAX_IMAGE_ROWS};
+use crate::theme::{TextProjection, Theme};
 use crate::{ElementKey, MathForm, PixelSize, RasterAsset, RasterCache, SourceSpan, TextStyle};
 
 const MAX_RASTERIZED_HEADINGS: usize = 8;
@@ -14,7 +15,7 @@ const MAX_RASTERIZED_TABLES: usize = 4;
 const MAX_LAYOUT_TABLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LAYOUT_MATH_BYTES: usize = 32 * 1024 * 1024;
 
-/// The single-cell glyph a thematic break is drawn from.
+#[cfg(test)]
 const RULE_GLYPH: char = '─';
 
 /// A displayed text fragment that retains its original source identity.
@@ -41,6 +42,7 @@ pub(crate) struct LayoutGraphic {
     pub(crate) rows: u16,
     pub(crate) asset: Arc<RasterAsset>,
     pub(crate) fallback: String,
+    pub(crate) fallback_style: TextStyle,
     pub(crate) column: u16,
 }
 
@@ -70,13 +72,14 @@ pub struct Layout {
 impl PreparedGraphics {
     pub(crate) fn prepare(
         document: &Document,
-        width: u16,
-        height: u16,
+        viewport: (u16, u16),
         images: &ImageCatalog,
         cache: &mut RasterCache,
         cell_pixels: PixelSize,
         focus_source: usize,
+        theme: &Theme,
     ) -> Self {
+        let (width, height) = viewport;
         let mut prepared = Self::default();
         let mut selected_headings = document.headings().iter().enumerate().collect::<Vec<_>>();
         selected_headings.sort_by_key(|(_, heading)| heading.source.start.abs_diff(focus_source));
@@ -99,13 +102,20 @@ impl PreparedGraphics {
         for segment in &document.segments {
             match segment {
                 Segment::Image { index } => {
+                    let Some(image_style) = theme.document.image.rasterized() else {
+                        continue;
+                    };
                     let Some(image) = images.get(*index).filter(|image| image.can_render()) else {
                         continue;
                     };
-                    match cache.rasterize(
+                    match cache.rasterize_themed(
                         image,
-                        (width.max(1), height.clamp(1, MAX_IMAGE_ROWS)),
+                        (
+                            width.max(1),
+                            height.clamp(1, image_style.max_rows.min(MAX_IMAGE_ROWS)),
+                        ),
                         cell_pixels,
+                        theme.identity,
                     ) {
                         Ok(Some((asset, columns, rows))) => {
                             prepared.insert(image.element_key, columns, rows, asset)
@@ -120,13 +130,18 @@ impl PreparedGraphics {
                     let Some(heading) = document.headings().get(*index) else {
                         continue;
                     };
+                    let style = theme.document.headings.level(heading.level);
+                    let Some(raster_style) = style.rasterized() else {
+                        continue;
+                    };
                     let key = crate::heading::HeadingPlan::element_key(*index);
-                    match cache.rasterize_heading(
+                    match cache.rasterize_heading_themed(
                         *index,
                         heading,
-                        width.max(1),
-                        height,
+                        (width.max(1), height),
                         cell_pixels,
+                        raster_style,
+                        theme.identity,
                     ) {
                         Ok(Some(rendered)) => {
                             let bytes = rendered.asset.rgba.len();
@@ -155,11 +170,21 @@ impl PreparedGraphics {
                     }
                 }
                 Segment::Table { index } if selected_tables.contains(index) => {
+                    let Some(table_style) = theme.document.table.rasterized() else {
+                        continue;
+                    };
                     let Some(table) = document.tables().get(*index) else {
                         continue;
                     };
                     let key = crate::table::TablePlan::element_key(*index);
-                    match cache.rasterize_table(*index, table, width.max(1), cell_pixels) {
+                    match cache.rasterize_table_themed(
+                        *index,
+                        table,
+                        width.max(1),
+                        cell_pixels,
+                        table_style,
+                        theme.identity,
+                    ) {
                         Ok(Some(rendered)) => {
                             let bytes = rendered.asset.rgba.len();
                             if let Err(error) = reserve_table_bytes(&mut table_bytes, bytes) {
@@ -183,8 +208,22 @@ impl PreparedGraphics {
                     let Some(math) = document.math().get(*index) else {
                         continue;
                     };
+                    let style = match math.form {
+                        MathForm::Inline => &theme.document.math.inline,
+                        MathForm::Display => &theme.document.math.display,
+                    };
+                    let Some(raster_style) = style.rasterized() else {
+                        continue;
+                    };
                     let key = crate::math::MathPlan::element_key(*index);
-                    match cache.rasterize_math(*index, math, width.max(1), height, cell_pixels) {
+                    match cache.rasterize_math_themed(
+                        *index,
+                        math,
+                        (width.max(1), height),
+                        cell_pixels,
+                        raster_style,
+                        theme.identity,
+                    ) {
                         Ok(Some(rendered)) => {
                             let bytes = rendered.asset.rgba.len();
                             if math_bytes.saturating_add(bytes) > MAX_LAYOUT_MATH_BYTES {
@@ -245,20 +284,44 @@ impl PreparedGraphics {
 impl Layout {
     #[must_use]
     pub fn new(document: &Document, width: u16) -> Self {
-        Self::build(document, width, None, None)
+        let theme = Theme::builtin_dark();
+        Self::build(document, width, None, None, &theme)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_text(document: &Document, width: u16, images: &ImageCatalog) -> Self {
-        Self::build(document, width, Some(images), None)
+        let theme = Theme::builtin_dark();
+        Self::build(document, width, Some(images), None, &theme)
     }
 
+    pub(crate) fn with_text_themed(
+        document: &Document,
+        width: u16,
+        images: &ImageCatalog,
+        theme: &Theme,
+    ) -> Self {
+        Self::build(document, width, Some(images), None, theme)
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_prepared(
         document: &Document,
         width: u16,
         images: &ImageCatalog,
         graphics: &PreparedGraphics,
     ) -> Self {
-        Self::build(document, width, Some(images), Some(graphics))
+        let theme = Theme::builtin_dark();
+        Self::build(document, width, Some(images), Some(graphics), &theme)
+    }
+
+    pub(crate) fn with_prepared_themed(
+        document: &Document,
+        width: u16,
+        images: &ImageCatalog,
+        graphics: &PreparedGraphics,
+        theme: &Theme,
+    ) -> Self {
+        Self::build(document, width, Some(images), Some(graphics), theme)
     }
 
     #[cfg(test)]
@@ -273,12 +336,12 @@ impl Layout {
     ) -> Self {
         let graphics = PreparedGraphics::prepare(
             document,
-            width,
-            height,
+            (width, height),
             images,
             cache,
             cell_pixels,
             focus_source,
+            &Theme::builtin_dark(),
         );
         Self::with_prepared(document, width, images, &graphics)
     }
@@ -288,6 +351,7 @@ impl Layout {
         width: u16,
         images: Option<&ImageCatalog>,
         graphics: Option<&PreparedGraphics>,
+        theme: &Theme,
     ) -> Self {
         let width = usize::from(width.max(1));
         let mut builder = Builder::new(width);
@@ -298,9 +362,11 @@ impl Layout {
                     source,
                     style,
                     synthetic,
-                } => builder.text(text, source.clone(), *style, *synthetic),
+                } => builder.themed_text(text, source.clone(), *style, *synthetic, theme),
                 Segment::Break { source, blank } => builder.line_break(*source, *blank),
-                Segment::Rule { source, style } => builder.rule(source.clone(), *style),
+                Segment::Rule { source, style } => {
+                    builder.rule(source.clone(), *style, theme.document.rule.character)
+                }
                 Segment::Image { index } => {
                     let prepared = images.and_then(|catalog| catalog.get(*index));
                     let key = prepared.map(|image| image.element_key);
@@ -311,10 +377,13 @@ impl Layout {
                             builder.image(
                                 graphic.element_key,
                                 image.source.clone(),
-                                graphic.columns,
-                                graphic.rows,
+                                (graphic.columns, graphic.rows),
                                 Arc::clone(&graphic.asset),
-                                image.text_projection.clone(),
+                                decorate_fallback(
+                                    &image.text_projection,
+                                    theme.document.image.readable_text(),
+                                ),
+                                image.style,
                             );
                         })
                         .is_some();
@@ -334,10 +403,10 @@ impl Layout {
                                     } else {
                                         image.alt.trim()
                                     };
-                                    format!("[image: {label}]")
+                                    label.to_owned()
                                 })
                             })
-                            .unwrap_or_else(|| "[image unavailable]".to_owned());
+                            .unwrap_or_else(|| "unavailable".to_owned());
                         let source = prepared
                             .map(|image| image.source.clone())
                             .or_else(|| {
@@ -352,7 +421,13 @@ impl Layout {
                             .or_else(|| document.images().get(*index).map(|image| image.style))
                             .unwrap_or_default();
                         style.muted = true;
-                        builder.text(&fallback, source, style, false);
+                        style.image = true;
+                        builder.decorated_text(
+                            &fallback,
+                            source,
+                            style,
+                            theme.document.image.readable_text(),
+                        );
                     }
                 }
                 Segment::Heading { index } => {
@@ -365,10 +440,13 @@ impl Layout {
                         builder.image(
                             rendered.element_key,
                             heading.source.clone(),
-                            rendered.columns,
-                            rendered.rows,
+                            (rendered.columns, rendered.rows),
                             Arc::clone(&rendered.asset),
-                            heading.text.clone(),
+                            decorate_fallback(
+                                &heading.text,
+                                theme.document.headings.level(heading.level).readable_text(),
+                            ),
+                            heading.style,
                         );
                     } else {
                         let raster_error =
@@ -379,7 +457,12 @@ impl Layout {
                                 format!("{} [heading raster unavailable: {error}]", heading.text)
                             },
                         );
-                        builder.text(&fallback, heading.source.clone(), heading.style, false);
+                        builder.decorated_text(
+                            &fallback,
+                            heading.source.clone(),
+                            heading.style,
+                            theme.document.headings.level(heading.level).readable_text(),
+                        );
                     }
                 }
                 Segment::Table { index } => {
@@ -392,15 +475,19 @@ impl Layout {
                         builder.image(
                             rendered.element_key,
                             table.source.clone(),
-                            rendered.columns,
-                            rendered.rows,
+                            (rendered.columns, rendered.rows),
                             Arc::clone(&rendered.asset),
-                            table_projection(table),
+                            table_projection(table, theme),
+                            {
+                                let mut style = table.style;
+                                style.table = true;
+                                style
+                            },
                         );
                     } else {
                         let raster_error =
                             graphics.and_then(|graphics| graphics.failures.get(&key));
-                        builder.table_text(table, raster_error.map(String::as_str));
+                        builder.table_text(table, raster_error.map(String::as_str), theme);
                     }
                 }
                 Segment::Link { index } => {
@@ -412,14 +499,25 @@ impl Layout {
                     };
                     let mut style = link.style;
                     style.link = false;
-                    style.muted = true;
-                    builder.text(&projection, link.destination_source.clone(), style, false);
+                    style.link_destination = true;
+                    style.standalone_link_destination = !link.has_label;
+                    let decoration = if link.has_label {
+                        &theme.document.link.destination
+                    } else {
+                        &theme.document.link.standalone_destination
+                    };
+                    builder.decorated_text(
+                        &projection,
+                        link.destination_source.clone(),
+                        style,
+                        decoration,
+                    );
                 }
                 Segment::CodeBlock { index } => {
                     let Some(code_block) = document.code_blocks().get(*index) else {
                         continue;
                     };
-                    builder.code_block(code_block);
+                    builder.code_block(code_block, theme);
                 }
                 Segment::Math { index } => {
                     let Some(math) = document.math().get(*index) else {
@@ -435,15 +533,21 @@ impl Layout {
                                 math.style,
                                 (rendered.columns, rendered.rows),
                                 Arc::clone(&rendered.asset),
-                                math.text_projection(),
+                                decorate_fallback(
+                                    &math.text_projection(),
+                                    theme.document.math.inline.readable_text(),
+                                ),
                             ),
                             MathForm::Display => builder.centered_image(
                                 rendered.element_key,
                                 math.source.clone(),
-                                rendered.columns,
-                                rendered.rows,
+                                (rendered.columns, rendered.rows),
                                 Arc::clone(&rendered.asset),
-                                math.text_projection(),
+                                decorate_fallback(
+                                    &math.text_projection(),
+                                    theme.document.math.display.readable_text(),
+                                ),
+                                math.style,
                             ),
                         }
                     } else {
@@ -460,7 +564,12 @@ impl Layout {
                         );
                         let mut style = math.style;
                         style.code = true;
-                        builder.text(&projection, math.source.clone(), style, false);
+                        style.math = Some(math.form);
+                        let decoration = match math.form {
+                            MathForm::Inline => theme.document.math.inline.readable_text(),
+                            MathForm::Display => theme.document.math.display.readable_text(),
+                        };
+                        builder.decorated_text(&projection, math.source.clone(), style, decoration);
                     }
                 }
             }
@@ -512,22 +621,28 @@ fn reserve_table_bytes(used: &mut usize, incoming: usize) -> Result<(), String> 
     Ok(())
 }
 
-fn table_projection(table: &crate::TableElement) -> String {
+fn table_projection(table: &crate::TableElement, theme: &Theme) -> String {
     table
         .rows
         .iter()
         .map(|row| {
             format!(
-                "│ {} │",
+                "{}{}{}",
+                theme.document.table.readable_text().border.left,
                 row.cells
                     .iter()
                     .map(|cell| cell.text.as_str())
                     .collect::<Vec<_>>()
-                    .join(" │ ")
+                    .join(&theme.document.table.readable_text().border.column),
+                theme.document.table.readable_text().border.right,
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn decorate_fallback(text: &str, style: &TextProjection) -> String {
+    format!("{}{}{}", style.prefix, text, style.suffix)
 }
 
 #[derive(Debug)]
@@ -578,6 +693,64 @@ impl Builder {
             }
         }
         self.text_piece(text, source, style, piece_start..text.len());
+    }
+
+    fn themed_text(
+        &mut self,
+        text: &str,
+        source: SourceSpan,
+        style: TextStyle,
+        synthetic: bool,
+        theme: &Theme,
+    ) {
+        if style.quote_marker {
+            self.synthetic_text(&theme.document.quote.marker.text, source, style);
+            return;
+        }
+        if let Some(kind) = style.list_marker {
+            let indent = usize::from(theme.document.list.indent_cells)
+                .saturating_mul(usize::from(style.list_depth));
+            if indent > 0 {
+                self.synthetic_text(&" ".repeat(indent), source.clone(), style);
+            }
+            let marker = match kind {
+                crate::document::ListMarkerKind::Unordered => {
+                    theme.document.list.unordered.text.clone()
+                }
+                crate::document::ListMarkerKind::Ordered => {
+                    format!("{text}{}", theme.document.list.ordered.suffix)
+                }
+                crate::document::ListMarkerKind::TaskChecked => {
+                    theme.document.list.task_checked.text.clone()
+                }
+                crate::document::ListMarkerKind::TaskUnchecked => {
+                    theme.document.list.task_unchecked.text.clone()
+                }
+            };
+            self.synthetic_text(&marker, source, style);
+            return;
+        }
+        if style.code && !style.block_code {
+            self.decorated_text(text, source, style, &theme.document.inline_code);
+            return;
+        }
+        self.text(text, source, style, synthetic);
+    }
+
+    fn decorated_text(
+        &mut self,
+        text: &str,
+        source: SourceSpan,
+        style: TextStyle,
+        decoration: &TextProjection,
+    ) {
+        if !decoration.prefix.is_empty() {
+            self.synthetic_text(&decoration.prefix, source.start..source.start, style);
+        }
+        self.text(text, source.clone(), style, false);
+        if !decoration.suffix.is_empty() {
+            self.synthetic_text(&decoration.suffix, source.end..source.end, style);
+        }
     }
 
     fn synthetic_text(&mut self, text: &str, source: SourceSpan, style: TextStyle) {
@@ -682,13 +855,13 @@ impl Builder {
     }
 
     /// Emit a thematic break spanning the content width still available on this row.
-    fn rule(&mut self, source: SourceSpan, style: TextStyle) {
+    fn rule(&mut self, source: SourceSpan, style: TextStyle, character: char) {
         if !self.current.is_empty() {
             self.push_row(source.start);
         }
         let columns = self.width.saturating_sub(self.cell_width).max(1);
         self.current.push(LayoutFragment {
-            text: RULE_GLYPH.to_string().repeat(columns),
+            text: character.to_string().repeat(columns),
             source,
             style,
         });
@@ -699,11 +872,12 @@ impl Builder {
         &mut self,
         element_key: ElementKey,
         source: SourceSpan,
-        columns: u16,
-        rows: u16,
+        cells: (u16, u16),
         asset: Arc<RasterAsset>,
         fallback: String,
+        fallback_style: TextStyle,
     ) {
+        let (columns, rows) = cells;
         if !self.current.is_empty() {
             self.push_row(source.start);
         }
@@ -714,6 +888,7 @@ impl Builder {
             rows,
             asset,
             fallback,
+            fallback_style,
             column: 0,
         });
         self.rows.push(LayoutRow {
@@ -729,11 +904,12 @@ impl Builder {
         &mut self,
         element_key: ElementKey,
         source: SourceSpan,
-        columns: u16,
-        rows: u16,
+        cells: (u16, u16),
         asset: Arc<RasterAsset>,
         fallback: String,
+        fallback_style: TextStyle,
     ) {
+        let (columns, rows) = cells;
         if !self.current.is_empty() {
             self.push_row(source.start);
         }
@@ -746,6 +922,7 @@ impl Builder {
             rows,
             asset,
             fallback,
+            fallback_style,
             column,
         });
         self.rows.push(LayoutRow {
@@ -779,6 +956,7 @@ impl Builder {
             rows,
             asset,
             fallback,
+            fallback_style: style,
             column,
         });
         self.current_graphics.push(graphic);
@@ -791,11 +969,17 @@ impl Builder {
         self.cell_width = self.cell_width.saturating_add(columns_usize);
     }
 
-    fn table_text(&mut self, table: &crate::TableElement, raster_error: Option<&str>) {
+    fn table_text(
+        &mut self,
+        table: &crate::TableElement,
+        raster_error: Option<&str>,
+        theme: &Theme,
+    ) {
         self.line_break(table.source.start, false);
         if let Some(error) = raster_error {
             let mut style = table.style;
             style.muted = true;
+            style.table = true;
             self.text(
                 &format!("[table raster unavailable: {error}]"),
                 table.source.clone(),
@@ -805,34 +989,50 @@ impl Builder {
             self.push_row(table.source.start);
         }
         for row in &table.rows {
-            self.synthetic_text("│ ", row.source.start..row.source.start, table.style);
+            let mut border_style = table.style;
+            border_style.table_border = true;
+            self.synthetic_text(
+                &theme.document.table.readable_text().border.left,
+                row.source.start..row.source.start,
+                border_style,
+            );
             for (column, cell) in row.cells.iter().enumerate() {
                 if column > 0 {
-                    self.synthetic_text(" │ ", cell.source.start..cell.source.start, table.style);
+                    self.synthetic_text(
+                        &theme.document.table.readable_text().border.column,
+                        cell.source.start..cell.source.start,
+                        border_style,
+                    );
                 }
                 let mut style = cell.style;
+                style.table = true;
                 if row.header {
                     style.strong = true;
+                    style.table_header = true;
                 }
                 self.text(&cell.text, cell.source.clone(), style, false);
             }
-            self.synthetic_text(" │", row.source.end..row.source.end, table.style);
+            self.synthetic_text(
+                &theme.document.table.readable_text().border.right,
+                row.source.end..row.source.end,
+                border_style,
+            );
             self.push_row(row.source.end);
         }
         self.line_break(table.source.end, true);
     }
 
-    fn code_block(&mut self, code_block: &crate::CodeBlockElement) {
+    fn code_block(&mut self, code_block: &crate::CodeBlockElement, theme: &Theme) {
         self.line_break(code_block.source.start, false);
         if let Some(language) = code_block.language.as_deref() {
             let mut label_style = code_block.style;
             label_style.code = false;
-            label_style.muted = true;
-            self.text(
+            label_style.code_label = true;
+            self.decorated_text(
                 language,
                 code_block.source.start..code_block.source.start,
                 label_style,
-                false,
+                &theme.document.code_block.label,
             );
             self.push_row(code_block.source.start);
         }
@@ -841,7 +1041,9 @@ impl Builder {
             let Some(text) = code_block.text.get(fragment.text.clone()) else {
                 continue;
             };
-            self.text(text, fragment.source.clone(), fragment.style, false);
+            let mut style = fragment.style;
+            style.block_code = true;
+            self.text(text, fragment.source.clone(), style, false);
         }
         self.line_break(code_block.source.end, true);
     }
@@ -1096,7 +1298,7 @@ mod tests {
             .iter()
             .find(|fragment| fragment.text == "rust")
             .expect("declared language should be visible");
-        assert!(label.style.muted);
+        assert!(label.style.code_label);
         assert!(!label.style.code);
         assert!(label.source.is_empty());
 
@@ -1108,11 +1310,17 @@ mod tests {
         assert!(
             code_fragments
                 .iter()
-                .all(|fragment| fragment.style.foreground.is_some())
+                .any(|fragment| fragment.style.syntax_role.is_some())
+        );
+        assert!(
+            code_fragments
+                .iter()
+                .any(|fragment| fragment.style.syntax_role.is_none()),
+            "plain code should inherit the code-block text style"
         );
         let colors = code_fragments
             .iter()
-            .filter_map(|fragment| fragment.style.foreground)
+            .filter_map(|fragment| fragment.style.syntax_role)
             .collect::<HashSet<_>>();
         assert!(colors.len() > 1, "Rust tokens should use multiple colors");
     }
@@ -1137,7 +1345,7 @@ mod tests {
         assert_eq!(rendered_code, code_block.text.trim_end());
         let label = fragments
             .iter()
-            .filter(|fragment| fragment.source.is_empty() && fragment.style.muted)
+            .filter(|fragment| fragment.source.is_empty() && fragment.style.code_label)
             .map(|fragment| fragment.text.as_str())
             .collect::<String>();
         assert_eq!(label, "made-up-language");
@@ -1145,7 +1353,11 @@ mod tests {
             fragments
                 .iter()
                 .filter(|fragment| !fragment.source.is_empty())
-                .all(|fragment| fragment.style.code && fragment.style.foreground.is_none())
+                .all(|fragment| {
+                    fragment.style.code
+                        && fragment.style.foreground.is_none()
+                        && fragment.style.syntax_role.is_none()
+                })
         );
         assert!(layout.rows().iter().all(|row| {
             row.fragments.iter().all(|fragment| {
@@ -1179,7 +1391,7 @@ mod tests {
             .rows()
             .iter()
             .flat_map(|row| row.fragments.iter())
-            .filter(|fragment| fragment.source.is_empty() && fragment.style.muted)
+            .filter(|fragment| fragment.source.is_empty() && fragment.style.code_label)
             .map(|fragment| fragment.text.as_str())
             .collect::<String>();
 
@@ -1251,7 +1463,7 @@ mod tests {
             .iter()
             .find(|fragment| fragment.text.contains("example.com"))
             .expect("destination is rendered");
-        assert!(destination.style.muted);
+        assert!(destination.style.link_destination);
         assert!(!destination.style.link);
         assert!(
             document.links()[0]
@@ -1380,7 +1592,7 @@ mod tests {
             .map(|fragment| fragment.text.as_str())
             .collect::<String>();
 
-        assert!(rendered.contains("image unavailable: diagram"));
+        assert!(rendered.contains("image: unavailable: diagram"));
         assert!(rendered.contains("could not open"));
         fs::remove_dir(root).expect("fixture directory should be removable");
     }
@@ -1496,7 +1708,7 @@ mod tests {
             .flat_map(|row| row.fragments.iter())
             .collect::<Vec<_>>();
 
-        assert!(rendered.starts_with("left [image unavailable: diagram — could not open "));
+        assert!(rendered.starts_with("left [image: unavailable: diagram — could not open "));
         assert!(rendered.ends_with("] right"));
         assert!(fragments.iter().all(|fragment| fragment.style.strong));
         fs::remove_dir(root).expect("fixture directory should be removable");
@@ -1772,5 +1984,95 @@ mod tests {
                     < 60)),
             "a rule inside a table must stay readable cell text"
         );
+    }
+
+    #[test]
+    fn text_heading_skips_raster_preparation() {
+        let document = Document::parse(
+            "# Heading\n\n$x^2$\n\n| a | b |\n| --- | --- |\n| c | d |\n".to_owned(),
+        );
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let mut cache = RasterCache::default();
+        let theme = crate::theme::resolve(
+            "builtin:plain",
+            &crate::theme::ThemeSettings::default(),
+            None,
+            None,
+        )
+        .expect("plain Theme should resolve");
+
+        let prepared = PreparedGraphics::prepare(
+            &document,
+            (80, 20),
+            &catalog,
+            &mut cache,
+            PixelSize::FALLBACK,
+            0,
+            &theme,
+        );
+        let layout = Layout::with_prepared(&document, 80, &catalog, &prepared);
+
+        assert!(prepared.graphics.is_empty());
+        assert!(prepared.failures.is_empty());
+        assert!(layout.graphics.is_empty());
+        assert!(
+            layout
+                .rows()
+                .iter()
+                .flat_map(|row| &row.fragments)
+                .any(|fragment| fragment.text.contains("Heading"))
+        );
+    }
+
+    #[test]
+    fn text_theme_controls_heading_markers_lists_rules_and_inline_code() {
+        let overrides = toml::from_str::<crate::theme::ThemeSettings>(
+            r#"
+[styles.document.heading.h1]
+renderer = "text"
+
+[styles.document.heading.h1.text]
+prefix = "▌ "
+suffix = " ◀"
+
+[styles.document.quote.marker]
+text = "┃ "
+
+[styles.document.list.unordered]
+text = "– "
+
+[styles.document.list.ordered]
+suffix = " → "
+
+[styles.document.rule]
+character = "·"
+
+[styles.document.inline_code]
+prefix = "‹"
+suffix = "›"
+"#,
+        )
+        .expect("text Theme overrides should parse");
+        let theme = crate::theme::resolve("builtin:dark", &overrides, None, None)
+            .expect("text Theme should resolve");
+        let document = Document::parse(
+            "# Title\n\n> Quote\n\n- item\n\n3. ordered\n\n---\n\nUse `code`.\n".to_owned(),
+        );
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+
+        let layout = Layout::with_text_themed(&document, 40, &catalog, &theme);
+        let rendered = layout
+            .rows()
+            .iter()
+            .flat_map(|row| row.fragments.iter())
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert!(rendered.contains("▌ Title ◀"));
+        assert!(rendered.contains("┃ Quote"));
+        assert!(rendered.contains("– item"));
+        assert!(rendered.contains("3 → ordered"));
+        assert!(rendered.contains("····"));
+        assert!(rendered.contains("Use ‹code›."));
     }
 }

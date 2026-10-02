@@ -8,6 +8,7 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use percent_encoding::percent_decode_str;
 
+use crate::theme::{RasterizedHeading, RasterizedMath, RasterizedTable};
 use crate::{Document, ImageElement, MathElement, SourceSpan, TableElement, TextStyle};
 use crate::{
     HeadingElement,
@@ -94,7 +95,7 @@ impl PreparedImage {
 
     #[must_use]
     pub fn failure_projection(&self, error: &str) -> String {
-        format!("[image unavailable: {} — {error}]", self.label)
+        format!("unavailable: {} — {error}", self.label)
     }
 }
 
@@ -211,8 +212,8 @@ fn image_label(element: &ImageElement) -> &str {
 fn fallback_text(element: &ImageElement, error: Option<&str>) -> String {
     let label = image_label(element);
     match error {
-        Some(error) => format!("[image unavailable: {label} — {error}]"),
-        None => format!("[image: {label}]"),
+        Some(error) => format!("unavailable: {label} — {error}"),
+        None => label.to_owned(),
     }
 }
 
@@ -374,7 +375,7 @@ pub struct RasterCache {
     capacity: usize,
     used: usize,
     clock: u64,
-    heading_fonts: HeadingFonts,
+    heading_fonts: Vec<HeadingFonts>,
 }
 
 impl Default for RasterCache {
@@ -386,14 +387,14 @@ impl Default for RasterCache {
 impl RasterCache {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        Self::new_with_heading_fonts(capacity, HeadingFonts::default())
+        Self::new_with_heading_fonts(capacity, (0..6).map(|_| HeadingFonts::default()).collect())
     }
 
-    pub(crate) fn with_heading_fonts(heading_fonts: HeadingFonts) -> Self {
+    pub(crate) fn with_heading_fonts(heading_fonts: Vec<HeadingFonts>) -> Self {
         Self::new_with_heading_fonts(DEFAULT_CACHE_BYTES, heading_fonts)
     }
 
-    fn new_with_heading_fonts(capacity: usize, heading_fonts: HeadingFonts) -> Self {
+    fn new_with_heading_fonts(capacity: usize, heading_fonts: Vec<HeadingFonts>) -> Self {
         Self {
             entries: HashMap::new(),
             heading_keys: HashMap::new(),
@@ -407,11 +408,12 @@ impl RasterCache {
         }
     }
 
-    pub(crate) fn rasterize(
+    pub(crate) fn rasterize_themed(
         &mut self,
         image: &PreparedImage,
         available_cells: (u16, u16),
         cell_pixels: PixelSize,
+        theme_identity: [u8; 32],
     ) -> Result<Option<(Arc<RasterAsset>, u16, u16)>, String> {
         let Some(recipe) = image.recipe.as_ref() else {
             return Ok(None);
@@ -434,7 +436,12 @@ impl RasterCache {
             return Ok(None);
         }
         let key = RasterAssetKey {
-            content_hash: raster_cache_hash(recipe.content_hash, target, cell_pixels),
+            content_hash: raster_cache_hash(
+                recipe.content_hash,
+                target,
+                cell_pixels,
+                theme_identity,
+            ),
             pixels: canvas_size,
             rasterizer_version: RASTERIZER_VERSION,
         };
@@ -479,19 +486,37 @@ impl RasterCache {
         Ok(Some((asset, columns, rows)))
     }
 
-    pub(crate) fn rasterize_heading(
+    #[cfg(test)]
+    pub(crate) fn rasterize(
+        &mut self,
+        image: &PreparedImage,
+        available_cells: (u16, u16),
+        cell_pixels: PixelSize,
+    ) -> Result<Option<(Arc<RasterAsset>, u16, u16)>, String> {
+        self.rasterize_themed(image, available_cells, cell_pixels, [0; 32])
+    }
+
+    pub(crate) fn rasterize_heading_themed(
         &mut self,
         index: usize,
         heading: &HeadingElement,
-        available_columns: u16,
-        available_rows: u16,
+        available: (u16, u16),
         cell_pixels: PixelSize,
+        style: &RasterizedHeading,
+        theme_identity: [u8; 32],
     ) -> Result<Option<HeadingRaster>, String> {
+        let (available_columns, available_rows) = available;
+        let fonts = self
+            .heading_fonts
+            .get(usize::from(heading.level.clamp(1, 6) - 1))
+            .ok_or_else(|| "heading font set is unavailable".to_owned())?;
         let identity = HeadingPlan::cache_identity_with_fonts(
             heading,
             available_columns,
             cell_pixels,
-            &self.heading_fonts,
+            fonts,
+            style,
+            theme_identity,
         )?;
         self.clock = self.clock.saturating_add(1);
         if let Some(key) = self.heading_keys.get(&identity).copied()
@@ -520,7 +545,9 @@ impl RasterCache {
             heading,
             available_columns,
             cell_pixels,
-            &self.heading_fonts,
+            fonts,
+            style,
+            theme_identity,
         ) {
             Ok(plan) => plan,
             Err(error) => {
@@ -538,7 +565,7 @@ impl RasterCache {
             );
             return Err(error);
         }
-        let rendered = match plan.render_with_fonts(&self.heading_fonts) {
+        let rendered = match plan.render_with_fonts(fonts) {
             Ok(rendered) => rendered,
             Err(error) => {
                 self.failures.insert(plan.key.content_hash, error.clone());
@@ -576,14 +603,48 @@ impl RasterCache {
         }))
     }
 
-    pub(crate) fn rasterize_table(
+    #[cfg(test)]
+    pub(crate) fn rasterize_heading(
+        &mut self,
+        index: usize,
+        heading: &HeadingElement,
+        available_columns: u16,
+        available_rows: u16,
+        cell_pixels: PixelSize,
+    ) -> Result<Option<HeadingRaster>, String> {
+        let theme = crate::theme::Theme::builtin_dark();
+        let style = theme
+            .document
+            .headings
+            .level(heading.level)
+            .rasterized()
+            .expect("built-in raster heading should have raster settings");
+        self.rasterize_heading_themed(
+            index,
+            heading,
+            (available_columns, available_rows),
+            cell_pixels,
+            style,
+            theme.identity,
+        )
+    }
+
+    pub(crate) fn rasterize_table_themed(
         &mut self,
         index: usize,
         table: &TableElement,
         available_columns: u16,
         cell_pixels: PixelSize,
+        style: &RasterizedTable,
+        theme_identity: [u8; 32],
     ) -> Result<Option<TableRaster>, String> {
-        let identity = TablePlan::cache_identity(table, available_columns, cell_pixels);
+        let identity = TablePlan::cache_identity_themed(
+            table,
+            available_columns,
+            cell_pixels,
+            style,
+            theme_identity,
+        );
         self.clock = self.clock.saturating_add(1);
         if let Some(key) = self.table_keys.get(&identity).copied()
             && let Some(entry) = self.entries.get_mut(&key)
@@ -600,7 +661,14 @@ impl RasterCache {
         if let Some(error) = self.failures.get(&identity) {
             return Err(error.clone());
         }
-        let plan = match TablePlan::build(index, table, available_columns, cell_pixels) {
+        let plan = match TablePlan::build_themed(
+            index,
+            table,
+            available_columns,
+            cell_pixels,
+            style,
+            theme_identity,
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 self.failures.insert(identity, error.clone());
@@ -650,16 +718,47 @@ impl RasterCache {
         }))
     }
 
-    pub(crate) fn rasterize_math(
+    #[cfg(test)]
+    pub(crate) fn rasterize_table(
+        &mut self,
+        index: usize,
+        table: &TableElement,
+        available_columns: u16,
+        cell_pixels: PixelSize,
+    ) -> Result<Option<TableRaster>, String> {
+        let theme = crate::theme::Theme::builtin_dark();
+        self.rasterize_table_themed(
+            index,
+            table,
+            available_columns,
+            cell_pixels,
+            theme
+                .document
+                .table
+                .rasterized()
+                .expect("built-in table should be rasterized"),
+            theme.identity,
+        )
+    }
+
+    pub(crate) fn rasterize_math_themed(
         &mut self,
         index: usize,
         math: &MathElement,
-        available_columns: u16,
-        available_rows: u16,
+        available: (u16, u16),
         cell_pixels: PixelSize,
+        style: &RasterizedMath,
+        theme_identity: [u8; 32],
     ) -> Result<Option<MathRaster>, String> {
-        let identity =
-            MathPlan::cache_identity(math, available_columns, available_rows, cell_pixels);
+        let (available_columns, available_rows) = available;
+        let identity = MathPlan::cache_identity_themed(
+            math,
+            available_columns,
+            available_rows,
+            cell_pixels,
+            style,
+            theme_identity,
+        );
         self.clock = self.clock.saturating_add(1);
         if let Some(key) = self.math_keys.get(&identity).copied()
             && let Some(entry) = self.entries.get_mut(&key)
@@ -676,14 +775,21 @@ impl RasterCache {
         if let Some(error) = self.failures.get(&identity) {
             return Err(error.clone());
         }
-        let plan =
-            match MathPlan::build(index, math, available_columns, available_rows, cell_pixels) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    self.failures.insert(identity, error.clone());
-                    return Err(error);
-                }
-            };
+        let plan = match MathPlan::build_themed(
+            index,
+            math,
+            available_columns,
+            available_rows,
+            cell_pixels,
+            style,
+            theme_identity,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.failures.insert(identity, error.clone());
+                return Err(error);
+            }
+        };
         let (plan, rendered) = match plan.render(cell_pixels) {
             Ok(rendered) => rendered,
             Err(error) => {
@@ -725,6 +831,32 @@ impl RasterCache {
             columns,
             rows,
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rasterize_math(
+        &mut self,
+        index: usize,
+        math: &MathElement,
+        available_columns: u16,
+        available_rows: u16,
+        cell_pixels: PixelSize,
+    ) -> Result<Option<MathRaster>, String> {
+        let theme = crate::theme::Theme::builtin_dark();
+        let element = match math.form {
+            crate::MathForm::Inline => &theme.document.math.inline,
+            crate::MathForm::Display => &theme.document.math.display,
+        };
+        self.rasterize_math_themed(
+            index,
+            math,
+            (available_columns, available_rows),
+            cell_pixels,
+            element
+                .rasterized()
+                .expect("built-in math should be rasterized"),
+            theme.identity,
+        )
     }
 
     fn evict_for(&mut self, incoming: usize) {
@@ -813,13 +945,19 @@ fn aligned_cells(pixels: PixelSize, cell: PixelSize) -> Result<(u16, u16), Strin
     Ok((columns.max(1), rows.max(1)))
 }
 
-fn raster_cache_hash(content_hash: [u8; 32], content: PixelSize, cell: PixelSize) -> [u8; 32] {
+fn raster_cache_hash(
+    content_hash: [u8; 32],
+    content: PixelSize,
+    cell: PixelSize,
+    theme_identity: [u8; 32],
+) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&content_hash);
     hasher.update(&content.width.to_le_bytes());
     hasher.update(&content.height.to_le_bytes());
     hasher.update(&cell.width.to_le_bytes());
     hasher.update(&cell.height.to_le_bytes());
+    hasher.update(&theme_identity);
     *hasher.finalize().as_bytes()
 }
 
@@ -1125,6 +1263,37 @@ mod tests {
     }
 
     #[test]
+    fn theme_identity_separates_raster_cache_entries() {
+        let root = temp_dir();
+        let path = root.join("pixel.png");
+        RgbaImage::from_pixel(2, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .expect("fixture should save");
+        let prepared = PreparedImage {
+            element_key: ElementKey(1),
+            source: 0..1,
+            label: "pixel".to_owned(),
+            text_projection: String::new(),
+            style: TextStyle::default(),
+            recipe: Some(inspect_image(path).expect("fixture should inspect")),
+        };
+        let mut cache = RasterCache::default();
+
+        let first = cache
+            .rasterize_themed(&prepared, (4, 2), PixelSize::FALLBACK, [1; 32])
+            .expect("first Theme should rasterize")
+            .expect("first raster should exist");
+        let second = cache
+            .rasterize_themed(&prepared, (4, 2), PixelSize::FALLBACK, [2; 32])
+            .expect("second Theme should rasterize")
+            .expect("second raster should exist");
+
+        assert_ne!(first.0.key, second.0.key);
+        assert_eq!(cache.entries.len(), 2);
+        fs::remove_dir_all(root).expect("fixture directory should be removable");
+    }
+
+    #[test]
     fn generated_raster_metadata_matches_between_cache_miss_and_hit() {
         let document = Document::parse(
             "# Heading\n\n$x^2$\n\n| a | b |\n| --- | --- |\n| c | d |\n".to_owned(),
@@ -1243,7 +1412,7 @@ mod tests {
             element_key: ElementKey(1),
             source: 0..1,
             label: "corrupt".to_owned(),
-            text_projection: "[image: corrupt]".to_owned(),
+            text_projection: "corrupt".to_owned(),
             style: TextStyle::default(),
             recipe: Some(inspect_image(path.clone()).expect("PNG header should expose dimensions")),
         };
@@ -1258,7 +1427,7 @@ mod tests {
         assert!(
             prepared
                 .failure_projection(&first_error)
-                .contains("image unavailable: corrupt")
+                .contains("unavailable: corrupt")
         );
 
         let document = Document::parse("![corrupt](corrupt.png)".to_owned());
@@ -1273,7 +1442,7 @@ mod tests {
             .flat_map(|row| row.fragments.iter())
             .map(|fragment| fragment.text.as_str())
             .collect::<String>();
-        assert!(rendered.contains("image unavailable: corrupt"));
+        assert!(rendered.contains("image: unavailable: corrupt"));
         assert!(rendered.contains("could not decode image"));
 
         fs::remove_file(&path).expect("fixture should be removable after the first attempt");

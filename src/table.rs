@@ -6,6 +6,7 @@ use typst::layout::Abs;
 use typst_as_lib::TypstEngine;
 use unicode_width::UnicodeWidthStr;
 
+use crate::theme::RasterizedTable;
 use crate::{
     ElementKey, PixelSize, RasterAssetKey, TableAlignment, TableElement,
     image::{cell_aligned_size, pad_to_cell_grid},
@@ -13,17 +14,13 @@ use crate::{
 
 const FONT: &[u8] = include_bytes!("../assets/fonts/NotoSansJP.ttf");
 static GLYPH_FONT: OnceLock<Result<Font, String>> = OnceLock::new();
-const TABLE_FONT_POINTS: f32 = 10.0;
-const TABLE_HORIZONTAL_INSET_POINTS: f32 = 5.0;
-const TABLE_VERTICAL_INSET_POINTS: f32 = 3.0;
-const TABLE_RULE_GAP_POINTS: f32 = 5.0;
 const MIN_COLUMN_CELLS: usize = 7;
 const MAX_COLUMN_WEIGHT: usize = 32;
 const MAX_TABLE_COLUMNS: usize = 32;
 const MAX_TABLE_CELLS: usize = 2_048;
 const MAX_TABLE_RASTER_ROWS: u32 = 256;
 const MAX_TABLE_RASTER_BYTES: u64 = 128 * 1024 * 1024;
-const TABLE_RASTERIZER_VERSION: u16 = 10;
+const TABLE_RASTERIZER_VERSION: u16 = 11;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TablePlan {
@@ -35,11 +32,13 @@ pub(crate) struct TablePlan {
 }
 
 impl TablePlan {
-    pub(crate) fn build(
+    pub(crate) fn build_themed(
         index: usize,
         table: &TableElement,
         available_columns: u16,
         cell_pixels: PixelSize,
+        style: &RasterizedTable,
+        theme_identity: [u8; 32],
     ) -> Result<Self, String> {
         validate_table(table)?;
         validate_glyphs(table)?;
@@ -66,16 +65,19 @@ impl TablePlan {
         let target_width = u32::try_from(table_columns)
             .unwrap_or(u32::MAX)
             .saturating_mul(cell_pixels.width.max(1));
-        let source = typst_source(table, &widths, target_width, cell_pixels)?;
+        let source = typst_source_themed(table, &widths, target_width, cell_pixels, style)?;
         let rows = u16::try_from(
-            logical_row_heights(table, &widths, cell_pixels)
+            logical_row_heights(table, &widths, cell_pixels, style)
                 .into_iter()
                 .sum::<usize>()
                 .saturating_add(1)
-                .saturating_add(rule_gap_rows(cell_pixels)),
+                .saturating_add(rule_gap_rows(cell_pixels, style)),
         )
         .unwrap_or(u16::MAX);
-        let content_hash = *blake3::hash(source.as_bytes()).as_bytes();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(source.as_bytes());
+        hasher.update(&theme_identity);
+        let content_hash = *hasher.finalize().as_bytes();
         Ok(Self {
             key: RasterAssetKey {
                 content_hash,
@@ -92,16 +94,26 @@ impl TablePlan {
         })
     }
 
-    pub(crate) fn cache_identity(
+    pub(crate) fn cache_identity_themed(
         table: &TableElement,
         available_columns: u16,
         cell_pixels: PixelSize,
+        style: &RasterizedTable,
+        theme_identity: [u8; 32],
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&TABLE_RASTERIZER_VERSION.to_le_bytes());
         hasher.update(&available_columns.to_le_bytes());
         hasher.update(&cell_pixels.width.to_le_bytes());
         hasher.update(&cell_pixels.height.to_le_bytes());
+        hash_table_text_style(&mut hasher, style.cell);
+        hash_table_text_style(&mut hasher, style.header);
+        hasher.update(&style.border.color.rgb);
+        hasher.update(&style.font_points.to_bits().to_le_bytes());
+        hasher.update(&style.horizontal_inset_points.to_bits().to_le_bytes());
+        hasher.update(&style.vertical_inset_points.to_bits().to_le_bytes());
+        hasher.update(&style.rule_gap_points.to_bits().to_le_bytes());
+        hasher.update(&theme_identity);
         for alignment in &table.alignments {
             hasher.update(&[*alignment as u8]);
         }
@@ -114,6 +126,48 @@ impl TablePlan {
             hasher.update(&[0xff]);
         }
         *hasher.finalize().as_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build(
+        index: usize,
+        table: &TableElement,
+        available_columns: u16,
+        cell_pixels: PixelSize,
+    ) -> Result<Self, String> {
+        let theme = crate::theme::Theme::builtin_dark();
+        Self::build_themed(
+            index,
+            table,
+            available_columns,
+            cell_pixels,
+            theme
+                .document
+                .table
+                .rasterized()
+                .expect("built-in table should be rasterized"),
+            theme.identity,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_identity(
+        table: &TableElement,
+        available_columns: u16,
+        cell_pixels: PixelSize,
+    ) -> [u8; 32] {
+        let theme = crate::theme::Theme::builtin_dark();
+        Self::cache_identity_themed(
+            table,
+            available_columns,
+            cell_pixels,
+            theme
+                .document
+                .table
+                .rasterized()
+                .expect("built-in table should be rasterized"),
+            theme.identity,
+        )
     }
 
     pub(crate) fn element_key(index: usize) -> ElementKey {
@@ -175,10 +229,33 @@ impl TablePlan {
     }
 }
 
+fn hash_table_text_style(
+    hasher: &mut blake3::Hasher,
+    style: crate::theme::RasterizedTableTextStyle,
+) {
+    hasher.update(&style.foreground.rgb);
+    match style.background {
+        Some(background) => {
+            hasher.update(&[1]);
+            hasher.update(&background.rgb);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&[
+        u8::from(style.bold),
+        u8::from(style.italic),
+        u8::from(style.underline),
+        u8::from(style.strikethrough),
+    ]);
+}
+
 fn logical_row_heights(
     table: &TableElement,
     widths: &[usize],
     cell_pixels: PixelSize,
+    style: &RasterizedTable,
 ) -> Vec<usize> {
     table
         .rows
@@ -188,9 +265,14 @@ fn logical_row_heights(
                 .iter()
                 .enumerate()
                 .map(|(column, cell)| {
-                    wrap_text(
+                    wrap_text_themed(
                         &cell.text,
-                        content_width_pixels(widths.get(column).copied().unwrap_or(1), cell_pixels),
+                        content_width_pixels_themed(
+                            widths.get(column).copied().unwrap_or(1),
+                            cell_pixels,
+                            style,
+                        ),
+                        style,
                     )
                     .map_or(1, |lines| lines.len())
                 })
@@ -201,8 +283,8 @@ fn logical_row_heights(
         .collect()
 }
 
-fn rule_gap_rows(cell_pixels: PixelSize) -> usize {
-    let extra_points = (TABLE_RULE_GAP_POINTS - TABLE_VERTICAL_INSET_POINTS).max(0.0) * 4.0;
+fn rule_gap_rows(cell_pixels: PixelSize, style: &RasterizedTable) -> usize {
+    let extra_points = (style.rule_gap_points - style.vertical_inset_points).max(0.0) * 4.0;
     let extra_pixels = extra_points * 96.0 / 72.0;
     (extra_pixels / cell_pixels.height.max(1) as f32).ceil() as usize
 }
@@ -306,11 +388,12 @@ fn column_widths(table: &TableElement, columns: usize, available: usize) -> Vec<
     widths
 }
 
-fn typst_source(
+fn typst_source_themed(
     table: &TableElement,
     widths: &[usize],
     target_width: u32,
     cell_pixels: PixelSize,
+    style: &RasterizedTable,
 ) -> Result<String, String> {
     let page_points = f64::from(target_width) * 72.0 / 96.0;
     let total_width = widths.iter().sum::<usize>().max(1);
@@ -330,8 +413,17 @@ fn typst_source(
         .collect::<Vec<_>>()
         .join(", ");
     let last_row = table.rows.len().saturating_sub(1);
+    let foreground = hex(style.cell.foreground.rgb);
+    let border = hex(style.border.color.rgb);
+    let has_header = table.rows.first().is_some_and(|row| row.header);
+    let cell_background = typst_fill(style.cell.background);
+    let header_background = typst_fill(style.header.background);
+    let font_points = style.font_points;
+    let horizontal = style.horizontal_inset_points;
+    let vertical = style.vertical_inset_points;
+    let rule_gap = style.rule_gap_points;
     let mut source = format!(
-        "#set page(width: {page_points:.4}pt, height: auto, margin: 0pt, fill: none)\n#set text(font: \"Noto Sans JP\", size: {TABLE_FONT_POINTS}pt, fill: rgb(\"#d8dee9\"))\n#table(columns: ({columns}), align: ({alignments}), inset: (_, y) => if y == 0 {{ (left: {TABLE_HORIZONTAL_INSET_POINTS}pt, right: {TABLE_HORIZONTAL_INSET_POINTS}pt, top: {TABLE_RULE_GAP_POINTS}pt, bottom: {TABLE_RULE_GAP_POINTS}pt) }} else if y == 1 and y == {last_row} {{ (left: {TABLE_HORIZONTAL_INSET_POINTS}pt, right: {TABLE_HORIZONTAL_INSET_POINTS}pt, top: {TABLE_RULE_GAP_POINTS}pt, bottom: {TABLE_RULE_GAP_POINTS}pt) }} else if y == 1 {{ (left: {TABLE_HORIZONTAL_INSET_POINTS}pt, right: {TABLE_HORIZONTAL_INSET_POINTS}pt, top: {TABLE_RULE_GAP_POINTS}pt, bottom: {TABLE_VERTICAL_INSET_POINTS}pt) }} else if y == {last_row} {{ (left: {TABLE_HORIZONTAL_INSET_POINTS}pt, right: {TABLE_HORIZONTAL_INSET_POINTS}pt, top: {TABLE_VERTICAL_INSET_POINTS}pt, bottom: {TABLE_RULE_GAP_POINTS}pt) }} else {{ (x: {TABLE_HORIZONTAL_INSET_POINTS}pt, y: {TABLE_VERTICAL_INSET_POINTS}pt) }}, stroke: (_, y) => if y == 0 {{ (top: 1.4pt + rgb(\"#8290a5\"), bottom: 0.6pt + rgb(\"#8290a5\")) }} else if y == {last_row} {{ (bottom: 1.4pt + rgb(\"#8290a5\")) }} else {{ none }}, fill: none,\n"
+        "#set page(width: {page_points:.4}pt, height: auto, margin: 0pt, fill: none)\n#set text(font: \"Noto Sans JP\", size: {font_points}pt, fill: rgb(\"{foreground}\"))\n#table(columns: ({columns}), align: ({alignments}), inset: (_, y) => if y == 0 {{ (left: {horizontal}pt, right: {horizontal}pt, top: {rule_gap}pt, bottom: {rule_gap}pt) }} else if y == 1 and y == {last_row} {{ (left: {horizontal}pt, right: {horizontal}pt, top: {rule_gap}pt, bottom: {rule_gap}pt) }} else if y == 1 {{ (left: {horizontal}pt, right: {horizontal}pt, top: {rule_gap}pt, bottom: {vertical}pt) }} else if y == {last_row} {{ (left: {horizontal}pt, right: {horizontal}pt, top: {vertical}pt, bottom: {rule_gap}pt) }} else {{ (x: {horizontal}pt, y: {vertical}pt) }}, stroke: (_, y) => if y == 0 {{ (top: 1.4pt + rgb(\"{border}\"), bottom: 0.6pt + rgb(\"{border}\")) }} else if y == {last_row} {{ (bottom: 1.4pt + rgb(\"{border}\")) }} else {{ none }}, fill: (_, y) => if {has_header} and y == 0 {{ {header_background} }} else {{ {cell_background} }},\n"
     );
     for row in &table.rows {
         for (column, width) in widths.iter().copied().enumerate() {
@@ -340,19 +432,20 @@ fn typst_source(
                 .get(column)
                 .map(|cell| cell.text.as_str())
                 .unwrap_or_default();
-            let weight = if row.header { "bold" } else { "regular" };
+            let text_style = if row.header { style.header } else { style.cell };
             source.push_str("  [");
-            for (line_index, line) in wrap_text(text, content_width_pixels(width, cell_pixels))?
-                .iter()
-                .enumerate()
+            for (line_index, line) in wrap_text_themed(
+                text,
+                content_width_pixels_themed(width, cell_pixels, style),
+                style,
+            )?
+            .iter()
+            .enumerate()
             {
                 if line_index > 0 {
                     source.push_str("#linebreak()");
                 }
-                source.push_str(&format!(
-                    "#box[#text(weight: \"{weight}\", \"{}\")]",
-                    escape_typst_string(line)
-                ));
+                push_styled_text(&mut source, line, text_style);
             }
             source.push_str("],\n");
         }
@@ -361,14 +454,57 @@ fn typst_source(
     Ok(source)
 }
 
-fn content_width_pixels(column_cells: usize, cell_pixels: PixelSize) -> f32 {
-    let inset_pixels = TABLE_HORIZONTAL_INSET_POINTS * 2.0 * 96.0 / 72.0;
+fn typst_fill(color: Option<crate::theme::ThemeColor>) -> String {
+    color.map_or_else(
+        || "none".to_owned(),
+        |color| format!("rgb(\"{}\")", hex(color.rgb)),
+    )
+}
+
+fn push_styled_text(
+    source: &mut String,
+    text: &str,
+    style: crate::theme::RasterizedTableTextStyle,
+) {
+    let foreground = hex(style.foreground.rgb);
+    let weight = if style.bold { "bold" } else { "regular" };
+    let font_style = if style.italic { "italic" } else { "normal" };
+    source.push_str("#box[");
+    if style.underline {
+        source.push_str("#underline[");
+    }
+    if style.strikethrough {
+        source.push_str("#strike[");
+    }
+    source.push_str(&format!(
+        "#text(fill: rgb(\"{foreground}\"), weight: \"{weight}\", style: \"{font_style}\", \"{}\")",
+        escape_typst_string(text)
+    ));
+    if style.strikethrough {
+        source.push(']');
+    }
+    if style.underline {
+        source.push(']');
+    }
+    source.push(']');
+}
+
+fn content_width_pixels_themed(
+    column_cells: usize,
+    cell_pixels: PixelSize,
+    style: &RasterizedTable,
+) -> f32 {
+    let inset_pixels = style.horizontal_inset_points * 2.0 * 96.0 / 72.0;
     (column_cells.saturating_mul(cell_pixels.width.max(1) as usize) as f32 - inset_pixels).max(1.0)
 }
 
-fn wrap_text(text: &str, width_pixels: f32) -> Result<Vec<String>, String> {
+fn wrap_text_themed(
+    text: &str,
+    width_pixels: f32,
+    style: &RasterizedTable,
+) -> Result<Vec<String>, String> {
     let font = table_font()?;
-    let font_pixels = TABLE_FONT_POINTS * 96.0 / 72.0;
+    let font_pixels = style.font_points * 96.0 / 72.0;
     let mut lines = vec![String::new()];
     let mut used = 0.0_f32;
     let mut previous = None;
@@ -392,6 +528,59 @@ fn wrap_text(text: &str, width_pixels: f32) -> Result<Vec<String>, String> {
         previous = Some(character);
     }
     Ok(lines)
+}
+
+#[cfg(test)]
+fn content_width_pixels(column_cells: usize, cell_pixels: PixelSize) -> f32 {
+    let theme = crate::theme::Theme::builtin_dark();
+    content_width_pixels_themed(
+        column_cells,
+        cell_pixels,
+        theme
+            .document
+            .table
+            .rasterized()
+            .expect("built-in table should be rasterized"),
+    )
+}
+
+#[cfg(test)]
+fn wrap_text(text: &str, width_pixels: f32) -> Result<Vec<String>, String> {
+    let theme = crate::theme::Theme::builtin_dark();
+    wrap_text_themed(
+        text,
+        width_pixels,
+        theme
+            .document
+            .table
+            .rasterized()
+            .expect("built-in table should be rasterized"),
+    )
+}
+
+#[cfg(test)]
+fn typst_source(
+    table: &TableElement,
+    widths: &[usize],
+    target_width: u32,
+    cell_pixels: PixelSize,
+) -> Result<String, String> {
+    let theme = crate::theme::Theme::builtin_dark();
+    typst_source_themed(
+        table,
+        widths,
+        target_width,
+        cell_pixels,
+        theme
+            .document
+            .table
+            .rasterized()
+            .expect("built-in table should be rasterized"),
+    )
+}
+
+fn hex(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
 }
 
 fn escape_typst_string(text: &str) -> String {
@@ -474,6 +663,49 @@ mod tests {
         assert!(plan.source.contains("else { none }"));
         plan.render(PixelSize::FALLBACK)
             .expect("booktabs-style rules should compile and render");
+    }
+
+    #[test]
+    fn rasterized_header_style_is_independent_and_renderable() {
+        let overrides = toml::from_str::<crate::theme::ThemeSettings>(
+            r##"
+[styles.document.table]
+renderer = "rasterized"
+
+[styles.document.table.rasterized.header]
+foreground = "#123456"
+background = "#654321"
+bold = false
+italic = true
+underline = true
+strikethrough = true
+"##,
+        )
+        .expect("table header override should parse");
+        let theme = crate::theme::resolve("builtin:dark", &overrides, None, None)
+            .expect("table header override should resolve");
+        let style = theme
+            .document
+            .table
+            .rasterized()
+            .expect("table should remain rasterized");
+        let plan = TablePlan::build_themed(
+            0,
+            &table("text"),
+            40,
+            PixelSize::FALLBACK,
+            style,
+            theme.identity,
+        )
+        .expect("styled table should plan");
+
+        assert!(plan.source.contains("fill: rgb(\"#123456\")"));
+        assert!(plan.source.contains("rgb(\"#654321\")"));
+        assert!(plan.source.contains("weight: \"regular\""));
+        assert!(plan.source.contains("style: \"italic\""));
+        assert!(plan.source.contains("#underline[#strike["));
+        plan.render(PixelSize::FALLBACK)
+            .expect("configured header style should compile and render");
     }
 
     #[test]
