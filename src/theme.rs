@@ -729,6 +729,14 @@ impl Theme {
             .expect("built-in dark Theme must remain valid")
     }
 
+    pub(crate) fn uses_rasterization(&self) -> bool {
+        (1..=6).any(|level| self.document.headings.level(level).rasterized().is_some())
+            || self.document.table.rasterized().is_some()
+            || self.document.math.inline.rasterized().is_some()
+            || self.document.math.display.rasterized().is_some()
+            || self.document.image.rasterized().is_some()
+    }
+
     fn from_settings(name: &str, theme: &ThemeSettings) -> Result<Self> {
         let palette = Palette::from_settings(&theme.palette)?;
         let app = AppTheme {
@@ -2132,6 +2140,8 @@ mod tests {
         assert!(matches!(plain.document.table, TableStyle::Text(_)));
         assert!(matches!(plain.document.math.display, MathStyle::Text(_)));
         assert!(matches!(plain.document.image, ImageStyle::Text(_)));
+        assert!(dark.uses_rasterization());
+        assert!(!plain.uses_rasterization());
     }
 
     #[test]

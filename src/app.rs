@@ -97,8 +97,13 @@ impl App {
 
     pub(crate) fn clamp_viewport(&mut self, layout: &Layout, viewport_height: u16) {
         let rows = layout.rows();
-        let (row, offset) = self.viewport_position(layout);
-        self.set_position(rows, clamp_position(rows, row, offset, viewport_height));
+        let position = self.viewport_position(layout);
+        let clamped = clamp_position(rows, position.0, position.1, viewport_height);
+        if clamped == position {
+            self.top_row_offset = position.1;
+        } else {
+            self.set_position(rows, clamped);
+        }
     }
 
     fn set_position(&mut self, rows: &[crate::LayoutRow], (row, offset): (usize, u16)) {

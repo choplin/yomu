@@ -1,0 +1,28 @@
+theme = "builtin:dark"
+
+[view]
+max_width = 100
+
+[theme_overrides.styles.document.heading.h1]
+renderer = "rasterized"
+
+[theme_overrides.styles.document.heading.h1.rasterized]
+font_families = [
+  "UDEV Gothic NF",
+  "HackGen35 Console NF",
+  "Broot Icons Visual Studio Code",
+  "SF Pro",
+  "DejaVu Sans",
+]
+
+[theme_overrides.styles.document.heading.h2]
+renderer = "rasterized"
+
+[theme_overrides.styles.document.heading.h2.rasterized]
+font_families = [
+  "UDEV Gothic NF",
+  "HackGen35 Console NF",
+  "Broot Icons Visual Studio Code",
+  "SF Pro",
+  "DejaVu Sans",
+]

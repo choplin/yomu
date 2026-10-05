@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::hash::Hash;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -366,16 +367,83 @@ struct CacheEntry {
 }
 
 #[derive(Debug)]
+enum RasterState {
+    Pending,
+    Ready(RasterAssetKey),
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ImageRasterIdentity([u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HeadingRasterIdentity([u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TableRasterIdentity([u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MathRasterIdentity([u8; 32]);
+
+#[derive(Debug)]
+enum RasterLookup {
+    Missing,
+    Pending,
+    Ready(Arc<RasterAsset>),
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct HeadingFontEntry {
+    fonts: HeadingFonts,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
 pub struct RasterCache {
     entries: HashMap<RasterAssetKey, CacheEntry>,
-    heading_keys: HashMap<[u8; 32], RasterAssetKey>,
-    table_keys: HashMap<[u8; 32], RasterAssetKey>,
-    math_keys: HashMap<[u8; 32], RasterAssetKey>,
-    failures: HashMap<[u8; 32], String>,
+    images: HashMap<ImageRasterIdentity, RasterState>,
+    headings: HashMap<HeadingRasterIdentity, RasterState>,
+    tables: HashMap<TableRasterIdentity, RasterState>,
+    maths: HashMap<MathRasterIdentity, RasterState>,
+    image_decode_failures: HashMap<[u8; 32], String>,
     capacity: usize,
     used: usize,
     clock: u64,
-    heading_fonts: Vec<HeadingFonts>,
+    heading_fonts: HashMap<Vec<String>, HeadingFontEntry>,
+}
+
+fn lookup_raster<K>(
+    states: &mut HashMap<K, RasterState>,
+    entries: &mut HashMap<RasterAssetKey, CacheEntry>,
+    identity: K,
+    clock: u64,
+) -> RasterLookup
+where
+    K: Copy + Eq + Hash,
+{
+    match states.get(&identity) {
+        None => RasterLookup::Missing,
+        Some(RasterState::Pending) => RasterLookup::Pending,
+        Some(RasterState::Failed(error)) => RasterLookup::Failed(error.clone()),
+        Some(RasterState::Ready(key)) => {
+            let key = *key;
+            if let Some(entry) = entries.get_mut(&key) {
+                entry.last_used = clock;
+                RasterLookup::Ready(Arc::clone(&entry.asset))
+            } else {
+                states.remove(&identity);
+                RasterLookup::Missing
+            }
+        }
+    }
+}
+
+fn remove_raster_state_for_asset<K>(states: &mut HashMap<K, RasterState>, key: RasterAssetKey)
+where
+    K: Eq + Hash,
+{
+    states.retain(|_, state| !matches!(state, RasterState::Ready(mapped) if *mapped == key));
 }
 
 impl Default for RasterCache {
@@ -387,25 +455,54 @@ impl Default for RasterCache {
 impl RasterCache {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        Self::new_with_heading_fonts(capacity, (0..6).map(|_| HeadingFonts::default()).collect())
-    }
-
-    pub(crate) fn with_heading_fonts(heading_fonts: Vec<HeadingFonts>) -> Self {
-        Self::new_with_heading_fonts(DEFAULT_CACHE_BYTES, heading_fonts)
-    }
-
-    fn new_with_heading_fonts(capacity: usize, heading_fonts: Vec<HeadingFonts>) -> Self {
+        let mut heading_fonts = HashMap::new();
+        heading_fonts.insert(
+            Vec::new(),
+            HeadingFontEntry {
+                fonts: HeadingFonts::default(),
+                error: None,
+            },
+        );
         Self {
             entries: HashMap::new(),
-            heading_keys: HashMap::new(),
-            table_keys: HashMap::new(),
-            math_keys: HashMap::new(),
-            failures: HashMap::new(),
+            images: HashMap::new(),
+            headings: HashMap::new(),
+            tables: HashMap::new(),
+            maths: HashMap::new(),
+            image_decode_failures: HashMap::new(),
             capacity,
             used: 0,
             clock: 0,
             heading_fonts,
         }
+    }
+
+    fn ensure_heading_fonts(&mut self, families: &[String]) {
+        if self.heading_fonts.contains_key(families) {
+            return;
+        }
+        let (fonts, error) = match HeadingFonts::load(families) {
+            Ok(fonts) => (fonts, None),
+            Err(error) => (HeadingFonts::default(), Some(error)),
+        };
+        self.heading_fonts
+            .insert(families.to_vec(), HeadingFontEntry { fonts, error });
+    }
+
+    pub(crate) fn heading_font_diagnostic(&self) -> Option<String> {
+        let mut errors = self
+            .heading_fonts
+            .values()
+            .filter_map(|entry| entry.error.clone())
+            .collect::<Vec<_>>();
+        errors.sort();
+        errors.dedup();
+        (!errors.is_empty()).then(|| {
+            format!(
+                "configured heading fonts unavailable ({}); using embedded Noto Sans JP",
+                errors.join("; ")
+            )
+        })
     }
 
     pub(crate) fn rasterize_themed(
@@ -446,19 +543,30 @@ impl RasterCache {
             rasterizer_version: RASTERIZER_VERSION,
         };
         let (columns, rows) = aligned_cells(canvas_size, cell_pixels)?;
+        let identity = ImageRasterIdentity(key.content_hash);
         self.clock = self.clock.saturating_add(1);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_used = self.clock;
-            return Ok(Some((Arc::clone(&entry.asset), columns, rows)));
+        match lookup_raster(&mut self.images, &mut self.entries, identity, self.clock) {
+            RasterLookup::Ready(asset) => return Ok(Some((asset, columns, rows))),
+            RasterLookup::Failed(error) => return Err(error),
+            RasterLookup::Pending => return Ok(None),
+            RasterLookup::Missing => {
+                self.images.insert(identity, RasterState::Pending);
+            }
         }
 
-        if let Some(error) = self.failures.get(&recipe.content_hash) {
-            return Err(error.clone());
+        if let Some(error) = self.image_decode_failures.get(&recipe.content_hash) {
+            let error = error.clone();
+            self.images
+                .insert(identity, RasterState::Failed(error.clone()));
+            return Err(error);
         }
         let source = match decode_image(&recipe.path, MAX_DECODED_BYTES) {
             Ok(source) => source,
             Err(error) => {
-                self.failures.insert(recipe.content_hash, error.clone());
+                self.image_decode_failures
+                    .insert(recipe.content_hash, error.clone());
+                self.images
+                    .insert(identity, RasterState::Failed(error.clone()));
                 return Err(error);
             }
         };
@@ -482,6 +590,7 @@ impl RasterCache {
                 last_used: self.clock,
             },
         );
+        self.images.insert(identity, RasterState::Ready(key));
         self.used = self.used.saturating_add(bytes);
         Ok(Some((asset, columns, rows)))
     }
@@ -506,39 +615,42 @@ impl RasterCache {
         theme_identity: [u8; 32],
     ) -> Result<Option<HeadingRaster>, String> {
         let (available_columns, available_rows) = available;
-        let fonts = self
+        self.ensure_heading_fonts(&style.font_families);
+        let fonts = &self
             .heading_fonts
-            .get(usize::from(heading.level.clamp(1, 6) - 1))
-            .ok_or_else(|| "heading font set is unavailable".to_owned())?;
-        let identity = HeadingPlan::cache_identity_with_fonts(
+            .get(&style.font_families)
+            .ok_or_else(|| "heading font set is unavailable".to_owned())?
+            .fonts;
+        let identity = HeadingRasterIdentity(HeadingPlan::cache_identity_with_fonts(
             heading,
             available_columns,
             cell_pixels,
             fonts,
             style,
             theme_identity,
-        )?;
+        )?);
         self.clock = self.clock.saturating_add(1);
-        if let Some(key) = self.heading_keys.get(&identity).copied()
-            && let Some(entry) = self.entries.get_mut(&key)
-        {
-            let (columns, rows) = aligned_cells(key.pixels, cell_pixels)?;
-            if rows > available_rows.max(1) {
-                return Err(format!(
-                    "heading needs {rows} terminal rows but viewport has {}",
-                    available_rows.max(1)
-                ));
+        match lookup_raster(&mut self.headings, &mut self.entries, identity, self.clock) {
+            RasterLookup::Ready(asset) => {
+                let (columns, rows) = aligned_cells(asset.key.pixels, cell_pixels)?;
+                if rows > available_rows.max(1) {
+                    return Err(format!(
+                        "heading needs {rows} terminal rows but viewport has {}",
+                        available_rows.max(1)
+                    ));
+                }
+                return Ok(Some(HeadingRaster {
+                    asset,
+                    element_key: HeadingPlan::element_key(index),
+                    columns,
+                    rows,
+                }));
             }
-            entry.last_used = self.clock;
-            return Ok(Some(HeadingRaster {
-                asset: Arc::clone(&entry.asset),
-                element_key: HeadingPlan::element_key(index),
-                columns,
-                rows,
-            }));
-        }
-        if let Some(error) = self.failures.get(&identity) {
-            return Err(error.clone());
+            RasterLookup::Failed(error) => return Err(error),
+            RasterLookup::Pending => return Ok(None),
+            RasterLookup::Missing => {
+                self.headings.insert(identity, RasterState::Pending);
+            }
         }
         let plan = match HeadingPlan::build_with_fonts(
             index,
@@ -551,11 +663,19 @@ impl RasterCache {
         ) {
             Ok(plan) => plan,
             Err(error) => {
-                self.failures.insert(identity, error.clone());
+                self.headings
+                    .insert(identity, RasterState::Failed(error.clone()));
                 return Err(error);
             }
         };
-        let (columns, rows) = aligned_cells(plan.key.pixels, cell_pixels)?;
+        let (columns, rows) = match aligned_cells(plan.key.pixels, cell_pixels) {
+            Ok(cells) => cells,
+            Err(error) => {
+                self.headings
+                    .insert(identity, RasterState::Failed(error.clone()));
+                return Err(error);
+            }
+        };
         debug_assert_eq!((plan.columns, plan.rows), (columns, rows));
         if rows > available_rows.max(1) {
             let error = format!(
@@ -563,22 +683,28 @@ impl RasterCache {
                 rows,
                 available_rows.max(1)
             );
+            self.headings
+                .insert(identity, RasterState::Failed(error.clone()));
             return Err(error);
         }
         let rendered = match plan.render_with_fonts(fonts) {
             Ok(rendered) => rendered,
             Err(error) => {
-                self.failures.insert(plan.key.content_hash, error.clone());
+                self.headings
+                    .insert(identity, RasterState::Failed(error.clone()));
                 return Err(error);
             }
         };
         let rgba: Arc<[u8]> = Arc::from(rendered.into_raw());
         let bytes = rgba.len();
         if bytes > self.capacity {
-            return Err(format!(
+            let error = format!(
                 "heading raster needs {bytes} bytes but cache capacity is {} bytes",
                 self.capacity
-            ));
+            );
+            self.headings
+                .insert(identity, RasterState::Failed(error.clone()));
+            return Err(error);
         }
         self.evict_for(bytes);
         let asset = Arc::new(RasterAsset {
@@ -593,7 +719,7 @@ impl RasterCache {
                 last_used: self.clock,
             },
         );
-        self.heading_keys.insert(identity, plan.key);
+        self.headings.insert(identity, RasterState::Ready(plan.key));
         self.used = self.used.saturating_add(bytes);
         Ok(Some(HeadingRaster {
             asset,
@@ -638,28 +764,29 @@ impl RasterCache {
         style: &RasterizedTable,
         theme_identity: [u8; 32],
     ) -> Result<Option<TableRaster>, String> {
-        let identity = TablePlan::cache_identity_themed(
+        let identity = TableRasterIdentity(TablePlan::cache_identity_themed(
             table,
             available_columns,
             cell_pixels,
             style,
             theme_identity,
-        );
+        ));
         self.clock = self.clock.saturating_add(1);
-        if let Some(key) = self.table_keys.get(&identity).copied()
-            && let Some(entry) = self.entries.get_mut(&key)
-        {
-            entry.last_used = self.clock;
-            let (columns, rows) = aligned_cells(key.pixels, cell_pixels)?;
-            return Ok(Some(TableRaster {
-                asset: Arc::clone(&entry.asset),
-                element_key: TablePlan::element_key(index),
-                columns,
-                rows,
-            }));
-        }
-        if let Some(error) = self.failures.get(&identity) {
-            return Err(error.clone());
+        match lookup_raster(&mut self.tables, &mut self.entries, identity, self.clock) {
+            RasterLookup::Ready(asset) => {
+                let (columns, rows) = aligned_cells(asset.key.pixels, cell_pixels)?;
+                return Ok(Some(TableRaster {
+                    asset,
+                    element_key: TablePlan::element_key(index),
+                    columns,
+                    rows,
+                }));
+            }
+            RasterLookup::Failed(error) => return Err(error),
+            RasterLookup::Pending => return Ok(None),
+            RasterLookup::Missing => {
+                self.tables.insert(identity, RasterState::Pending);
+            }
         }
         let plan = match TablePlan::build_themed(
             index,
@@ -671,26 +798,38 @@ impl RasterCache {
         ) {
             Ok(plan) => plan,
             Err(error) => {
-                self.failures.insert(identity, error.clone());
+                self.tables
+                    .insert(identity, RasterState::Failed(error.clone()));
                 return Err(error);
             }
         };
         let (plan, rendered) = match plan.render(cell_pixels) {
             Ok(rendered) => rendered,
             Err(error) => {
-                self.failures.insert(identity, error.clone());
+                self.tables
+                    .insert(identity, RasterState::Failed(error.clone()));
                 return Err(error);
             }
         };
-        let (columns, rows) = aligned_cells(plan.key.pixels, cell_pixels)?;
+        let (columns, rows) = match aligned_cells(plan.key.pixels, cell_pixels) {
+            Ok(cells) => cells,
+            Err(error) => {
+                self.tables
+                    .insert(identity, RasterState::Failed(error.clone()));
+                return Err(error);
+            }
+        };
         debug_assert_eq!((plan.columns, plan.rows), (columns, rows));
         let rgba: Arc<[u8]> = Arc::from(rendered.into_raw());
         let bytes = rgba.len();
         if bytes > self.capacity {
-            return Err(format!(
+            let error = format!(
                 "table raster needs {bytes} bytes but cache capacity is {} bytes",
                 self.capacity
-            ));
+            );
+            self.tables
+                .insert(identity, RasterState::Failed(error.clone()));
+            return Err(error);
         }
         self.evict_for(bytes);
         let asset = Arc::new(RasterAsset {
@@ -708,7 +847,7 @@ impl RasterCache {
         if let Some(replaced) = replaced {
             self.used = self.used.saturating_sub(replaced.bytes);
         }
-        self.table_keys.insert(identity, plan.key);
+        self.tables.insert(identity, RasterState::Ready(plan.key));
         self.used = self.used.saturating_add(bytes);
         Ok(Some(TableRaster {
             asset,
@@ -751,29 +890,30 @@ impl RasterCache {
         theme_identity: [u8; 32],
     ) -> Result<Option<MathRaster>, String> {
         let (available_columns, available_rows) = available;
-        let identity = MathPlan::cache_identity_themed(
+        let identity = MathRasterIdentity(MathPlan::cache_identity_themed(
             math,
             available_columns,
             available_rows,
             cell_pixels,
             style,
             theme_identity,
-        );
+        ));
         self.clock = self.clock.saturating_add(1);
-        if let Some(key) = self.math_keys.get(&identity).copied()
-            && let Some(entry) = self.entries.get_mut(&key)
-        {
-            entry.last_used = self.clock;
-            let (columns, rows) = aligned_cells(key.pixels, cell_pixels)?;
-            return Ok(Some(MathRaster {
-                asset: Arc::clone(&entry.asset),
-                element_key: MathPlan::element_key(index),
-                columns,
-                rows,
-            }));
-        }
-        if let Some(error) = self.failures.get(&identity) {
-            return Err(error.clone());
+        match lookup_raster(&mut self.maths, &mut self.entries, identity, self.clock) {
+            RasterLookup::Ready(asset) => {
+                let (columns, rows) = aligned_cells(asset.key.pixels, cell_pixels)?;
+                return Ok(Some(MathRaster {
+                    asset,
+                    element_key: MathPlan::element_key(index),
+                    columns,
+                    rows,
+                }));
+            }
+            RasterLookup::Failed(error) => return Err(error),
+            RasterLookup::Pending => return Ok(None),
+            RasterLookup::Missing => {
+                self.maths.insert(identity, RasterState::Pending);
+            }
         }
         let plan = match MathPlan::build_themed(
             index,
@@ -786,26 +926,38 @@ impl RasterCache {
         ) {
             Ok(plan) => plan,
             Err(error) => {
-                self.failures.insert(identity, error.clone());
+                self.maths
+                    .insert(identity, RasterState::Failed(error.clone()));
                 return Err(error);
             }
         };
         let (plan, rendered) = match plan.render(cell_pixels) {
             Ok(rendered) => rendered,
             Err(error) => {
-                self.failures.insert(identity, error.clone());
+                self.maths
+                    .insert(identity, RasterState::Failed(error.clone()));
                 return Err(error);
             }
         };
-        let (columns, rows) = aligned_cells(plan.key.pixels, cell_pixels)?;
+        let (columns, rows) = match aligned_cells(plan.key.pixels, cell_pixels) {
+            Ok(cells) => cells,
+            Err(error) => {
+                self.maths
+                    .insert(identity, RasterState::Failed(error.clone()));
+                return Err(error);
+            }
+        };
         debug_assert_eq!((plan.columns, plan.rows), (columns, rows));
         let rgba: Arc<[u8]> = Arc::from(rendered.into_raw());
         let bytes = rgba.len();
         if bytes > self.capacity {
-            return Err(format!(
+            let error = format!(
                 "math raster needs {bytes} bytes but cache capacity is {} bytes",
                 self.capacity
-            ));
+            );
+            self.maths
+                .insert(identity, RasterState::Failed(error.clone()));
+            return Err(error);
         }
         self.evict_for(bytes);
         let asset = Arc::new(RasterAsset {
@@ -823,7 +975,7 @@ impl RasterCache {
         if let Some(replaced) = replaced {
             self.used = self.used.saturating_sub(replaced.bytes);
         }
-        self.math_keys.insert(identity, plan.key);
+        self.maths.insert(identity, RasterState::Ready(plan.key));
         self.used = self.used.saturating_add(bytes);
         Ok(Some(MathRaster {
             asset,
@@ -872,15 +1024,26 @@ impl RasterCache {
             if let Some(entry) = self.entries.remove(&key) {
                 self.used = self.used.saturating_sub(entry.bytes);
             }
-            self.heading_keys.retain(|_, mapped| *mapped != key);
-            self.table_keys.retain(|_, mapped| *mapped != key);
-            self.math_keys.retain(|_, mapped| *mapped != key);
+            remove_raster_state_for_asset(&mut self.images, key);
+            remove_raster_state_for_asset(&mut self.headings, key);
+            remove_raster_state_for_asset(&mut self.tables, key);
+            remove_raster_state_for_asset(&mut self.maths, key);
         }
     }
 
     #[cfg(test)]
     fn contains(&self, key: RasterAssetKey) -> bool {
         self.entries.contains_key(&key)
+    }
+
+    #[cfg(test)]
+    fn image_decode_failure_count(&self) -> usize {
+        self.image_decode_failures.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_loaded_heading_fonts(&self, families: &[String]) -> bool {
+        self.heading_fonts.contains_key(families)
     }
 }
 
@@ -1450,7 +1613,7 @@ mod tests {
             .rasterize(&prepared, (2, 1), cell)
             .expect_err("decode failure should remain cached without reopening the file");
         assert_eq!(cached_error, first_error);
-        assert_eq!(cache.failures.len(), 1);
+        assert_eq!(cache.image_decode_failure_count(), 1);
         fs::remove_dir(root).expect("fixture directory should be removable");
     }
 
@@ -1490,5 +1653,35 @@ mod tests {
         assert_ne!(second.asset.key, first.asset.key);
         assert_eq!(cache.entries.len(), 2);
         assert_eq!(cache.used, first.asset.rgba.len() + second.asset.rgba.len());
+    }
+
+    #[test]
+    fn configured_heading_fonts_load_lazily_and_fall_back_to_embedded_font() {
+        let document = Document::parse("# 漆 Heading".to_owned());
+        let heading = &document.headings()[0];
+        let mut theme = crate::theme::Theme::builtin_dark();
+        let crate::theme::HeadingStyle::Rasterized(style) = &mut theme.document.headings.h1 else {
+            panic!("built-in H1 should be rasterized");
+        };
+        style.font_families = vec!["Raden Test Font That Does Not Exist 8E31A2".to_owned()];
+        let mut cache = RasterCache::default();
+        let cell = PixelSize {
+            width: 8,
+            height: 16,
+        };
+
+        assert!(!cache.has_loaded_heading_fonts(&style.font_families));
+        let rendered = cache
+            .rasterize_heading_themed(0, heading, (40, 20), cell, style, theme.identity)
+            .expect("embedded fallback should rasterize")
+            .expect("heading raster should exist");
+        let diagnostic = cache
+            .heading_font_diagnostic()
+            .expect("missing configured font should produce a fallback diagnostic");
+
+        assert!(cache.has_loaded_heading_fonts(&style.font_families));
+        assert!(diagnostic.contains("using embedded Noto Sans JP"));
+        assert!(rendered.rows > 0);
+        assert_eq!(cache.heading_font_diagnostic(), Some(diagnostic));
     }
 }

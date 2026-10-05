@@ -3234,9 +3234,9 @@ dependencies = [
 
 [[package]]
 name = "urushi"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e1cdc045a6ef6c403956f285a56ceef9649f0d484c54ba77fd2244e58c2de52"
+checksum = "6c5ae756f4f3e00d75b8f312c92b50f0a8b2d9c25bee5402431a1f549174b08d"
 dependencies = [
  "unicode-segmentation",
  "unicode-width",
@@ -3246,9 +3246,9 @@ dependencies = [
 
 [[package]]
 name = "urushi-derive"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "358c037f9b816c6470f84807b8b9cd2964c7040b4c334191336d0729ead552c9"
+checksum = "da7df75ac740af1f42e622b84171b9aeef4801e175460b826a23f65e68c5596d"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3258,9 +3258,9 @@ dependencies = [
 
 [[package]]
 name = "urushi-graphics"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7702df49221001541578822a596978f39b9ff696d7015a07e8da00ceaaafec"
+checksum = "e92c17848e821cff3a60f3d339113d3d9e046dc14701b032e2126b141c460c70"
 dependencies = [
  "base64",
  "icy_sixel",
@@ -3270,9 +3270,9 @@ dependencies = [
 
 [[package]]
 name = "urushi-terminal"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff160c7938f29469f78d06a47e10e76ef71952bf2c48be8721ee29a47d049b10"
+checksum = "a1acb808ad06593bab1e9cd7ff3be7395342413faa92a5b78842d5121e9719a5"
 dependencies = [
  "libc",
  "terminal_size",
@@ -3280,9 +3280,9 @@ dependencies = [
 
 [[package]]
 name = "urushi-tui"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec5e5bea57331de7bf23a5745cf37af29d426feaf3a7fb296e1986471e4bb28"
+checksum = "f38e56599784bec99245637373e43828fbbb77bf4adc101462128e2e569711f5"
 dependencies = [
  "compact_str",
  "unicode-width",
@@ -3292,9 +3292,9 @@ dependencies = [
 
 [[package]]
 name = "urushi-tui-app"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c733596115403ab9327cc40d918d5d444054bc765ff61c16cc0fec495d432b0"
+checksum = "cd9f449415a076fa9305dadb1f70b260ef3516d040f115828f2a264b9bf2f8f2"
 dependencies = [
  "futures-core",
  "libc",

@@ -24,7 +24,7 @@ typst-as-lib = "=0.16.0"
 typst-assets = { version = "=0.15.1", features = ["fonts"] }
 typst-svg = "=0.15.0"
 unicode-width = "0.2"
-urushi = "0.1.0"
-urushi-graphics = "0.1.0"
-urushi-terminal = "0.1.0"
-urushi-tui-app = { version = "0.1.0", default-features = false, features = ["graphics"] }
+urushi = "0.1.1"
+urushi-graphics = "0.1.1"
+urushi-terminal = "0.1.1"
+urushi-tui-app = { version = "0.1.1", default-features = false, features = ["graphics"] }

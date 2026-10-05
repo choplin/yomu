@@ -260,6 +260,13 @@ The viewport is anchored to source byte positions rather than terminal cells,
 so resizing reflows the document while keeping the same logical content in
 view.
 
+## Startup performance
+
+The repository includes a repeatable PTY benchmark for measuring the first
+complete frame of the current release build. See
+[`benches/README.md`](benches/README.md) for its measurement contract and
+usage.
+
 ## Kitty graphics check
 
 Use a Markdown fixture with level-one or level-two headings, or one that
