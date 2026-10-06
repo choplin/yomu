@@ -614,13 +614,36 @@ impl RasterCache {
         style: &RasterizedHeading,
         theme_identity: [u8; 32],
     ) -> Result<Option<HeadingRaster>, String> {
-        let (available_columns, available_rows) = available;
         self.ensure_heading_fonts(&style.font_families);
-        let fonts = &self
+        let fonts = self
             .heading_fonts
             .get(&style.font_families)
             .ok_or_else(|| "heading font set is unavailable".to_owned())?
-            .fonts;
+            .fonts
+            .clone();
+        self.rasterize_heading_with_fonts(
+            index,
+            heading,
+            available,
+            cell_pixels,
+            style,
+            theme_identity,
+            &fonts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_heading_with_fonts(
+        &mut self,
+        index: usize,
+        heading: &HeadingElement,
+        available: (u16, u16),
+        cell_pixels: PixelSize,
+        style: &RasterizedHeading,
+        theme_identity: [u8; 32],
+        fonts: &HeadingFonts,
+    ) -> Result<Option<HeadingRaster>, String> {
+        let (available_columns, available_rows) = available;
         let identity = HeadingRasterIdentity(HeadingPlan::cache_identity_with_fonts(
             heading,
             available_columns,

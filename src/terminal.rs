@@ -11,7 +11,7 @@ use urushi_tui_app::{
 };
 
 use crate::image::ImageCatalog;
-use crate::layout::PreparedGraphics;
+use crate::layout::{GraphicsPreparationState, PreparedGraphics};
 use crate::{
     App, Command, Document, GraphicsPreference, Layout, PixelSize, RasterCache, config::Config, ui,
 };
@@ -38,14 +38,14 @@ pub(crate) fn run(
     let rasterize = preference != GraphicsPreference::Text && theme.uses_rasterization();
     let application = ReaderApplication {
         path: path.to_path_buf(),
-        document: document.clone(),
-        images: ImageCatalog::load(document, path),
+        document: Arc::new(document.clone()),
+        images: Arc::new(ImageCatalog::load(document, path)),
         raster_cache: Arc::new(Mutex::new(RasterCache::default())),
         latest_generation: Arc::new(AtomicU64::new(0)),
         max_width: config.body_max_width(),
         rasterize,
         graphics_label: preference_label(preference),
-        theme,
+        theme: Arc::new(theme),
     };
     Runtime::new(application)
         .backend(terminal)
@@ -60,14 +60,14 @@ pub(crate) fn run(
 
 struct ReaderApplication {
     path: PathBuf,
-    document: Document,
-    images: ImageCatalog,
+    document: Arc<Document>,
+    images: Arc<ImageCatalog>,
     raster_cache: Arc<Mutex<RasterCache>>,
     latest_generation: Arc<AtomicU64>,
     max_width: Option<u16>,
     rasterize: bool,
     graphics_label: &'static str,
-    theme: crate::theme::Theme,
+    theme: Arc<crate::theme::Theme>,
 }
 
 struct ReaderModel {
@@ -132,10 +132,7 @@ impl Application for ReaderApplication {
                 model.generation = model.generation.saturating_add(1);
                 self.prepare_graphics(model, body)
             }
-            Message::Prepared(prepared) => {
-                self.apply_prepared(model, prepared);
-                Effect::none()
-            }
+            Message::Prepared(prepared) => self.apply_prepared(model, prepared),
             Message::TerminalError(error) => {
                 model.terminal_diagnostic = Some(error.to_string());
                 Effect::none()
@@ -167,15 +164,34 @@ impl Application for ReaderApplication {
 }
 
 impl ReaderApplication {
-    fn apply_prepared(&self, model: &mut ReaderModel, prepared: Option<PreparedGraphicsResult>) {
+    fn apply_prepared(
+        &self,
+        model: &mut ReaderModel,
+        prepared: Option<PreparedGraphicsResult>,
+    ) -> Effect<Message> {
         let Some(prepared) = prepared.filter(|result| result.generation == model.generation) else {
-            return;
+            return Effect::none();
         };
-        model.prepared_graphics = Some(prepared.graphics);
+        model
+            .prepared_graphics
+            .get_or_insert_default()
+            .merge(prepared.graphics);
+        let complete = prepared.state.is_complete();
+        if complete {
+            model
+                .prepared_graphics
+                .get_or_insert_default()
+                .retain_targets(&prepared.state);
+        }
         model.graphics_diagnostic = prepared.diagnostic;
         let layout = self.layout(model);
         let body = ui::viewport_areas(model.surface.size, self.max_width)[1];
         model.app.clamp_viewport(&layout, body.height);
+        if complete {
+            Effect::none()
+        } else {
+            self.prepare_graphics_step(model, body, prepared.state)
+        }
     }
 
     fn layout(&self, model: &ReaderModel) -> Layout {
@@ -198,15 +214,59 @@ impl ReaderApplication {
         if !self.rasterize {
             return Effect::none();
         }
-        let document = self.document.clone();
-        let images = self.images.clone();
+        let document = Arc::clone(&self.document);
+        let images = Arc::clone(&self.images);
         let raster_cache = Arc::clone(&self.raster_cache);
         let latest_generation = Arc::clone(&self.latest_generation);
         let generation = model.generation;
         latest_generation.store(generation, Ordering::Release);
-        let cell_pixels = model.cell_pixels;
         let focus_source = model.app.top_source();
-        let theme = self.theme.clone();
+        let theme = Arc::clone(&self.theme);
+        let state = GraphicsPreparationState::new(&document, focus_source, &theme);
+        self.prepare_graphics_step_with_context(
+            model,
+            body,
+            document,
+            images,
+            raster_cache,
+            latest_generation,
+            theme,
+            state,
+        )
+    }
+
+    fn prepare_graphics_step(
+        &self,
+        model: &ReaderModel,
+        body: crate::CellRect,
+        state: GraphicsPreparationState,
+    ) -> Effect<Message> {
+        self.prepare_graphics_step_with_context(
+            model,
+            body,
+            Arc::clone(&self.document),
+            Arc::clone(&self.images),
+            Arc::clone(&self.raster_cache),
+            Arc::clone(&self.latest_generation),
+            Arc::clone(&self.theme),
+            state,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_graphics_step_with_context(
+        &self,
+        model: &ReaderModel,
+        body: crate::CellRect,
+        document: Arc<Document>,
+        images: Arc<ImageCatalog>,
+        raster_cache: Arc<Mutex<RasterCache>>,
+        latest_generation: Arc<AtomicU64>,
+        theme: Arc<crate::theme::Theme>,
+        state: GraphicsPreparationState,
+    ) -> Effect<Message> {
+        let generation = model.generation;
+        let cell_pixels = model.cell_pixels;
         Effect::perform_latest("raden-rasterize", move || {
             Message::Prepared(prepare_graphics_result(GraphicsPreparation {
                 document: &document,
@@ -217,8 +277,8 @@ impl ReaderApplication {
                 width: body.width,
                 height: body.height,
                 cell_pixels,
-                focus_source,
                 theme: &theme,
+                state,
             }))
         })
     }
@@ -251,10 +311,12 @@ impl ReaderApplication {
     }
 }
 
+#[derive(Clone)]
 struct PreparedGraphicsResult {
     generation: u64,
     graphics: PreparedGraphics,
     diagnostic: Option<String>,
+    state: GraphicsPreparationState,
 }
 
 struct GraphicsPreparation<'a> {
@@ -266,8 +328,8 @@ struct GraphicsPreparation<'a> {
     width: u16,
     height: u16,
     cell_pixels: PixelSize,
-    focus_source: usize,
     theme: &'a crate::theme::Theme,
+    state: GraphicsPreparationState,
 }
 
 fn prepare_graphics_result(request: GraphicsPreparation<'_>) -> Option<PreparedGraphicsResult> {
@@ -278,20 +340,26 @@ fn prepare_graphics_result(request: GraphicsPreparation<'_>) -> Option<PreparedG
     if request.latest_generation.load(Ordering::Acquire) != request.generation {
         return None;
     }
-    let graphics = PreparedGraphics::prepare(
+    let mut state = request.state;
+    let graphics = PreparedGraphics::prepare_next_while(
         request.document,
         (request.width, request.height),
         request.images,
         &mut cache,
         request.cell_pixels,
-        request.focus_source,
         request.theme,
+        &mut state,
+        || request.latest_generation.load(Ordering::Acquire) == request.generation,
     );
+    if request.latest_generation.load(Ordering::Acquire) != request.generation {
+        return None;
+    }
     let diagnostic = cache.heading_font_diagnostic();
     Some(PreparedGraphicsResult {
         generation: request.generation,
         graphics,
         diagnostic,
+        state,
     })
 }
 
@@ -336,14 +404,14 @@ mod tests {
         let raster_cache = Arc::new(Mutex::new(RasterCache::default()));
         ReaderApplication {
             path: PathBuf::from("document.md"),
-            images: ImageCatalog::load(&document, Path::new("document.md")),
-            document,
+            images: Arc::new(ImageCatalog::load(&document, Path::new("document.md"))),
+            document: Arc::new(document),
             raster_cache,
             latest_generation: Arc::new(AtomicU64::new(0)),
             max_width: Some(80),
             rasterize,
             graphics_label: preference_label(preference),
-            theme,
+            theme: Arc::new(theme),
         }
     }
 
@@ -370,6 +438,40 @@ mod tests {
         assert!(model.prepared_graphics.is_none());
         assert!(layout.graphics.is_empty());
         assert_eq!(model.app.top_source(), 0);
+    }
+
+    #[test]
+    fn navigation_keeps_existing_graphics_until_replacements_arrive() {
+        let application = application(
+            "# Heading\n\nfirst paragraph\n\nsecond paragraph\n\nthird paragraph",
+            GraphicsPreference::Auto,
+        );
+        let (mut model, _) = application.init();
+        model.surface = Surface::new(40, 10);
+        model.cell_pixels = PixelSize {
+            width: 8,
+            height: 16,
+        };
+        let body = ui::viewport_areas(model.surface.size, application.max_width)[1];
+        let graphics = PreparedGraphics::prepare(
+            &application.document,
+            (body.width, body.height),
+            &application.images,
+            &mut RasterCache::default(),
+            model.cell_pixels,
+            model.app.top_source(),
+            &application.theme,
+        );
+        model.prepared_graphics = Some(graphics);
+        assert!(!application.layout(&model).graphics.is_empty());
+
+        let _ = application.update(
+            &mut model,
+            Message::Input(Input::Key(urushi_tui_app::KeyEvent::new(KeyCode::Down))),
+        );
+
+        assert!(model.prepared_graphics.is_some());
+        assert!(!application.layout(&model).graphics.is_empty());
     }
 
     #[test]
@@ -400,6 +502,7 @@ mod tests {
                 generation: 1,
                 graphics: PreparedGraphics::default(),
                 diagnostic: Some("stale".to_owned()),
+                state: GraphicsPreparationState::new(&application.document, 0, &application.theme),
             }),
         );
 
@@ -421,7 +524,12 @@ mod tests {
         let body = ui::viewport_areas(model.surface.size, application.max_width)[1];
 
         assert!(application.layout(&model).graphics.is_empty());
-        let prepared = prepare_graphics_result(GraphicsPreparation {
+        let state = GraphicsPreparationState::new(
+            &application.document,
+            model.app.top_source(),
+            &application.theme,
+        );
+        let first = prepare_graphics_result(GraphicsPreparation {
             document: &application.document,
             images: &application.images,
             raster_cache: &application.raster_cache,
@@ -430,10 +538,12 @@ mod tests {
             width: body.width,
             height: body.height,
             cell_pixels: model.cell_pixels,
-            focus_source: model.app.top_source(),
             theme: &application.theme,
-        });
-        application.apply_prepared(&mut model, prepared);
+            state,
+        })
+        .expect("current generation should produce a heading");
+        assert!(first.state.is_complete());
+        let _ = application.apply_prepared(&mut model, Some(first));
 
         assert!(!application.layout(&model).graphics.is_empty());
         assert!(
@@ -465,22 +575,28 @@ mod tests {
         assert!(anchor < application.document.headings()[0].source.end);
         let body = ui::viewport_areas(model.surface.size, application.max_width)[1];
         let mut cache = RasterCache::default();
-        let graphics = PreparedGraphics::prepare(
-            &application.document,
-            (body.width, body.height),
-            &application.images,
-            &mut cache,
-            model.cell_pixels,
-            anchor,
-            &application.theme,
-        );
+        let mut state =
+            GraphicsPreparationState::new(&application.document, anchor, &application.theme);
+        let mut graphics = PreparedGraphics::default();
+        while !state.is_complete() {
+            graphics.merge(PreparedGraphics::prepare_next(
+                &application.document,
+                (body.width, body.height),
+                &application.images,
+                &mut cache,
+                model.cell_pixels,
+                &application.theme,
+                &mut state,
+            ));
+        }
 
-        application.apply_prepared(
+        let _ = application.apply_prepared(
             &mut model,
             Some(PreparedGraphicsResult {
                 generation: 1,
                 graphics,
                 diagnostic: None,
+                state,
             }),
         );
 

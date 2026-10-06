@@ -11,6 +11,7 @@ use crate::{ElementKey, MathForm, PixelSize, RasterAsset, RasterCache, SourceSpa
 
 const MAX_RASTERIZED_HEADINGS: usize = 8;
 const MAX_LAYOUT_HEADING_BYTES: usize = 32 * 1024 * 1024;
+const PROGRESSIVE_GRAPHICS_TASKS: usize = 3;
 const MAX_RASTERIZED_TABLES: usize = 4;
 const MAX_LAYOUT_TABLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LAYOUT_MATH_BYTES: usize = 32 * 1024 * 1024;
@@ -61,6 +62,24 @@ pub(crate) struct PreparedGraphics {
     failures: HashMap<ElementKey, String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PreparationTask {
+    Image(usize),
+    Heading(usize),
+    Table(usize),
+    Math(usize),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GraphicsPreparationState {
+    tasks: Vec<PreparationTask>,
+    next: usize,
+    heading_bytes: usize,
+    heading_asset_bytes: HashMap<ElementKey, usize>,
+    table_bytes: usize,
+    math_bytes: usize,
+}
+
 /// Width-dependent terminal layout derived from a source-ranged document.
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -70,6 +89,7 @@ pub struct Layout {
 }
 
 impl PreparedGraphics {
+    #[cfg(test)]
     pub(crate) fn prepare(
         document: &Document,
         viewport: (u16, u16),
@@ -79,33 +99,80 @@ impl PreparedGraphics {
         focus_source: usize,
         theme: &Theme,
     ) -> Self {
+        let mut state = GraphicsPreparationState::new(document, focus_source, theme);
+        let mut prepared = Self::default();
+        while !state.is_complete() {
+            prepared.merge(Self::prepare_next(
+                document,
+                viewport,
+                images,
+                cache,
+                cell_pixels,
+                theme,
+                &mut state,
+            ));
+        }
+        prepared
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_next(
+        document: &Document,
+        viewport: (u16, u16),
+        images: &ImageCatalog,
+        cache: &mut RasterCache,
+        cell_pixels: PixelSize,
+        theme: &Theme,
+        state: &mut GraphicsPreparationState,
+    ) -> Self {
+        Self::prepare_next_while(
+            document,
+            viewport,
+            images,
+            cache,
+            cell_pixels,
+            theme,
+            state,
+            || true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_next_while(
+        document: &Document,
+        viewport: (u16, u16),
+        images: &ImageCatalog,
+        cache: &mut RasterCache,
+        cell_pixels: PixelSize,
+        theme: &Theme,
+        state: &mut GraphicsPreparationState,
+        mut should_continue: impl FnMut() -> bool,
+    ) -> Self {
         let (width, height) = viewport;
         let mut prepared = Self::default();
-        let mut selected_headings = document.headings().iter().enumerate().collect::<Vec<_>>();
-        selected_headings.sort_by_key(|(_, heading)| heading.source.start.abs_diff(focus_source));
-        let selected_headings = selected_headings
-            .into_iter()
-            .take(MAX_RASTERIZED_HEADINGS)
-            .map(|(index, _)| index)
-            .collect::<HashSet<_>>();
-        let mut selected_tables = document.tables().iter().enumerate().collect::<Vec<_>>();
-        selected_tables.sort_by_key(|(_, table)| table.source.start.abs_diff(focus_source));
-        let selected_tables = selected_tables
-            .into_iter()
-            .take(MAX_RASTERIZED_TABLES)
-            .map(|(index, _)| index)
-            .collect::<HashSet<_>>();
-        let mut heading_bytes = 0usize;
-        let mut table_bytes = 0usize;
-        let mut math_bytes = 0usize;
+        let Some(_) = state.tasks.get(state.next) else {
+            return prepared;
+        };
+        let batch_end = if state.next < PROGRESSIVE_GRAPHICS_TASKS {
+            state.next.saturating_add(1)
+        } else {
+            state.tasks.len()
+        };
 
-        for segment in &document.segments {
-            match segment {
-                Segment::Image { index } => {
-                    let Some(image_style) = theme.document.image.rasterized() else {
-                        continue;
-                    };
-                    let Some(image) = images.get(*index).filter(|image| image.can_render()) else {
+        while state.next < batch_end {
+            if !should_continue() {
+                break;
+            }
+            let task = state.tasks[state.next];
+            state.next = state.next.saturating_add(1);
+            match task {
+                PreparationTask::Image(index) => {
+                    let image_style = theme
+                        .document
+                        .image
+                        .rasterized()
+                        .expect("image tasks require a rasterized style");
+                    let Some(image) = images.get(index).filter(|image| image.can_render()) else {
                         continue;
                     };
                     match cache.rasterize_themed(
@@ -124,70 +191,36 @@ impl PreparedGraphics {
                         Err(error) => {
                             prepared.failures.insert(image.element_key, error);
                         }
-                    };
+                    }
                 }
-                Segment::Heading { index } if selected_headings.contains(index) => {
-                    let Some(heading) = document.headings().get(*index) else {
+                PreparationTask::Heading(index) => {
+                    let Some(heading) = document.headings().get(index) else {
                         continue;
                     };
-                    let style = theme.document.headings.level(heading.level);
-                    let Some(raster_style) = style.rasterized() else {
-                        continue;
-                    };
-                    let key = crate::heading::HeadingPlan::element_key(*index);
-                    match cache.rasterize_heading_themed(
-                        *index,
+                    let raster_style = theme
+                        .document
+                        .headings
+                        .level(heading.level)
+                        .rasterized()
+                        .expect("heading tasks require a rasterized style");
+                    let key = crate::heading::HeadingPlan::element_key(index);
+                    let rendered = cache.rasterize_heading_themed(
+                        index,
                         heading,
                         (width.max(1), height),
                         cell_pixels,
                         raster_style,
                         theme.identity,
-                    ) {
+                    );
+                    match rendered {
                         Ok(Some(rendered)) => {
                             let bytes = rendered.asset.rgba.len();
-                            if heading_bytes.saturating_add(bytes) > MAX_LAYOUT_HEADING_BYTES {
-                                prepared.failures.insert(
-                                    key,
-                                    format!(
-                                        "heading raster needs {bytes} bytes but the layout budget has {} of {MAX_LAYOUT_HEADING_BYTES} bytes remaining",
-                                        MAX_LAYOUT_HEADING_BYTES.saturating_sub(heading_bytes)
-                                    ),
-                                );
-                            } else {
-                                heading_bytes = heading_bytes.saturating_add(bytes);
-                                prepared.insert(
-                                    rendered.element_key,
-                                    rendered.columns,
-                                    rendered.rows,
-                                    rendered.asset,
-                                );
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            prepared.failures.insert(key, error);
-                        }
-                    }
-                }
-                Segment::Table { index } if selected_tables.contains(index) => {
-                    let Some(table_style) = theme.document.table.rasterized() else {
-                        continue;
-                    };
-                    let Some(table) = document.tables().get(*index) else {
-                        continue;
-                    };
-                    let key = crate::table::TablePlan::element_key(*index);
-                    match cache.rasterize_table_themed(
-                        *index,
-                        table,
-                        width.max(1),
-                        cell_pixels,
-                        table_style,
-                        theme.identity,
-                    ) {
-                        Ok(Some(rendered)) => {
-                            let bytes = rendered.asset.rgba.len();
-                            if let Err(error) = reserve_table_bytes(&mut table_bytes, bytes) {
+                            if let Err(error) = reserve_heading_bytes(
+                                &mut state.heading_bytes,
+                                &mut state.heading_asset_bytes,
+                                key,
+                                bytes,
+                            ) {
                                 prepared.failures.insert(key, error);
                             } else {
                                 prepared.insert(
@@ -204,38 +237,29 @@ impl PreparedGraphics {
                         }
                     }
                 }
-                Segment::Math { index } => {
-                    let Some(math) = document.math().get(*index) else {
+                PreparationTask::Table(index) => {
+                    let table_style = theme
+                        .document
+                        .table
+                        .rasterized()
+                        .expect("table tasks require a rasterized style");
+                    let Some(table) = document.tables().get(index) else {
                         continue;
                     };
-                    let style = match math.form {
-                        MathForm::Inline => &theme.document.math.inline,
-                        MathForm::Display => &theme.document.math.display,
-                    };
-                    let Some(raster_style) = style.rasterized() else {
-                        continue;
-                    };
-                    let key = crate::math::MathPlan::element_key(*index);
-                    match cache.rasterize_math_themed(
-                        *index,
-                        math,
-                        (width.max(1), height),
+                    let key = crate::table::TablePlan::element_key(index);
+                    match cache.rasterize_table_themed(
+                        index,
+                        table,
+                        width.max(1),
                         cell_pixels,
-                        raster_style,
+                        table_style,
                         theme.identity,
                     ) {
                         Ok(Some(rendered)) => {
                             let bytes = rendered.asset.rgba.len();
-                            if math_bytes.saturating_add(bytes) > MAX_LAYOUT_MATH_BYTES {
-                                prepared.failures.insert(
-                                    key,
-                                    format!(
-                                        "math raster needs {bytes} bytes but the layout budget has {} of {MAX_LAYOUT_MATH_BYTES} bytes remaining",
-                                        MAX_LAYOUT_MATH_BYTES.saturating_sub(math_bytes)
-                                    ),
-                                );
+                            if let Err(error) = reserve_table_bytes(&mut state.table_bytes, bytes) {
+                                prepared.failures.insert(key, error);
                             } else {
-                                math_bytes = math_bytes.saturating_add(bytes);
                                 prepared.insert(
                                     rendered.element_key,
                                     rendered.columns,
@@ -250,16 +274,74 @@ impl PreparedGraphics {
                         }
                     }
                 }
-                Segment::Text { .. }
-                | Segment::Break { .. }
-                | Segment::Rule { .. }
-                | Segment::Heading { .. }
-                | Segment::Table { .. }
-                | Segment::Link { .. }
-                | Segment::CodeBlock { .. } => {}
+                PreparationTask::Math(index) => {
+                    let Some(math) = document.math().get(index) else {
+                        continue;
+                    };
+                    let raster_style = match math.form {
+                        MathForm::Inline => &theme.document.math.inline,
+                        MathForm::Display => &theme.document.math.display,
+                    }
+                    .rasterized()
+                    .expect("math tasks require a rasterized style");
+                    let key = crate::math::MathPlan::element_key(index);
+                    match cache.rasterize_math_themed(
+                        index,
+                        math,
+                        (width.max(1), height),
+                        cell_pixels,
+                        raster_style,
+                        theme.identity,
+                    ) {
+                        Ok(Some(rendered)) => {
+                            let bytes = rendered.asset.rgba.len();
+                            if state.math_bytes.saturating_add(bytes) > MAX_LAYOUT_MATH_BYTES {
+                                prepared.failures.insert(
+                                key,
+                                format!(
+                                    "math raster needs {bytes} bytes but the layout budget has {} of {MAX_LAYOUT_MATH_BYTES} bytes remaining",
+                                    MAX_LAYOUT_MATH_BYTES.saturating_sub(state.math_bytes)
+                                ),
+                            );
+                            } else {
+                                state.math_bytes = state.math_bytes.saturating_add(bytes);
+                                prepared.insert(
+                                    rendered.element_key,
+                                    rendered.columns,
+                                    rendered.rows,
+                                    rendered.asset,
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            prepared.failures.insert(key, error);
+                        }
+                    }
+                }
             }
         }
         prepared
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.graphics.extend(other.graphics);
+        self.failures.extend(other.failures);
+    }
+
+    pub(crate) fn retain_targets(&mut self, state: &GraphicsPreparationState) {
+        let target_keys = state
+            .tasks
+            .iter()
+            .map(|task| match *task {
+                PreparationTask::Image(index) => ElementKey(index as u64 + 1),
+                PreparationTask::Heading(index) => crate::heading::HeadingPlan::element_key(index),
+                PreparationTask::Table(index) => crate::table::TablePlan::element_key(index),
+                PreparationTask::Math(index) => crate::math::MathPlan::element_key(index),
+            })
+            .collect::<HashSet<_>>();
+        self.graphics.retain(|key, _| target_keys.contains(key));
+        self.failures.retain(|key, _| target_keys.contains(key));
     }
 
     fn insert(
@@ -278,6 +360,95 @@ impl PreparedGraphics {
                 asset,
             },
         );
+    }
+}
+
+impl GraphicsPreparationState {
+    pub(crate) fn new(document: &Document, focus_source: usize, theme: &Theme) -> Self {
+        let mut selected_headings = document.headings().iter().enumerate().collect::<Vec<_>>();
+        selected_headings.sort_by_key(|(_, heading)| heading.source.start.abs_diff(focus_source));
+        let selected_headings = selected_headings
+            .into_iter()
+            .take(MAX_RASTERIZED_HEADINGS)
+            .map(|(index, _)| index)
+            .collect::<HashSet<_>>();
+        let mut selected_tables = document.tables().iter().enumerate().collect::<Vec<_>>();
+        selected_tables.sort_by_key(|(_, table)| table.source.start.abs_diff(focus_source));
+        let selected_tables = selected_tables
+            .into_iter()
+            .take(MAX_RASTERIZED_TABLES)
+            .map(|(index, _)| index)
+            .collect::<HashSet<_>>();
+        let mut tasks = document
+            .segments
+            .iter()
+            .flat_map(|segment| match segment {
+                Segment::Image { index } if theme.document.image.rasterized().is_some() => {
+                    vec![PreparationTask::Image(*index)]
+                }
+                Segment::Heading { index }
+                    if selected_headings.contains(index)
+                        && document.headings().get(*index).is_some_and(|heading| {
+                            theme
+                                .document
+                                .headings
+                                .level(heading.level)
+                                .rasterized()
+                                .is_some()
+                        }) =>
+                {
+                    vec![PreparationTask::Heading(*index)]
+                }
+                Segment::Table { index }
+                    if selected_tables.contains(index)
+                        && theme.document.table.rasterized().is_some() =>
+                {
+                    vec![PreparationTask::Table(*index)]
+                }
+                Segment::Math { index }
+                    if document.math().get(*index).is_some_and(|math| {
+                        match math.form {
+                            MathForm::Inline => &theme.document.math.inline,
+                            MathForm::Display => &theme.document.math.display,
+                        }
+                        .rasterized()
+                        .is_some()
+                    }) =>
+                {
+                    vec![PreparationTask::Math(*index)]
+                }
+                Segment::Text { .. }
+                | Segment::Break { .. }
+                | Segment::Rule { .. }
+                | Segment::Link { .. }
+                | Segment::CodeBlock { .. }
+                | Segment::Image { .. }
+                | Segment::Heading { .. }
+                | Segment::Table { .. }
+                | Segment::Math { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| {
+            let source = match *task {
+                PreparationTask::Image(index) => &document.images()[index].source,
+                PreparationTask::Heading(index) => &document.headings()[index].source,
+                PreparationTask::Table(index) => &document.tables()[index].source,
+                PreparationTask::Math(index) => &document.math()[index].source,
+            };
+            (source.start.abs_diff(focus_source), source.start)
+        });
+        Self {
+            tasks,
+            next: 0,
+            heading_bytes: 0,
+            heading_asset_bytes: HashMap::new(),
+            table_bytes: 0,
+            math_bytes: 0,
+        }
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.next >= self.tasks.len()
     }
 }
 
@@ -618,6 +789,25 @@ fn reserve_table_bytes(used: &mut usize, incoming: usize) -> Result<(), String> 
         ));
     }
     *used = used.saturating_add(incoming);
+    Ok(())
+}
+
+fn reserve_heading_bytes(
+    used: &mut usize,
+    assets: &mut HashMap<ElementKey, usize>,
+    key: ElementKey,
+    incoming: usize,
+) -> Result<(), String> {
+    let replaced = assets.get(&key).copied().unwrap_or(0);
+    let without_replaced = used.saturating_sub(replaced);
+    if without_replaced.saturating_add(incoming) > MAX_LAYOUT_HEADING_BYTES {
+        return Err(format!(
+            "heading raster needs {incoming} bytes but the layout budget has {} of {MAX_LAYOUT_HEADING_BYTES} bytes remaining",
+            MAX_LAYOUT_HEADING_BYTES.saturating_sub(without_replaced)
+        ));
+    }
+    *used = without_replaced.saturating_add(incoming);
+    assets.insert(key, incoming);
     Ok(())
 }
 
@@ -1856,12 +2046,221 @@ mod tests {
     }
 
     #[test]
+    fn incremental_preparation_yields_the_nearest_graphic_first() {
+        let markdown = "# First\n\nbody\n\n# Second\n\nbody\n\n# Focused";
+        let document = Document::parse(markdown.to_owned());
+        let focus = markdown
+            .find("Focused")
+            .expect("fixture has focused heading");
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let theme = Theme::builtin_dark();
+        let mut state = GraphicsPreparationState::new(&document, focus, &theme);
+        let mut cache = RasterCache::default();
+
+        let first = PreparedGraphics::prepare_next(
+            &document,
+            (80, 20),
+            &catalog,
+            &mut cache,
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            &theme,
+            &mut state,
+        );
+
+        assert!(
+            first
+                .graphics
+                .contains_key(&crate::heading::HeadingPlan::element_key(2))
+        );
+        assert_eq!(first.graphics.len(), 1);
+        assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn incremental_preparation_bounds_the_number_of_layout_updates() {
+        let markdown = (0..MAX_RASTERIZED_HEADINGS)
+            .map(|index| format!("# Heading {index}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let document = Document::parse(markdown);
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let theme = Theme::builtin_dark();
+        let mut state = GraphicsPreparationState::new(&document, 0, &theme);
+        let mut cache = RasterCache::default();
+        let mut batches = 0;
+
+        while !state.is_complete() {
+            let _ = PreparedGraphics::prepare_next(
+                &document,
+                (80, 20),
+                &catalog,
+                &mut cache,
+                PixelSize {
+                    width: 8,
+                    height: 16,
+                },
+                &theme,
+                &mut state,
+            );
+            batches += 1;
+        }
+
+        assert_eq!(batches, PROGRESSIVE_GRAPHICS_TASKS + 1);
+    }
+
+    #[test]
+    fn completed_generation_prunes_graphics_outside_its_target_set() {
+        let markdown = (0..=MAX_RASTERIZED_HEADINGS)
+            .map(|index| format!("# Heading {index}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let document = Document::parse(markdown.clone());
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let theme = Theme::builtin_dark();
+        let mut cache = RasterCache::default();
+        let mut graphics = PreparedGraphics::prepare(
+            &document,
+            (80, 20),
+            &catalog,
+            &mut cache,
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            0,
+            &theme,
+        );
+        let last_focus = markdown
+            .rfind("Heading")
+            .expect("fixture has a final heading");
+        let target = GraphicsPreparationState::new(&document, last_focus, &theme);
+
+        graphics.retain_targets(&target);
+
+        assert!(
+            !graphics
+                .graphics
+                .contains_key(&crate::heading::HeadingPlan::element_key(0))
+        );
+        assert_eq!(graphics.graphics.len(), MAX_RASTERIZED_HEADINGS - 1);
+    }
+
+    #[test]
+    fn final_graphics_batch_can_stop_between_tasks() {
+        let markdown = (0..MAX_RASTERIZED_HEADINGS)
+            .map(|index| format!("# Heading {index}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let document = Document::parse(markdown);
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let theme = Theme::builtin_dark();
+        let mut state = GraphicsPreparationState::new(&document, 0, &theme);
+        let mut cache = RasterCache::default();
+        for _ in 0..PROGRESSIVE_GRAPHICS_TASKS {
+            let _ = PreparedGraphics::prepare_next(
+                &document,
+                (80, 20),
+                &catalog,
+                &mut cache,
+                PixelSize {
+                    width: 8,
+                    height: 16,
+                },
+                &theme,
+                &mut state,
+            );
+        }
+        let mut checks = 0;
+
+        let _ = PreparedGraphics::prepare_next_while(
+            &document,
+            (80, 20),
+            &catalog,
+            &mut cache,
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            &theme,
+            &mut state,
+            || {
+                checks += 1;
+                checks == 1
+            },
+        );
+
+        assert_eq!(state.next, PROGRESSIVE_GRAPHICS_TASKS + 1);
+        assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn configured_font_heading_renders_only_with_its_final_font_set() {
+        let markdown = "# First\n\nbody\n\n# Focused";
+        let document = Document::parse(markdown.to_owned());
+        let focus = markdown
+            .find("Focused")
+            .expect("fixture has focused heading");
+        let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
+        let mut theme = Theme::builtin_dark();
+        let font_families = vec!["Configured Font".to_owned()];
+        match &mut theme.document.headings.h1 {
+            crate::theme::HeadingStyle::Rasterized(style) => {
+                style.font_families = font_families.clone();
+            }
+            _ => panic!("built-in H1 should be rasterized"),
+        }
+        let mut state = GraphicsPreparationState::new(&document, focus, &theme);
+        let mut cache = RasterCache::default();
+        let focused = PreparedGraphics::prepare_next(
+            &document,
+            (80, 20),
+            &catalog,
+            &mut cache,
+            PixelSize {
+                width: 8,
+                height: 16,
+            },
+            &theme,
+            &mut state,
+        );
+
+        assert!(
+            focused
+                .graphics
+                .contains_key(&crate::heading::HeadingPlan::element_key(1))
+        );
+        assert!(!state.is_complete());
+        assert!(cache.has_loaded_heading_fonts(&font_families));
+    }
+
+    #[test]
     fn table_layout_budget_accepts_the_boundary_and_rejects_the_next_byte() {
         let mut used = 0;
         assert!(reserve_table_bytes(&mut used, MAX_LAYOUT_TABLE_BYTES).is_ok());
         assert_eq!(used, MAX_LAYOUT_TABLE_BYTES);
         assert!(reserve_table_bytes(&mut used, 1).is_err());
         assert_eq!(used, MAX_LAYOUT_TABLE_BYTES);
+    }
+
+    #[test]
+    fn heading_layout_budget_replaces_bytes_for_the_same_element() {
+        let key = crate::heading::HeadingPlan::element_key(0);
+        let other = crate::heading::HeadingPlan::element_key(1);
+        let mut used = 0;
+        let mut assets = HashMap::new();
+
+        assert!(
+            reserve_heading_bytes(&mut used, &mut assets, key, MAX_LAYOUT_HEADING_BYTES).is_ok()
+        );
+        assert!(
+            reserve_heading_bytes(&mut used, &mut assets, key, MAX_LAYOUT_HEADING_BYTES).is_ok()
+        );
+        assert_eq!(used, MAX_LAYOUT_HEADING_BYTES);
+        assert!(reserve_heading_bytes(&mut used, &mut assets, other, 1).is_err());
+        assert_eq!(used, MAX_LAYOUT_HEADING_BYTES);
     }
 
     fn rule_row(layout: &Layout) -> &LayoutRow {

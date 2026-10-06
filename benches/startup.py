@@ -29,7 +29,7 @@ from typing import Sequence
 
 CAPABILITY_QUERY_END = b"\x1b[5n"
 CAPABILITY_RESPONSE = (
-    b"\x1b_Gi=31;EINVAL\x1b\\"
+    b"\x1b_Gi=31;OK\x1b\\"
     b"\x1b[?1;2c"
     b"\x1bP1+r436f=323536\x1b\\"
     b"\x1bP1+r524742=38\x1b\\"
@@ -37,6 +37,7 @@ CAPABILITY_RESPONSE = (
 )
 BACKGROUND_QUERY = b"\x1b]11;?\x1b\\"
 BACKGROUND_RESPONSE = b"\x1b]11;rgb:0000/0000/0000\x1b\\\n"
+KITTY_UPLOAD = b"\x1b_Ga=t"
 MAX_CAPTURE_BYTES = 1024 * 1024
 
 
@@ -54,6 +55,7 @@ class Target:
 class Observation:
     capability_query_ms: float | None
     first_frame_ms: float
+    first_graphics_ms: float | None
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path, default=Path("target/startup-benchmark.csv")
+    )
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        help="prebuilt raden executable to measure instead of building this checkout",
     )
     args = parser.parse_args(argv)
     args.mode = args.mode or ["auto", "text"]
@@ -167,6 +174,13 @@ def build_current_binary(repository: Path) -> Target:
     return Target(binary, file_sha256(binary))
 
 
+def resolve_target(repository: Path, binary: Path | None) -> Target:
+    if binary is None:
+        return build_current_binary(repository)
+    resolved = checked_file(binary)
+    return Target(resolved, file_sha256(resolved))
+
+
 def observe(
     binary: Path,
     document: Path,
@@ -192,6 +206,8 @@ def observe(
     deadline = started + timeout_seconds
     output = bytearray()
     capability_query_ms = None
+    first_frame_ms = None
+    first_graphics_ms = None
     capability_answered = False
     background_answered = False
     resize_confirmed = False
@@ -246,10 +262,18 @@ def observe(
                 if not background_answered and BACKGROUND_QUERY in output:
                     os.write(master, BACKGROUND_RESPONSE)
                     background_answered = True
-                if marker in output:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                if first_frame_ms is None and marker in output:
+                    first_frame_ms = elapsed_ms
+                if first_graphics_ms is None and KITTY_UPLOAD in output:
+                    first_graphics_ms = elapsed_ms
+                if first_frame_ms is not None and (
+                    mode == "text" or first_graphics_ms is not None
+                ):
                     observation = Observation(
                         capability_query_ms=capability_query_ms,
-                        first_frame_ms=(time.perf_counter() - started) * 1000,
+                        first_frame_ms=first_frame_ms,
+                        first_graphics_ms=first_graphics_ms,
                     )
                     completed = True
                     return observation
@@ -358,6 +382,7 @@ def write_csv(
                 "success",
                 "capability_query_ms",
                 "first_frame_ms",
+                "first_graphics_ms",
                 "error",
             )
         )
@@ -381,6 +406,9 @@ def write_csv(
                     if observation is None or observation.capability_query_ms is None
                     else f"{observation.capability_query_ms:.3f}",
                     "" if observation is None else f"{observation.first_frame_ms:.3f}",
+                    ""
+                    if observation is None or observation.first_graphics_ms is None
+                    else f"{observation.first_graphics_ms:.3f}",
                     sample.error or "",
                 )
             )
@@ -411,12 +439,18 @@ def print_summary(args: argparse.Namespace, target: Target, samples: Sequence[Sa
     print()
     print(
         f"{'mode':<10} {'ok':>7} {'failed':>7} "
-        f"{'median ms':>12} {'p95 ms':>12} {'query med.':>12}"
+        f"{'frame med.':>12} {'frame p95':>12} "
+        f"{'graphic med.':>13} {'graphic p95':>13} {'query med.':>12}"
     )
     for mode in args.mode:
         group = [sample for sample in samples if sample.mode == mode]
         observations = [sample.observation for sample in group if sample.observation]
         frames = [value.first_frame_ms for value in observations]
+        graphics = [
+            value.first_graphics_ms
+            for value in observations
+            if value.first_graphics_ms is not None
+        ]
         queries = [
             value.capability_query_ms
             for value in observations
@@ -426,6 +460,8 @@ def print_summary(args: argparse.Namespace, target: Target, samples: Sequence[Sa
             f"{mode:<10} {len(frames):>7} {len(group) - len(frames):>7} "
             f"{display_stat(statistics.median(frames) if frames else None):>12} "
             f"{display_stat(percentile(frames, 0.95)):>12} "
+            f"{display_stat(statistics.median(graphics) if graphics else None):>13} "
+            f"{display_stat(percentile(graphics, 0.95)):>13} "
             f"{display_stat(statistics.median(queries) if queries else None):>12}"
         )
     print()
@@ -434,7 +470,7 @@ def print_summary(args: argparse.Namespace, target: Target, samples: Sequence[Sa
 
 def run(args: argparse.Namespace) -> int:
     repository = Path(__file__).resolve().parent.parent
-    target = build_current_binary(repository)
+    target = resolve_target(repository, args.binary)
     document = checked_file(args.document)
     config = checked_file(args.config)
 
