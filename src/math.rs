@@ -348,6 +348,30 @@ mod tests {
     }
 
     #[test]
+    fn effective_foreground_changes_the_cache_identity() {
+        let theme = crate::theme::Theme::builtin_dark();
+        let mut style = theme
+            .document
+            .math
+            .inline
+            .rasterized()
+            .expect("built-in inline math should be rasterized")
+            .clone();
+        let formula = math(r"x^2", MathForm::Inline);
+        let base =
+            MathPlan::build_themed(0, &formula, 80, 20, PixelSize::FALLBACK, &style, [0; 32])
+                .expect("math should build")
+                .key;
+        style.foreground.rgb = [1, 2, 3];
+        let changed =
+            MathPlan::build_themed(0, &formula, 80, 20, PixelSize::FALLBACK, &style, [0; 32])
+                .expect("math should build")
+                .key;
+
+        assert_ne!(base, changed);
+    }
+
+    #[test]
     fn viewport_height_above_the_form_limit_reuses_the_same_identity() {
         let formula = math(r"x^2", MathForm::Inline);
         let pixels = PixelSize::FALLBACK;

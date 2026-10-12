@@ -534,6 +534,44 @@ mod tests {
     }
 
     #[test]
+    fn effective_foreground_changes_the_cache_identity() {
+        let theme = crate::theme::Theme::builtin_dark();
+        let mut style = theme
+            .document
+            .headings
+            .h1
+            .rasterized()
+            .expect("built-in H1 should be rasterized")
+            .clone();
+        let fonts = HeadingFonts::default();
+        let base = HeadingPlan::build_with_fonts(
+            0,
+            &heading(1, "Heading"),
+            40,
+            PixelSize::FALLBACK,
+            &fonts,
+            &style,
+            [0; 32],
+        )
+        .expect("heading should build")
+        .key;
+        style.foreground.rgb = [1, 2, 3];
+        let changed = HeadingPlan::build_with_fonts(
+            0,
+            &heading(1, "Heading"),
+            40,
+            PixelSize::FALLBACK,
+            &fonts,
+            &style,
+            [0; 32],
+        )
+        .expect("heading should build")
+        .key;
+
+        assert_ne!(base, changed);
+    }
+
+    #[test]
     fn raster_height_is_cell_aligned_without_scaling_the_content() {
         for cell in [
             PixelSize {

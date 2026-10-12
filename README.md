@@ -57,9 +57,13 @@ Unsupported terminals and rasterization failures retain readable heading text.
 The bundled font is licensed under the SIL Open Font License 1.1; see
 `assets/fonts/OFL-NotoSansJP.txt`.
 
+Without configuration, Raden asks Urushi to classify the terminal background
+once before startup and selects its light or dark built-in Theme. Missing,
+timed-out, or malformed background responses quietly use the dark Theme.
+
 Create `$XDG_CONFIG_HOME/raden/config.toml` (or
-`~/.config/raden/config.toml` when `XDG_CONFIG_HOME` is unset) to select a
-Theme and configure the reader:
+`~/.config/raden/config.toml` when `XDG_CONFIG_HOME` is unset) to select an
+explicit Theme and configure the reader:
 
 ```toml
 theme = "builtin:dark"
@@ -78,9 +82,11 @@ nix develop -c cargo run -- --theme builtin:light examples/showcase.md
 ```
 
 `builtin:plain` uses terminal text for every rich element. `builtin:auto` is
-also available: it asks Urushi to classify the observed terminal background
-and falls back to the dark Theme when the terminal cannot report one. Theme
-selection does not change graphics backend selection.
+the default; it asks Urushi to classify the observed terminal background and
+falls back to the dark Theme when the terminal cannot provide usable evidence.
+Theme selection does not change graphics backend selection. User Themes,
+per-element rendering choices, and overrides follow the complete contract in
+[`docs/theme.md`](docs/theme.md).
 
 The main config may override only the fields it needs. CLI `--theme` replaces
 the selected base Theme while these overrides still apply:

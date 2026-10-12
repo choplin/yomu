@@ -27,14 +27,7 @@ pub(crate) fn run(
         return Err(anyhow!("an interactive terminal is required on stdout"));
     }
     let mut terminal = NativeTerminal::open().context("could not open the controlling terminal")?;
-    let background = if config.needs_terminal_background(theme_name) {
-        terminal
-            .terminal_background()
-            .context("could not query terminal background for automatic Theme selection")?
-    } else {
-        None
-    };
-    let theme = config.resolve_theme(theme_name, background)?;
+    let theme = resolve_theme(config, theme_name, &mut terminal)?;
     let rasterize = preference != GraphicsPreference::Text && theme.uses_rasterization();
     let application = ReaderApplication {
         path: path.to_path_buf(),
@@ -56,6 +49,21 @@ pub(crate) fn run(
         .run()
         .context("terminal application failed")?;
     Ok(())
+}
+
+fn resolve_theme(
+    config: &Config,
+    theme_name: Option<&str>,
+    terminal: &mut impl TerminalQuery,
+) -> Result<crate::theme::Theme> {
+    let background = if config.needs_terminal_background(theme_name) {
+        terminal
+            .terminal_background()
+            .context("could not query terminal background for automatic Theme selection")?
+    } else {
+        None
+    };
+    config.resolve_theme(theme_name, background)
 }
 
 struct ReaderApplication {
@@ -384,6 +392,48 @@ const fn preference_label(preference: GraphicsPreference) -> &'static str {
 mod tests {
     use super::*;
 
+    struct BackgroundTerminal {
+        response: Option<urushi_terminal::TerminalBackground>,
+        query_count: usize,
+    }
+
+    impl BackgroundTerminal {
+        const fn new(response: Option<urushi_terminal::TerminalBackground>) -> Self {
+            Self {
+                response,
+                query_count: 0,
+            }
+        }
+    }
+
+    impl TerminalQuery for BackgroundTerminal {
+        fn terminal_size(&mut self) -> io::Result<urushi_terminal::TerminalSize> {
+            Ok(urushi_terminal::TerminalSize::new(80, 24))
+        }
+
+        fn cursor_position(&mut self) -> io::Result<urushi_terminal::Position> {
+            Ok(urushi_terminal::Position::new(0, 0))
+        }
+
+        fn window_size(&mut self) -> io::Result<urushi_terminal::WindowSize> {
+            Ok(urushi_terminal::WindowSize::new(
+                urushi_terminal::TerminalSize::new(80, 24),
+                None,
+            ))
+        }
+
+        fn raw_mode_enabled(&mut self) -> io::Result<bool> {
+            Ok(false)
+        }
+
+        fn terminal_background(
+            &mut self,
+        ) -> io::Result<Option<urushi_terminal::TerminalBackground>> {
+            self.query_count += 1;
+            Ok(self.response)
+        }
+    }
+
     fn application(source: &str, preference: GraphicsPreference) -> ReaderApplication {
         let mut theme = crate::theme::Theme::builtin_dark();
         let crate::theme::HeadingStyle::Rasterized(heading) = &mut theme.document.headings.h1
@@ -413,6 +463,49 @@ mod tests {
             graphics_label: preference_label(preference),
             theme: Arc::new(theme),
         }
+    }
+
+    #[test]
+    fn automatic_theme_queries_once_and_uses_urushi_classification() {
+        for (background, expected) in [
+            (
+                urushi_terminal::TerminalBackground::new(u16::MAX, u16::MAX, u16::MAX),
+                "builtin:light",
+            ),
+            (
+                urushi_terminal::TerminalBackground::new(0, 0, 0),
+                "builtin:dark",
+            ),
+        ] {
+            let mut terminal = BackgroundTerminal::new(Some(background));
+            let theme = resolve_theme(&Config::default(), None, &mut terminal)
+                .expect("automatic Theme should resolve");
+
+            assert_eq!(theme.name, expected);
+            assert_eq!(terminal.query_count, 1);
+        }
+    }
+
+    #[test]
+    fn unavailable_background_evidence_uses_dark_fallback() {
+        // Urushi maps missing, timed-out, and malformed OSC 11 replies to None.
+        let mut terminal = BackgroundTerminal::new(None);
+        let theme = resolve_theme(&Config::default(), None, &mut terminal)
+            .expect("unavailable evidence should not block startup");
+
+        assert_eq!(theme.name, "builtin:dark");
+        assert_eq!(terminal.query_count, 1);
+    }
+
+    #[test]
+    fn explicit_theme_does_not_query_the_terminal_background() {
+        let mut terminal =
+            BackgroundTerminal::new(Some(urushi_terminal::TerminalBackground::new(0, 0, 0)));
+        let theme = resolve_theme(&Config::default(), Some("builtin:light"), &mut terminal)
+            .expect("explicit Theme should resolve");
+
+        assert_eq!(theme.name, "builtin:light");
+        assert_eq!(terminal.query_count, 0);
     }
 
     #[test]

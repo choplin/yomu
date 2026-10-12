@@ -733,6 +733,27 @@ strikethrough = true
     }
 
     #[test]
+    fn effective_foreground_changes_the_cache_identity() {
+        let theme = crate::theme::Theme::builtin_dark();
+        let mut style = theme
+            .document
+            .table
+            .rasterized()
+            .expect("built-in table should be rasterized")
+            .clone();
+        let table = table("text");
+        let base = TablePlan::build_themed(0, &table, 80, PixelSize::FALLBACK, &style, [0; 32])
+            .expect("table should build")
+            .key;
+        style.cell.foreground.rgb = [1, 2, 3];
+        let changed = TablePlan::build_themed(0, &table, 80, PixelSize::FALLBACK, &style, [0; 32])
+            .expect("table should build")
+            .key;
+
+        assert_ne!(base, changed);
+    }
+
+    #[test]
     fn short_tables_fit_content_instead_of_filling_the_viewport() {
         let plan = TablePlan::build(0, &table("short"), 80, PixelSize::FALLBACK)
             .expect("short table should plan");

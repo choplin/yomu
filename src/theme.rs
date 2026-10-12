@@ -2393,6 +2393,61 @@ italic = true
     }
 
     #[test]
+    fn automatic_scheme_supplies_contrasting_raster_colors_to_every_text_rasterizer() {
+        fn raster_colors(theme: &Theme) -> ([u8; 3], [u8; 3], [u8; 3]) {
+            let heading = theme
+                .document
+                .headings
+                .h1
+                .rasterized()
+                .expect("built-in H1 should be rasterized")
+                .foreground
+                .rgb;
+            let table = theme
+                .document
+                .table
+                .rasterized()
+                .expect("built-in table should be rasterized")
+                .cell
+                .foreground
+                .rgb;
+            let math = theme
+                .document
+                .math
+                .inline
+                .rasterized()
+                .expect("built-in math should be rasterized")
+                .foreground
+                .rgb;
+            (heading, table, math)
+        }
+
+        let light = resolve(
+            "builtin:auto",
+            &ThemeSettings::default(),
+            None,
+            Some(TerminalBackground::new(u16::MAX, u16::MAX, u16::MAX)),
+        )
+        .expect("light background should resolve");
+        let dark = resolve(
+            "builtin:auto",
+            &ThemeSettings::default(),
+            None,
+            Some(TerminalBackground::new(0, 0, 0)),
+        )
+        .expect("dark background should resolve");
+
+        assert_eq!(
+            raster_colors(&light),
+            ([0x09, 0x69, 0xda], [0x24, 0x29, 0x2f], [0x24, 0x29, 0x2f])
+        );
+        assert_eq!(
+            raster_colors(&dark),
+            ([0x46, 0xd2, 0xe1], [0xd8, 0xde, 0xe9], [0xd8, 0xde, 0xe9])
+        );
+    }
+
+    #[test]
     fn unknown_theme_fields_are_rejected() {
         let error = toml::from_str::<ThemeSettings>("[palette]\nunknown = \"#ffffff\"\n")
             .expect_err("unknown fields must be rejected");

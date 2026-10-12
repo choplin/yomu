@@ -123,7 +123,7 @@ impl Config {
 }
 
 fn default_theme() -> String {
-    "builtin:dark".to_owned()
+    "builtin:auto".to_owned()
 }
 
 const fn default_max_width() -> u16 {
