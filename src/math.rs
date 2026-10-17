@@ -516,9 +516,9 @@ mod tests {
             "fixture should contain antialiased edges"
         );
         for pixel in edges {
-            assert!(pixel[0].abs_diff(0xd8) <= 3);
-            assert!(pixel[1].abs_diff(0xde) <= 3);
-            assert!(pixel[2].abs_diff(0xe9) <= 3);
+            assert!(pixel[0].abs_diff(0xdc) <= 3);
+            assert!(pixel[1].abs_diff(0xe3) <= 3);
+            assert!(pixel[2].abs_diff(0xea) <= 3);
         }
     }
 

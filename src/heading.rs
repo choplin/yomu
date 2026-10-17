@@ -520,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_have_distinct_size_color_and_cache_keys() {
+    fn levels_share_heading_color_but_keep_distinct_size_and_cache_keys() {
         let cell = PixelSize {
             width: 8,
             height: 16,
@@ -529,7 +529,7 @@ mod tests {
         let h2 = HeadingPlan::build(0, &heading(2, "Heading"), 40, cell).expect("H2 plans");
 
         assert!(h1.rows > h2.rows);
-        assert_ne!(h1.color, h2.color);
+        assert_eq!(h1.color, h2.color);
         assert_ne!(h1.key, h2.key);
     }
 

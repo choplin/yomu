@@ -654,8 +654,8 @@ mod tests {
             .expect("table should plan");
 
         assert!(plan.source.contains("if y == 0"));
-        assert!(plan.source.contains("top: 5pt, bottom: 5pt"));
-        assert!(plan.source.contains("else { (x: 5pt, y: 3pt) }"));
+        assert!(plan.source.contains("top: 4pt, bottom: 4pt"));
+        assert!(plan.source.contains("else { (x: 4pt, y: 2pt) }"));
         assert!(plan.source.contains("top: 1.4pt"));
         assert!(plan.source.contains("bottom: 0.6pt"));
         assert!(plan.source.contains("else if y == 1"));

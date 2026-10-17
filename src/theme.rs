@@ -1737,20 +1737,29 @@ fn text_projection(foreground: &str) -> TextSettings {
     }
 }
 
-fn text_heading(foreground: &str) -> Option<HeadingLevelSettings> {
+fn heading_text_projection(foreground: &str, level: usize) -> TextSettings {
+    TextSettings {
+        style: text_style(foreground),
+        prefix: Some(format!("{} ", "#".repeat(level))),
+        ..TextSettings::default()
+    }
+}
+
+fn text_heading(foreground: &str, level: usize) -> Option<HeadingLevelSettings> {
     Some(HeadingLevelSettings::Text {
-        text: text_projection(foreground),
+        text: heading_text_projection(foreground, level),
     })
 }
 
 fn rasterized_heading(
     foreground: &str,
+    level: usize,
     scale: f32,
     underline: bool,
     stroke_radius: u32,
 ) -> Option<HeadingLevelSettings> {
     Some(HeadingLevelSettings::Rasterized {
-        text: text_projection(foreground),
+        text: heading_text_projection(foreground, level),
         rasterized: RasterizedHeadingSettings {
             foreground: Some(foreground.to_owned()),
             scale: Some(scale),
@@ -1763,13 +1772,14 @@ fn rasterized_heading(
 
 fn table_text() -> TableTextSettings {
     TableTextSettings {
-        cell: TextStyleSettings::default(),
+        cell: text_style("text"),
         header: TextStyleSettings {
+            foreground: Some("text".to_owned()),
             bold: Some(true),
             ..TextStyleSettings::default()
         },
         border: TableTextBorderSettings {
-            style: text_style("muted"),
+            style: text_style("border"),
             left: Some("│ ".to_owned()),
             column: Some(" │ ".to_owned()),
             right: Some(" │".to_owned()),
@@ -1821,17 +1831,17 @@ fn code_block_palette(colors: [&str; 9]) -> CodeBlockPaletteSettings {
 fn builtin_dark() -> ThemeSettings {
     ThemeSettings {
         palette: PaletteSettings {
-            text: Some("#d8dee9".to_owned()),
-            muted: Some("bright_black".to_owned()),
-            accent: Some("cyan".to_owned()),
-            secondary: Some("blue".to_owned()),
-            inline_code: Some("yellow".to_owned()),
-            surface: Some("black".to_owned()),
-            border: Some("#8290a5".to_owned()),
-            error: Some("bright_red".to_owned()),
+            text: Some("#dce3ea".to_owned()),
+            muted: Some("#8793a1".to_owned()),
+            accent: Some("#68d6c5".to_owned()),
+            secondary: Some("#82aaff".to_owned()),
+            inline_code: Some("#e6b673".to_owned()),
+            surface: Some("#161d26".to_owned()),
+            border: Some("#566373".to_owned()),
+            error: Some("#ff7a85".to_owned()),
             code_block: code_block_palette([
-                "#65737e", "#bf616a", "#d08770", "#ebcb8b", "#a3be8c", "#96b5b4", "#8fa1b3",
-                "#b48ead", "#ab7967",
+                "#7f8c9a", "#dce3ea", "#f2b880", "#7bdcb5", "#a9dc76", "#78dce8", "#82aaff",
+                "#c099ff", "#ff7a85",
             ]),
         },
         styles: ThemeStyleSettings {
@@ -1841,11 +1851,15 @@ fn builtin_dark() -> ThemeSettings {
                     bold: Some(true),
                     ..TextStyleSettings::default()
                 },
-                footer: text_style("muted"),
+                footer: TextStyleSettings {
+                    foreground: Some("muted".to_owned()),
+                    dim: Some(true),
+                    ..TextStyleSettings::default()
+                },
                 diagnostic: text_style("error"),
             },
             document: DocumentSettings {
-                body: TextStyleSettings::default(),
+                body: text_style("text"),
                 paragraph: TextStyleSettings::default(),
                 heading: HeadingSettings {
                     base: TextSettings {
@@ -1855,12 +1869,12 @@ fn builtin_dark() -> ThemeSettings {
                         },
                         ..TextSettings::default()
                     },
-                    h1: rasterized_heading("#46d2e1", 2.0, true, 2),
-                    h2: rasterized_heading("#699bf5", 1.5, true, 1),
-                    h3: text_heading("secondary"),
-                    h4: text_heading("secondary"),
-                    h5: text_heading("secondary"),
-                    h6: text_heading("secondary"),
+                    h1: rasterized_heading("text", 1, 1.85, true, 2),
+                    h2: rasterized_heading("text", 2, 1.45, true, 1),
+                    h3: text_heading("text", 3),
+                    h4: text_heading("text", 4),
+                    h5: text_heading("text", 5),
+                    h6: text_heading("muted", 6),
                 },
                 emphasis: TextStyleSettings {
                     italic: Some(true),
@@ -1893,26 +1907,27 @@ fn builtin_dark() -> ThemeSettings {
                 },
                 inline_code: text_projection("inline_code"),
                 code_block: CodeBlockSettings {
-                    text: TextStyleSettings::default(),
+                    text: text_style("text"),
                     label: text_projection("muted"),
                 },
                 quote: QuoteSettings {
                     text: TextStyleSettings {
+                        foreground: Some("muted".to_owned()),
                         italic: Some(true),
                         ..TextStyleSettings::default()
                     },
-                    marker: text_marker("│ ", "muted"),
+                    marker: text_marker("│ ", "border"),
                 },
                 list: ListSettings {
                     item: TextStyleSettings::default(),
                     unordered: text_marker("• ", "accent"),
-                    ordered: ordered_marker(". ", "accent"),
-                    task_checked: text_marker("[✓] ", "green"),
+                    ordered: ordered_marker(". ", "secondary"),
+                    task_checked: text_marker("[✓] ", "accent"),
                     task_unchecked: text_marker("[ ] ", "muted"),
                     indent_cells: Some(2),
                 },
                 rule: RuleSettings {
-                    style: text_style("muted"),
+                    style: text_style("border"),
                     character: Some("─".to_owned()),
                 },
                 table: Some(TableSettings::Rasterized {
@@ -1934,9 +1949,9 @@ fn builtin_dark() -> ThemeSettings {
                             color: Some("border".to_owned()),
                         },
                         font_points: Some(10.0),
-                        horizontal_inset_points: Some(5.0),
-                        vertical_inset_points: Some(3.0),
-                        rule_gap_points: Some(5.0),
+                        horizontal_inset_points: Some(4.0),
+                        vertical_inset_points: Some(2.0),
+                        rule_gap_points: Some(4.0),
                     },
                 }),
                 math: MathSettings {
@@ -1977,40 +1992,19 @@ fn builtin_dark() -> ThemeSettings {
 fn builtin_light() -> ThemeSettings {
     let mut theme = builtin_dark();
     theme.palette = PaletteSettings {
-        text: Some("#24292f".to_owned()),
-        muted: Some("#6e7781".to_owned()),
-        accent: Some("#0969da".to_owned()),
-        secondary: Some("#8250df".to_owned()),
-        inline_code: Some("#953800".to_owned()),
-        surface: Some("#ffffff".to_owned()),
-        border: Some("#8c959f".to_owned()),
-        error: Some("#cf222e".to_owned()),
+        text: Some("#24313d".to_owned()),
+        muted: Some("#65717d".to_owned()),
+        accent: Some("#087f8c".to_owned()),
+        secondary: Some("#3156a3".to_owned()),
+        inline_code: Some("#9a5b00".to_owned()),
+        surface: Some("#f6f8fa".to_owned()),
+        border: Some("#8a97a3".to_owned()),
+        error: Some("#c53b45".to_owned()),
         code_block: code_block_palette([
-            "#65737e", "#bf616a", "#d08770", "#ebcb8b", "#a3be8c", "#96b5b4", "#8fa1b3", "#b48ead",
-            "#ab7967",
+            "#687581", "#24313d", "#9a5b00", "#147d64", "#4f7d20", "#087f8c", "#3156a3", "#7b3fa0",
+            "#c53b45",
         ]),
     };
-    for heading in [
-        &mut theme.styles.document.heading.h1,
-        &mut theme.styles.document.heading.h2,
-        &mut theme.styles.document.heading.h3,
-        &mut theme.styles.document.heading.h4,
-        &mut theme.styles.document.heading.h5,
-        &mut theme.styles.document.heading.h6,
-    ] {
-        match heading
-            .as_mut()
-            .expect("built-in heading must be configured")
-        {
-            HeadingLevelSettings::Text { text } => {
-                text.style.foreground = Some("accent".to_owned());
-            }
-            HeadingLevelSettings::Rasterized { text, rasterized } => {
-                rasterized.foreground = Some("accent".to_owned());
-                text.style.foreground = Some("accent".to_owned());
-            }
-        }
-    }
     theme
 }
 
@@ -2031,10 +2025,22 @@ fn builtin_plain() -> ThemeSettings {
     theme.styles.app.diagnostic = plain.clone();
     theme.styles.document.body = plain.clone();
     theme.styles.document.paragraph = plain.clone();
-    theme.styles.document.emphasis = plain.clone();
-    theme.styles.document.strong = plain.clone();
-    theme.styles.document.strikethrough = plain.clone();
-    theme.styles.document.link.label = plain.clone();
+    theme.styles.document.emphasis = TextStyleSettings {
+        italic: Some(true),
+        ..plain.clone()
+    };
+    theme.styles.document.strong = TextStyleSettings {
+        bold: Some(true),
+        ..plain.clone()
+    };
+    theme.styles.document.strikethrough = TextStyleSettings {
+        strikethrough: Some(true),
+        ..plain.clone()
+    };
+    theme.styles.document.link.label = TextStyleSettings {
+        underline: Some(true),
+        ..plain.clone()
+    };
     theme.styles.document.link.destination.style = plain.clone();
     theme.styles.document.link.standalone_destination.style = plain.clone();
     theme.styles.document.inline_code.style = plain.clone();
@@ -2050,17 +2056,21 @@ fn builtin_plain() -> ThemeSettings {
     theme.styles.document.rule.style = plain.clone();
     theme.styles.document.html.inline = plain.clone();
     theme.styles.document.html.block = plain.clone();
-    for heading in [
-        &mut theme.styles.document.heading.h1,
-        &mut theme.styles.document.heading.h2,
-        &mut theme.styles.document.heading.h3,
-        &mut theme.styles.document.heading.h4,
-        &mut theme.styles.document.heading.h5,
-        &mut theme.styles.document.heading.h6,
+    for (heading, prefix) in [
+        (&mut theme.styles.document.heading.h1, "# "),
+        (&mut theme.styles.document.heading.h2, "## "),
+        (&mut theme.styles.document.heading.h3, "### "),
+        (&mut theme.styles.document.heading.h4, "#### "),
+        (&mut theme.styles.document.heading.h5, "##### "),
+        (&mut theme.styles.document.heading.h6, "###### "),
     ] {
         *heading = Some(HeadingLevelSettings::Text {
             text: TextSettings {
-                style: plain.clone(),
+                style: TextStyleSettings {
+                    bold: Some(true),
+                    ..plain.clone()
+                },
+                prefix: Some(prefix.to_owned()),
                 ..TextSettings::default()
             },
         });
@@ -2108,6 +2118,13 @@ mod tests {
         path
     }
 
+    fn foreground_rgb(style: ResolvedTextStyle) -> [u8; 3] {
+        let ColorChoice::Set(color) = style.foreground else {
+            panic!("style should set a foreground color");
+        };
+        color.rgb
+    }
+
     #[test]
     fn documented_complete_theme_example_resolves() {
         let file = toml::from_str::<ThemeFile>(include_str!("../examples/themes/custom.toml"))
@@ -2131,8 +2148,14 @@ mod tests {
         let HeadingStyle::Rasterized(rasterized) = dark.document.headings.level(1) else {
             panic!("built-in dark H1 should resolve directly to Rasterized");
         };
-        assert_eq!(rasterized.scale, 2.0);
+        assert_eq!(rasterized.scale, 1.85);
+        assert!(rasterized.underline);
         assert_eq!(rasterized.fallback.style.bold, AttributeChoice::Enabled);
+        let HeadingStyle::Rasterized(rasterized) = dark.document.headings.level(2) else {
+            panic!("built-in dark H2 should resolve directly to Rasterized");
+        };
+        assert_eq!(rasterized.scale, 1.45);
+        assert!(rasterized.underline);
         assert!(matches!(
             plain.document.headings.level(1),
             HeadingStyle::Text(_)
@@ -2142,6 +2165,68 @@ mod tests {
         assert!(matches!(plain.document.image, ImageStyle::Text(_)));
         assert!(dark.uses_rasterization());
         assert!(!plain.uses_rasterization());
+    }
+
+    #[test]
+    fn builtin_defaults_lock_semantic_hierarchy_and_contrast_roles() {
+        let dark = resolve("builtin:dark", &ThemeSettings::default(), None, None)
+            .expect("dark theme should resolve");
+        let light = resolve("builtin:light", &ThemeSettings::default(), None, None)
+            .expect("light theme should resolve");
+        let plain = resolve("builtin:plain", &ThemeSettings::default(), None, None)
+            .expect("plain theme should resolve");
+
+        assert_eq!(foreground_rgb(dark.document.body), [0xdc, 0xe3, 0xea]);
+        assert_eq!(foreground_rgb(dark.app.header), [0x68, 0xd6, 0xc5]);
+        assert_eq!(dark.app.footer.dim, AttributeChoice::Enabled);
+        assert_eq!(dark.app.diagnostic.bold, AttributeChoice::Inherit);
+        assert_eq!(
+            dark.code_block_palette.get(SyntaxRole::Comment).rgb,
+            [0x7f, 0x8c, 0x9a]
+        );
+
+        let dark_heading_colors = [
+            [0xdc, 0xe3, 0xea],
+            [0xdc, 0xe3, 0xea],
+            [0xdc, 0xe3, 0xea],
+            [0xdc, 0xe3, 0xea],
+            [0xdc, 0xe3, 0xea],
+            [0x87, 0x93, 0xa1],
+        ];
+        for (level, expected) in (1..=6).zip(dark_heading_colors) {
+            let heading = dark.document.headings.level(level).readable_text();
+            assert_eq!(foreground_rgb(heading.style), expected);
+            assert_eq!(heading.prefix, format!("{} ", "#".repeat(level.into())));
+        }
+
+        let TableStyle::Rasterized(table) = &dark.document.table else {
+            panic!("built-in dark table should be rasterized");
+        };
+        assert_eq!(table.header.foreground.rgb, [0xdc, 0xe3, 0xea]);
+        assert_eq!(
+            foreground_rgb(table.fallback.header),
+            table.header.foreground.rgb
+        );
+
+        assert_eq!(foreground_rgb(light.document.body), [0x24, 0x31, 0x3d]);
+        assert_eq!(foreground_rgb(light.app.header), [0x08, 0x7f, 0x8c]);
+        assert_eq!(
+            light.code_block_palette.get(SyntaxRole::String).rgb,
+            [0x4f, 0x7d, 0x20]
+        );
+
+        for level in 1..=6 {
+            let heading = plain.document.headings.level(level).readable_text();
+            assert_eq!(heading.prefix, format!("{} ", "#".repeat(level.into())));
+            assert_eq!(heading.style.bold, AttributeChoice::Enabled);
+            assert_eq!(heading.style.foreground, ColorChoice::Reset);
+        }
+        assert_eq!(plain.document.emphasis.italic, AttributeChoice::Enabled);
+        assert_eq!(plain.document.strong.bold, AttributeChoice::Enabled);
+        assert_eq!(
+            plain.document.link.label.underline,
+            AttributeChoice::Enabled
+        );
     }
 
     #[test]
@@ -2439,11 +2524,11 @@ italic = true
 
         assert_eq!(
             raster_colors(&light),
-            ([0x09, 0x69, 0xda], [0x24, 0x29, 0x2f], [0x24, 0x29, 0x2f])
+            ([0x24, 0x31, 0x3d], [0x24, 0x31, 0x3d], [0x24, 0x31, 0x3d])
         );
         assert_eq!(
             raster_colors(&dark),
-            ([0x46, 0xd2, 0xe1], [0xd8, 0xde, 0xe9], [0xd8, 0xde, 0xe9])
+            ([0xdc, 0xe3, 0xea], [0xdc, 0xe3, 0xea], [0xdc, 0xe3, 0xea])
         );
     }
 

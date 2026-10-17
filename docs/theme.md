@@ -43,6 +43,40 @@ classify the observed background, with dark as the unavailable-observation
 fallback; user Themes extend an explicit light or dark base so their inheritance
 result stays deterministic.
 
+## Built-in appearance
+
+The built-ins use one restrained semantic hierarchy rather than assigning an
+unrelated color to every Markdown element. `accent` identifies primary
+structure, `secondary` supports links and the next heading tier, `muted` keeps
+metadata and fallbacks subordinate, and `border` separates content without
+competing with it. Body text remains the highest-contrast reading surface.
+
+| Role | `builtin:dark` | `builtin:light` |
+| --- | --- | --- |
+| body text | `#dce3ea` | `#24313d` |
+| muted text | `#8793a1` | `#65717d` |
+| accent | `#68d6c5` | `#087f8c` |
+| secondary | `#82aaff` | `#3156a3` |
+| inline code | `#e6b673` | `#9a5b00` |
+| border | `#566373` | `#8a97a3` |
+| diagnostic | `#ff7a85` | `#c53b45` |
+
+Headings use the document text color instead of treating color as their primary
+hierarchy cue. H1 and H2 use compact rasterized type and quiet rules when
+graphics are available, while their different scales establish rank. H3
+through H5 stay bold terminal text, and H6 is muted. Text rendering and raster
+fallbacks retain the full hierarchy with visible Markdown heading prefixes.
+Tables use body text, a bold header, and a quiet border in both rendering paths;
+quotes and destinations use muted text; code tokens use separate dark- and
+light-background palettes so neither built-in borrows contrast assumptions
+from the other.
+
+`builtin:plain` is intentionally colorless and never rasterizes rich elements,
+but it does not erase document structure. It uses terminal-default colors,
+conventional emphasis attributes, underlined links, and visible `#` prefixes
+for H1 through H6. This makes plain mode a complete low-decoration reading
+mode rather than a degraded dark Theme.
+
 ## Settings boundary
 
 The serializable `ThemeSettings` tree mirrors Raden's app and Markdown roles.
