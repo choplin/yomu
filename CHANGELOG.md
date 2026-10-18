@@ -12,6 +12,8 @@ and this project adheres to
 
 - Release the initial crate locally and use crates.io Trusted Publishing for
   later versions without long-lived crates.io or repository tokens.
+- Create each GitHub Release from the matching changelog section and append the
+  generated installation and artifact information.
 
 ### Added
 

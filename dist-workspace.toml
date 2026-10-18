@@ -12,6 +12,7 @@ targets = [
 ]
 pr-run-mode = "upload"
 hosting = "github"
+create-release = true
 checksum = "sha256"
 github-attestations = false
 install-updater = false

@@ -36,6 +36,13 @@ Homebrew tap using a `HOMEBREW_TAP_TOKEN` with contents write access to that
 tap. `RELEASE_GITHUB_TOKEN` and `CARGO_REGISTRY_TOKEN` repository secrets are
 not used.
 
+The `Release` workflow also creates the GitHub Release. Its release-notes
+section is the content beneath the matching `## [<version>]` heading in
+`CHANGELOG.md`; dist then appends the generated Homebrew installation command,
+artifact download table, and checksums. `create-release = true` is explicit in
+`dist-workspace.toml`, and the generated workflow must remain the only GitHub
+Release creator.
+
 The generated `.github/workflows/release.yml` is derived from
 `dist-workspace.toml` by `dist` 0.33.0. Do not edit the workflow by hand;
 change the dist configuration and regenerate it. The dist configuration pins
