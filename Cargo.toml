@@ -1,9 +1,31 @@
 [package]
-name = "raden"
+name = "yomu"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
-publish = false
+description = "A terminal Markdown reader with rich image, table, and math rendering"
+license = "MIT"
+repository = "https://github.com/choplin/yomu"
+homepage = "https://github.com/choplin/yomu"
+readme = "README.md"
+keywords = ["markdown", "reader", "terminal", "tui", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+include = [
+    "/src",
+    "/assets/fonts",
+    "/docs",
+    "/examples",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/CHANGELOG.md",
+    "/README.md",
+    "/LICENSE",
+]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.xz"
+bin-dir = "{ name }-{ target }/{ bin }"
+pkg-fmt = "txz"
 
 [dependencies]
 anyhow = "1.0"
@@ -28,3 +50,7 @@ urushi = "0.1.1"
 urushi-graphics = "0.1.1"
 urushi-terminal = "0.1.1"
 urushi-tui-app = { version = "0.1.1", default-features = false, features = ["graphics"] }
+
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -1,7 +1,7 @@
 # Startup benchmark
 
 `startup.py` builds the current checkout in release mode, then measures the
-latency from spawning that Raden executable to the first complete terminal
+latency from spawning that Yomu executable to the first complete terminal
 frame and the first raster graphic. It runs the real executable in a fixed-size
 pseudo-terminal and replies to terminal capability queries with deterministic
 responses.
@@ -34,7 +34,7 @@ the same host and in the same session.
 ## Running the benchmark
 
 Run the benchmark from the repository root. It runs `cargo build --release
---locked --bin raden` before collecting samples, so the measured executable
+--locked --bin yomu` before collecting samples, so the measured executable
 always reflects the current checkout:
 
 ```console

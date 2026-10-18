@@ -1,30 +1,54 @@
-# raden
+# Yomu
 
-Terminal markdown viewer that inlays pixel-perfect rendering — images, math,
-tables — into plain terminal text, built around reviewing AI-written markdown.
-
-Named after 螺鈿 (raden), the craft of inlaying luminous shell fragments into
-lacquer: the body stays text, and only the parts that aid understanding shine.
+Yomu is a terminal Markdown reader. It keeps prose as native terminal text and
+uses Kitty Graphics or experimental sixel rendering for images, large
+headings, tables, and math when the terminal supports them. Every rich element
+retains a readable text fallback.
 
 ## Overview
 
-- A markdown viewer for the terminal. The text body is rendered as normal
+- A Markdown reader for the terminal. The text body is rendered as normal
   terminal text; understanding-critical elements are rendered pixel-perfect
-  via terminal graphics protocols (sixel, kitty image protocol, etc.).
-- Rendering targets: images, math (LaTeX), and tables are must-haves.
-  Diagrams and similar elements are candidates.
-- Designed around the workflow of reviewing AI-written markdown — not a
-  general-purpose viewer. Inline comments on the document are a planned
-  capability (design not finalized).
-- Starts as a one-shot file viewer; a live/watch mode is intended later.
-  The author expects the core architecture to be largely the same either way.
+  via terminal graphics protocols.
+- Images, headings, tables, and a documented subset of LaTeX math can render as
+  raster graphics, with deterministic text degradation.
+- Files and standard input are both supported; viewport navigation remains
+  anchored to source content across resize and reflow.
 
-## Current viewer
+## Installation
 
-Run the one-file viewer from the development shell:
+After the first release is published, install the crate with Cargo:
 
 ```console
-nix develop -c cargo run -- examples/showcase.md
+cargo install yomu --locked
+```
+
+The same release's prebuilt archives can be installed with Homebrew or
+cargo-binstall:
+
+```console
+brew install choplin/tap/yomu
+cargo binstall yomu
+```
+
+Before the first release, or to install the latest source revision instead:
+
+```console
+cargo install --git https://github.com/choplin/yomu --locked
+```
+
+From a local checkout:
+
+```console
+cargo install --path . --locked
+```
+
+## Usage
+
+Open a Markdown file:
+
+```console
+yomu examples/showcase.md
 ```
 
 Markdown can also be piped through standard input. Use either an omitted path
@@ -32,8 +56,8 @@ or the conventional `-`; relative image paths are resolved from the current
 working directory:
 
 ```console
-cat examples/showcase.md | nix develop -c cargo run --
-printf '# Hello\n' | nix develop -c cargo run -- -
+cat examples/showcase.md | yomu
+printf '# Hello\n' | yomu -
 ```
 
 The showcase covers headings, inline styles, nested and ordered lists, task
@@ -57,12 +81,12 @@ Unsupported terminals and rasterization failures retain readable heading text.
 The bundled font is licensed under the SIL Open Font License 1.1; see
 `assets/fonts/OFL-NotoSansJP.txt`.
 
-Without configuration, Raden asks Urushi to classify the terminal background
+Without configuration, Yomu asks Urushi to classify the terminal background
 once before startup and selects its light or dark built-in Theme. Missing,
 timed-out, or malformed background responses quietly use the dark Theme.
 
-Create `$XDG_CONFIG_HOME/raden/config.toml` (or
-`~/.config/raden/config.toml` when `XDG_CONFIG_HOME` is unset) to select an
+Create `$XDG_CONFIG_HOME/yomu/config.toml` (or
+`~/.config/yomu/config.toml` when `XDG_CONFIG_HOME` is unset) to select an
 explicit Theme and configure the reader:
 
 ```toml
@@ -74,11 +98,11 @@ max_width = 100
 
 ### Themes and element rendering
 
-Raden ships `builtin:dark`, `builtin:light`, and `builtin:plain`. Select one in
+Yomu ships `builtin:dark`, `builtin:light`, and `builtin:plain`. Select one in
 `config.toml` or override the selection for one invocation:
 
 ```console
-nix develop -c cargo run -- --theme builtin:light examples/showcase.md
+yomu --theme builtin:light examples/showcase.md
 ```
 
 `builtin:plain` uses terminal text for every rich element. `builtin:auto` is
@@ -112,7 +136,7 @@ See [`examples/config.toml`](examples/config.toml) for a complete application
 configuration.
 
 User Themes are TOML files in
-`${XDG_CONFIG_HOME:-$HOME/.config}/raden/themes/`. The filename without
+`${XDG_CONFIG_HOME:-$HOME/.config}/yomu/themes/`. The filename without
 `.toml` is the selection name; no duplicate name field is required:
 
 [`examples/themes/custom.toml`](examples/themes/custom.toml) is a complete,
@@ -138,7 +162,7 @@ strikethrough, dim, and reverse. Text projections that need terminal notation
 also expose prefix/suffix or fixed marker text. Fixed marker sections use
 `text`; ordered-list numbering keeps the source number and configures its
 `suffix`. Thematic rules use the single-cell `character`, and table text follows
-the `cell` / `header` / `border` roles used by Urushi tables. Raden's
+the `cell` / `header` / `border` roles used by Urushi tables. Yomu's
 source-mapped table projection keeps its `left`, `column`, and `right` boundary
 text inside the `border` section. Rasterized tables use the same three roles;
 their header text style overlays the cell style, while `border.color` is
@@ -177,13 +201,13 @@ selected Kitty or Sixel presentation. Their canvas is transparent so
 the terminal background remains visible. Column widths fit
 parsed cell content up to a deterministic cap and
 only expand as far as needed, bounded by the viewport; wide cells wrap instead
-of shrinking the text. Raden determines the terminal height from the original
+of shrinking the text. Yomu determines the terminal height from the original
 table rows and their precomputed cell wrapping, with one extra row of breathing
 room. That logical height is converted through the terminal's measured cell
 pixels, and the SVG is scaled uniformly to it; width follows from the SVG aspect
 ratio. If the
 viewport cannot give every column a readable minimum width, or if
-table compilation or rasterization fails, raden re-lays out every cell as
+table compilation or rasterization fails, yomu re-lays out every cell as
 source-mapped terminal text. The renderer embeds its font and exposes no Typst
 package, network, or filesystem resolver.
 
@@ -213,7 +237,7 @@ MathJax compatibility. Unsupported or malformed input remains visible with its
 original `$...$` or `$$...$$` delimiters and a concise conversion or rendering
 diagnostic.
 
-Raden enters the alternate screen, queries terminal capabilities and cell-pixel
+Yomu enters the alternate screen, queries terminal capabilities and cell-pixel
 size, and only then starts reading input events. A terminal response is primary
 evidence; environment variables are used only when the protocol was not tested
 or no usable response arrived. Automatic selection is deterministic:
@@ -222,7 +246,7 @@ Kitty, then sixel, then Text. Sixel remains experimental.
 Override the automatic choice from the command line:
 
 ```console
-nix develop -c cargo run -- --graphics text examples/showcase.md
+yomu --graphics text examples/showcase.md
 ```
 
 The accepted values are `auto`, `kitty`, `sixel`, and `text`. An explicit Kitty
@@ -273,6 +297,20 @@ complete frame of the current release build. See
 [`benches/README.md`](benches/README.md) for its measurement contract and
 usage.
 
+## Text rendering check
+
+Text mode requires no terminal graphics support:
+
+```console
+yomu --graphics text examples/showcase.md
+```
+
+Verify ordinary and Unicode prose, code, links and destinations, thematic
+rules, headings, narrow and wide tables, valid and invalid math, the local
+image label, and the long document scroll path. Resize the terminal and confirm
+that the same source content remains near the viewport anchor, then quit with
+`q` and confirm the normal shell screen is restored.
+
 ## Kitty graphics check
 
 Use a Markdown fixture with level-one or level-two headings, or one that
@@ -280,7 +318,7 @@ references a local PNG, JPEG, WebP, or GIF, then run the viewer in a
 Kitty-compatible terminal:
 
 ```console
-nix develop -c cargo run -- /path/to/fixture.md
+yomu /path/to/fixture.md
 ```
 
 Check the backend label in the footer and verify this lifecycle:
@@ -326,29 +364,21 @@ with no stale fragments after scrolling away and back. A brief full-screen
 redraw is expected: portable partial sixel deletion is not reliable across the
 target terminals.
 
-## Motivation
+## Development
 
-- Reviewing AI-written markdown happens in the terminal, but web rendering is
-  easier to read, so the author keeps switching to VS Code, Zed, or a browser.
-- Projects like mdroll and glowm suggest that sixel / kitty image protocol can
-  close most of that readability gap without leaving the CLI.
+The Nix development shell supplies the supported Rust toolchain and local
+utilities:
 
-## Notes
+```console
+nix develop
+cargo test --all-targets --all-features
+```
 
-- Related projects:
-  - [mdroll](https://github.com/tokuhirom/mdroll), [glowm](https://github.com/atani/glowm) — inspiration for the approach.
-  - [mdfried](https://github.com/benjajaja/mdfried) — very close prior art:
-    Rust, images via sixel/kitty/iTerm2 (chafa fallback), image slicing for
-    natural scrolling, big headers, syntax highlighting, mermaid, pager/search.
-    Its image layer is extracted as
-    [ratatui-image](https://github.com/benjajaja/ratatui-image).
-  - Gaps observed in mdfried (as of 2026-08): live reload, math rendering,
-    and any review-oriented workflow.
-- Differentiation: build for the AI-review use case — inline comments, math
-  and tables as first-class citizens — rather than competing as a
-  general-purpose viewer.
-- Not finalized: inline comment design and live mode design.
-- Naming: rejected candidates — makie (collides with Makie.jl), galley
-  (collides with an AI-coding CLI and a macOS PDF previewer), inlay ("inlay
-  hints" association), tipin (obscure), focal (generic, Ubuntu Focal Fossa).
-  raden pairs with the author's urushi project (lacquer-craft lineage).
+Release automation and its non-publishing validation procedure are documented
+in [`docs/release-automation.md`](docs/release-automation.md).
+
+## License
+
+Yomu is licensed under the [MIT License](LICENSE). The bundled Noto Sans JP
+font remains licensed under the SIL Open Font License 1.1; see
+[`assets/fonts/OFL-NotoSansJP.txt`](assets/fonts/OFL-NotoSansJP.txt).

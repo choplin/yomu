@@ -1,4 +1,4 @@
-//! Core document, layout, and application state for raden.
+//! Core document, layout, and application state for yomu.
 
 mod app;
 mod code;
@@ -127,7 +127,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after the Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("raden-invalid-{suffix}.md"));
+        let path = std::env::temp_dir().join(format!("yomu-invalid-{suffix}.md"));
         fs::write(&path, [0xff, 0xfe]).expect("fixture should be writable");
 
         let error = load_document(&path).expect_err("invalid UTF-8 must fail");
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn load_document_reports_a_missing_path() {
-        let path = std::env::temp_dir().join("raden-file-that-does-not-exist.md");
+        let path = std::env::temp_dir().join("yomu-file-that-does-not-exist.md");
         let error = load_document(&path).expect_err("missing input must fail");
         let message = format!("{error:#}");
 

@@ -1,14 +1,14 @@
 # Theme and element rendering
 
-Raden Theme is the serializable application-semantic layer that maps Markdown
-and reader chrome to Urushi styles plus Raden's typed raster parameters. It is
+Yomu Theme is the serializable application-semantic layer that maps Markdown
+and reader chrome to Urushi styles plus Yomu's typed raster parameters. It is
 not a second terminal capability or graphics protocol system.
 
 ## Ownership boundary
 
 Urushi owns terminal background observation and classification, low-level
 colors and text styles, terminal capability lowering, graphics backend
-selection, protocol lifecycle, and runtime fallback. Raden owns the `app` and
+selection, protocol lifecycle, and runtime fallback. Yomu owns the `app` and
 `document` semantic roles, Theme discovery and inheritance, user overrides,
 and the element-specific decision to prepare text or raster content.
 
@@ -20,7 +20,7 @@ example, is either `Text(TextProjection)` or
 settings and its required readable text projection directly. There is no runtime
 state containing a presentation flag plus two potentially active render
 styles. Text styles lower to Urushi values at View construction. Raster
-settings remain Raden data and are included in raster cache identity.
+settings remain Yomu data and are included in raster cache identity.
 
 ## Resolution
 
@@ -79,7 +79,7 @@ mode rather than a degraded dark Theme.
 
 ## Settings boundary
 
-The serializable `ThemeSettings` tree mirrors Raden's app and Markdown roles.
+The serializable `ThemeSettings` tree mirrors Yomu's app and Markdown roles.
 Every text-bearing role uses the same `TextStyleSettings`. A text projection
 adds only the notation its role requires: prefix/suffix around source text,
 `text` for a fixed marker, or the single-cell `character` repeated by a
@@ -88,11 +88,11 @@ corresponding direct settings variant.
 
 Table text follows Urushi's semantic presentation roles: `cell`, `header`, and
 `border`. The border section owns both its text style and the `left`, `column`,
-and `right` strings used by Raden's source-mapped text projection. It is kept as
-`TableTextProjection` rather than presented as an Urushi `Table`: Raden must
+and `right` strings used by Yomu's source-mapped text projection. It is kept as
+`TableTextProjection` rather than presented as an Urushi `Table`: Yomu must
 retain a source range for each Markdown cell, while Urushi owns renderer-neutral
 table composition without Markdown source identity. Rasterized table geometry
-remains a separate Raden-specific section. Its `cell` and `header` text roles
+remains a separate Yomu-specific section. Its `cell` and `header` text roles
 control foreground, background, bold, italic, underline, and strikethrough;
 `header` overlays `cell`. Its `border.color` is independent of both text roles.
 

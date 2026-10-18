@@ -1,4 +1,4 @@
-# raden Markdown showcase
+# yomu Markdown showcase
 
 This document exercises the ordinary Markdown supported by the initial
 one-file viewer. Resize the terminal while reading and confirm that the same
@@ -7,7 +7,7 @@ logical content remains near the top of the viewport.
 ## Inline styles
 
 Plain text can contain *emphasis*, **strong emphasis**, ~~strikethrough~~,
-`inline code`, and a [link to the raden repository](https://example.com/raden).
+`inline code`, and a [link to the yomu repository](https://example.com/yomu).
 Inline math is retained as source text: $E = mc^2$.
 
 ## Lists and tasks
@@ -34,11 +34,11 @@ Inline math is retained as source text: $E = mc^2$.
 
 ## Code
 
-Inline code looks like `raden examples/showcase.md`.
+Inline code looks like `yomu examples/showcase.md`.
 
 ```rust
 fn main() {
-    println!("hello from raden");
+    println!("hello from yomu");
 }
 ```
 
@@ -84,7 +84,7 @@ This bundled PNG exercises successful Kitty rendering without any setup:
 Raw inline HTML remains visible but muted: <kbd>q</kbd> exits the viewer.
 
 This separate missing image intentionally demonstrates a readable diagnostic
-without interrupting review:
+without interrupting reading:
 
 ![An intentionally missing image](fixtures/missing-image.png)
 

@@ -1,4 +1,4 @@
-# Copy this file to ${XDG_CONFIG_HOME:-$HOME/.config}/raden/themes/custom.toml.
+# Copy this file to ${XDG_CONFIG_HOME:-$HOME/.config}/yomu/themes/custom.toml.
 extends = "builtin:dark"
 
 [palette]

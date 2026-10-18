@@ -1891,34 +1891,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raden"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "fontdb",
- "fontdue",
- "image",
- "percent-encoding",
- "pulldown-cmark",
- "resvg",
- "serde",
- "syntect",
- "tex2typst-rs",
- "toml 0.9.12+spec-1.1.0",
- "typst",
- "typst-as-lib",
- "typst-assets",
- "typst-svg",
- "unicode-width",
- "urushi",
- "urushi-graphics",
- "urushi-terminal",
- "urushi-tui-app",
-]
-
-[[package]]
 name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3679,6 +3651,34 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "yomu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "fontdb",
+ "fontdue",
+ "image",
+ "percent-encoding",
+ "pulldown-cmark",
+ "resvg",
+ "serde",
+ "syntect",
+ "tex2typst-rs",
+ "toml 0.9.12+spec-1.1.0",
+ "typst",
+ "typst-as-lib",
+ "typst-assets",
+ "typst-svg",
+ "unicode-width",
+ "urushi",
+ "urushi-graphics",
+ "urushi-terminal",
+ "urushi-tui-app",
 ]
 
 [[package]]

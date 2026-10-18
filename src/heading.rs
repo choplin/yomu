@@ -75,7 +75,7 @@ impl HeadingFonts {
     fn load_from_database(families: &[String], database: &Database) -> Result<Self, String> {
         let mut configured = Vec::with_capacity(families.len());
         let mut hash = blake3::Hasher::new();
-        hash.update(b"raden-heading-font-stack-v1");
+        hash.update(b"yomu-heading-font-stack-v1");
         for family in families {
             let Some(id) = database.query(&Query {
                 families: &[Family::Name(family)],

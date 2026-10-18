@@ -1,5 +1,5 @@
 [devshell]
-name = "raden"
+name = "yomu"
 packages = ["cargo-sweep"]
 
 [[env]]
@@ -12,7 +12,7 @@ prefix = "${CARGO_HOME}/bin"
 
 [[commands]]
 name = "install-local"
-help = "Install the local raden release binary into Cargo's bin directory"
+help = "Install the local yomu release binary into Cargo's bin directory"
 command = '''
 cargo install --path "$PRJ_ROOT" --locked --force
 '''

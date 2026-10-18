@@ -1,4 +1,4 @@
-# Copy this file to ${XDG_CONFIG_HOME:-$HOME/.config}/raden/config.toml.
+# Copy this file to ${XDG_CONFIG_HOME:-$HOME/.config}/yomu/config.toml.
 theme = "custom"
 
 [view]

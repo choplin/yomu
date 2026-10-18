@@ -1,6 +1,6 @@
 # Source-Anchored Layout
 
-This document answers how Raden preserves logical reading position and source
+This document answers how Yomu preserves logical reading position and source
 identity while wrapping, resizing, or replacing rich graphics with text.
 
 ## Decision
@@ -42,7 +42,7 @@ Rendered rows are unsuitable as canonical identity because their count changes
 with viewport width, font cell geometry, raster availability, and text
 fallback. Line and column coordinates would introduce another conversion with
 ambiguous Unicode width behavior. The source range remains stable for the
-lifetime of the parsed `Document`; Raden does not claim that it survives edits
+lifetime of the parsed `Document`; Yomu does not claim that it survives edits
 to the source file.
 
 ## Mapping rules
@@ -95,7 +95,7 @@ without additional state.
 
 Equal rectangles would make row indices appear stable, but text tables,
 diagnostics, and formulas need different heights from their rasters. Clipping
-them to the old rectangle would discard reviewable content. Raden instead
+them to the old rectangle would discard reviewable content. Yomu instead
 rebuilds layout and preserves the source anchor.
 
 ### Apply every completed preparation

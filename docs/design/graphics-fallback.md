@@ -1,17 +1,17 @@
 # Graphics Selection and Fallback
 
-This document answers how Raden uses Urushi terminal graphics without making
+This document answers how Yomu uses Urushi terminal graphics without making
 document reviewability depend on a graphics protocol or successful
 rasterization.
 
 ## Decision
 
 Every rich element has a cell-aligned RGBA projection and a readable text
-projection. Raden embeds prepared RGBA in `urushi_graphics::Image`, composes it
+projection. Yomu embeds prepared RGBA in `urushi_graphics::Image`, composes it
 with `ImagePresentation`, and supplies the text projection as the component's
 fallback. The resulting Image is an ordinary part of the application `View`.
 
-Raden owns raster preparation and application geometry. `urushi-tui-app` with
+Yomu owns raster preparation and application geometry. `urushi-tui-app` with
 its `graphics` feature owns capability observation, protocol selection, View
 resolution, clipping, Kitty/Sixel lifecycle state, transactional frame commit,
 failure recovery, resize handling, and shutdown cleanup.
@@ -23,7 +23,7 @@ prefers positively confirmed Kitty support, then Sixel when uniform cell-pixel
 geometry is known, and finally text. Explicit Kitty or Sixel is a requirement;
 an unavailable explicit protocol fails startup.
 
-Explicit text mode skips Raden raster effects. In automatic mode Raden may
+Explicit text mode skips Yomu raster effects. In automatic mode Yomu may
 prepare RGBA before learning that the runtime selected text; this is bounded
 extra work and preserves the separation between application state and terminal
 capabilities.
@@ -49,12 +49,12 @@ Their state is internal to `urushi-graphics` and the runtime presenter.
 On a graphics-output failure, the Urushi presenter attempts protocol cleanup,
 disables graphics for the remaining session, redraws the same View's text
 fallback, and publishes the error through the terminal-error subscription.
-Raden records the diagnostic in its footer but does not operate the backend.
+Yomu records the diagnostic in its footer but does not operate the backend.
 Resize and shutdown use the same Urushi-owned lifecycle.
 
 ## Asynchronous preparation
 
-Raden returns raster preparation as `Effect::perform_latest` under one stable
+Yomu returns raster preparation as `Effect::perform_latest` under one stable
 key. Its completion carries prepared assets, not a completed `Layout`; `view`
 derives layout from the current model and those assets. Replacement suppresses
 obsolete queued work at the runtime boundary, and a generation check also
@@ -70,7 +70,7 @@ but cannot change Markdown meaning, source navigation, or fallback content.
 
 ## Rejected alternatives
 
-### Keep a Raden graphics backend
+### Keep a Yomu graphics backend
 
 A second backend would duplicate capability selection, resize ordering,
 transactional commit, protocol recovery, and cleanup already provided by

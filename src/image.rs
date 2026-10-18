@@ -1172,7 +1172,7 @@ mod tests {
             .as_nanos();
         let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "raden-image-{}-{suffix}-{serial}",
+            "yomu-image-{}-{suffix}-{serial}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("fixture directory should be created");
@@ -1686,7 +1686,7 @@ mod tests {
         let crate::theme::HeadingStyle::Rasterized(style) = &mut theme.document.headings.h1 else {
             panic!("built-in H1 should be rasterized");
         };
-        style.font_families = vec!["Raden Test Font That Does Not Exist 8E31A2".to_owned()];
+        style.font_families = vec!["Yomu Test Font That Does Not Exist 8E31A2".to_owned()];
         let mut cache = RasterCache::default();
         let cell = PixelSize {
             width: 8,

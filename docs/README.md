@@ -1,6 +1,6 @@
 # Documentation Policy
 
-Everything under `docs/` is written for developers changing Raden. User-facing
+Everything under `docs/` is written for developers changing Yomu. User-facing
 installation, configuration, and operation belong in the top-level
 [`README`](../README.md), not here.
 
@@ -36,13 +36,13 @@ topic may constrain several modules, and one architectural unit may link to
 several design topics. When a decision changes, rewrite the design document so
 it continues to describe the present rule. These documents are not ADRs: they
 do not accumulate dated states. The decision log preserves the superseded
-decision and why Raden revised it.
+decision and why Yomu revised it.
 
 ## `decision-log.md`: design decision history
 
 [`decision-log.md`](decision-log.md) preserves design decisions whose historical
 context would otherwise disappear when a design document is rewritten in
-place. A row records that Raden chose or revised a durable design rule among
+place. A row records that Yomu chose or revised a durable design rule among
 meaningful alternatives, summarizes why, and links to the document that owns
 the current rule and rationale.
 

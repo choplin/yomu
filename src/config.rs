@@ -10,7 +10,7 @@ use urushi_terminal::TerminalBackground;
 
 use crate::{GraphicsPreference, theme};
 
-const APP_DIRECTORY: &str = "raden";
+const APP_DIRECTORY: &str = "yomu";
 const CONFIG_FILE: &str = "config.toml";
 const DEFAULT_MAX_WIDTH: u16 = 100;
 #[derive(Clone, Debug, Deserialize)]
@@ -157,7 +157,7 @@ mod tests {
     fn xdg_config_home_takes_precedence() {
         assert_eq!(
             config_path(Some("/tmp/xdg"), Some("/home/user")),
-            Some(PathBuf::from("/tmp/xdg/raden/config.toml"))
+            Some(PathBuf::from("/tmp/xdg/yomu/config.toml"))
         );
     }
 
@@ -165,7 +165,7 @@ mod tests {
     fn relative_xdg_config_home_falls_back_to_home() {
         assert_eq!(
             config_path(Some("relative"), Some("/home/user")),
-            Some(PathBuf::from("/home/user/.config/raden/config.toml"))
+            Some(PathBuf::from("/home/user/.config/yomu/config.toml"))
         );
     }
 
@@ -252,7 +252,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after the Unix epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("raden-config-theme-{suffix}"));
+        let root = std::env::temp_dir().join(format!("yomu-config-theme-{suffix}"));
         let themes = root.join("themes");
         fs::create_dir_all(&themes).expect("Theme fixture directory should be writable");
         let config_path = root.join(CONFIG_FILE);

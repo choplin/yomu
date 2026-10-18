@@ -1771,7 +1771,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("raden-layout-text-{suffix}"));
+        let root = std::env::temp_dir().join(format!("yomu-layout-text-{suffix}"));
         fs::create_dir(&root).expect("fixture directory should be created");
         let document = Document::parse("![diagram](missing.png)".to_owned());
         let catalog = ImageCatalog::load(&document, &root.join("doc.md"));
@@ -1789,7 +1789,7 @@ mod tests {
 
     #[test]
     fn narrow_table_fallback_keeps_every_cell_and_its_source_span() {
-        let markdown = "| Name | 説明 |\n| --- | --- |\n| raden | very long Unicode 内容 |\n";
+        let markdown = "| Name | 説明 |\n| --- | --- |\n| yomu | very long Unicode 内容 |\n";
         let document = Document::parse(markdown.to_owned());
         let layout = Layout::new(&document, 12);
         let fragments = layout
@@ -1818,7 +1818,7 @@ mod tests {
 
     #[test]
     fn table_raster_uses_the_scene_cache_and_changes_on_resize() {
-        let markdown = "before\n\n| Name | 説明 | Value |\n| :--- | :---: | ---: |\n| raden | Unicode 螺鈿 with wrapped content | 42 |\n\nafter";
+        let markdown = "before\n\n| Name | 説明 | Value |\n| :--- | :---: | ---: |\n| yomu | Unicode 螺鈿 with wrapped content | 42 |\n\nafter";
         let document = Document::parse(markdown.to_owned());
         let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
         let mut cache = RasterCache::default();
@@ -1847,7 +1847,7 @@ mod tests {
 
     #[test]
     fn table_raster_failure_falls_back_without_losing_content() {
-        let markdown = "| Name | Value |\n| --- | ---: |\n| raden | 42 |\n";
+        let markdown = "| Name | Value |\n| --- | ---: |\n| yomu | 42 |\n";
         let document = Document::parse(markdown.to_owned());
         let catalog = ImageCatalog::load(&document, std::path::Path::new("doc.md"));
         let mut cache = RasterCache::new(1);
@@ -1871,7 +1871,7 @@ mod tests {
         assert!(rendered.contains("table raster unavailable"));
         assert!(rendered.contains("cache capacity"));
         assert!(rendered.contains("Name"));
-        assert!(rendered.contains("raden"));
+        assert!(rendered.contains("yomu"));
         assert!(rendered.contains("42"));
     }
 
@@ -1881,7 +1881,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("raden-layout-inline-{suffix}"));
+        let root = std::env::temp_dir().join(format!("yomu-layout-inline-{suffix}"));
         fs::create_dir(&root).expect("fixture directory should be created");
         let document = Document::parse("**left ![diagram](missing.png) right**".to_owned());
         let catalog = ImageCatalog::load(&document, &root.join("doc.md"));
@@ -1910,7 +1910,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("raden-layout-image-{suffix}"));
+        let root = std::env::temp_dir().join(format!("yomu-layout-image-{suffix}"));
         fs::create_dir(&root).expect("fixture directory should be created");
         let image_path = root.join("image.png");
         ImageBuffer::<Rgba<u8>, _>::from_pixel(4, 4, Rgba([1, 2, 3, 255]))
@@ -1960,7 +1960,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("raden-layout-heading-{suffix}"));
+        let root = std::env::temp_dir().join(format!("yomu-layout-heading-{suffix}"));
         fs::create_dir(&root).expect("fixture directory should be created");
         let markdown = "# 漆と螺鈿\n\n## A long second-level heading\n\n### Plain heading";
         let document = Document::parse(markdown.to_owned());

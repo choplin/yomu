@@ -1,10 +1,10 @@
 # Architecture
 
-This document is the starting point for developers changing Raden. It explains
+This document is the starting point for developers changing Yomu. It explains
 how Markdown source becomes a source-aware Urushi view and which responsibilities
 remain application-specific.
 
-Raden is one Rust package with a library and CLI binary. The top-level
+Yomu is one Rust package with a library and CLI binary. The top-level
 [`README`](../README.md) describes user-visible behavior. Precise rules for
 Theme ownership and resolution live in [`theme.md`](theme.md). Precise rules for
 source identity and graphics degradation live in
@@ -40,7 +40,7 @@ text projection         raster preparation
        cells + Kitty/Sixel lifecycle
 ```
 
-Raden owns Markdown meaning, source-aware navigation, raster preparation,
+Yomu owns Markdown meaning, source-aware navigation, raster preparation,
 application-semantic Theme roles, and application state. Urushi owns the
 terminal session, background observation and light/dark classification, event delivery, effects,
 view resolution, cell-frame commit, graphics protocol selection and lifecycle,
@@ -72,11 +72,11 @@ so every derived layout resolves the viewport from its source anchor.
 
 ### Theme resolution
 
-[`src/theme.rs`](../src/theme.rs) owns Raden's serializable partial Theme
+[`src/theme.rs`](../src/theme.rs) owns Yomu's serializable partial Theme
 schema, built-in Themes, single inheritance, recursive merge, validation, and
 the complete `Theme` consumed by rendering. App roles and Markdown
-roles remain Raden concepts. Terminal colors lower to Urushi `TextStyle`, while
-heading, table, math, and image raster parameters remain typed Raden data.
+roles remain Yomu concepts. Terminal colors lower to Urushi `TextStyle`, while
+heading, table, math, and image raster parameters remain typed Yomu data.
 Resolved rich-element styles are element-specific sum types: text or
 rasterized content with an explicit readable fallback. The partial merge model
 does not leak a presentation flag or an inactive render branch into runtime.
@@ -86,7 +86,7 @@ model.
 [`src/config.rs`](../src/config.rs) discovers user Themes next to `config.toml`
 and applies config overrides after the selected Theme. Automatic light/dark
 selection queries the terminal once through Urushi and uses Urushi's
-`ThemeMode` classification; Raden does not duplicate the query or luminance
+`ThemeMode` classification; Yomu does not duplicate the query or luminance
 policy. Graphics capability, backend selection, viewport width, cache capacity,
 and safety limits are outside Theme.
 
@@ -104,7 +104,7 @@ cache coordinates:
 
 Raster identities include every input that changes pixels and the resolved
 Theme identity. Protocol upload and
-encoded-band caches are not Raden state; they are owned by `urushi-graphics`.
+encoded-band caches are not Yomu state; they are owned by `urushi-graphics`.
 
 ### Reading state and View construction
 
@@ -116,11 +116,11 @@ preparation.
 [`src/ui.rs`](../src/ui.rs) converts the layout into one Urushi `View`. Text and
 `urushi_graphics::Image` components share the same row geometry. An Urushi
 vertical `Viewport` performs clipping, including the source crop of a partially
-visible image. Raden emits no Kitty or Sixel commands.
+visible image. Yomu emits no Kitty or Sixel commands.
 
 ### Application and runtime
 
-[`src/terminal.rs`](../src/terminal.rs) defines Raden's
+[`src/terminal.rs`](../src/terminal.rs) defines Yomu's
 `urushi_tui_app::Application`: `ReaderModel`, `Message`, `init`, `update`,
 `view`, and `subscriptions`. These are application-domain TEA values. The
 runtime owns their execution.
@@ -144,11 +144,11 @@ once and commits its cell frame and image scene together.
 
 1. The CLI resolves file or standard-input Markdown plus optional graphics and
    Theme selections.
-2. Raden parses the document, loads configuration, resolves one validated
+2. Yomu parses the document, loads configuration, resolves one validated
    Theme, and loads local-image metadata.
 3. Urushi enters the terminal session, observes geometry and capabilities, and
    selects the graphics presentation.
-4. The initial `Surface` message causes Raden to return a latest-only raster
+4. The initial `Surface` message causes Yomu to return a latest-only raster
    effect when graphics have not been explicitly disabled.
 5. The effect completion adds prepared assets to the model. `view` derives a
    layout containing Urushi Image components, and Urushi commits cells and
@@ -156,13 +156,13 @@ once and commits its cell frame and image scene together.
 
 ### Scroll and resize
 
-A key becomes a Raden `Command`, and `App` advances through the currently
+A key becomes a Yomu `Command`, and `App` advances through the currently
 derived layout's cell heights while retaining only a source anchor in the
-model. The next `view` derives layout again from that updated state. Raden also
+model. The next `view` derives layout again from that updated state. Yomu also
 returns a latest-only effect so near-viewport raster preparation follows the
 new focus.
 
-On resize, Raden clears assets tied to the old geometry and requests new
+On resize, Yomu clears assets tied to the old geometry and requests new
 preparation. The next `view` derives the new-width text projection until those
 assets arrive. Urushi owns presentation invalidation, graphics clearing, and
 redraw against the accepted surface snapshot. A stale effect generation cannot
@@ -202,6 +202,9 @@ through `layout.rs`. Raster changes begin in `image.rs` and the specialized
 rasterizer. Navigation belongs in `app.rs`; message handling and effects belong
 in `terminal.rs`; View composition belongs in `ui.rs`.
 
-Graphics protocol behavior belongs in the Urushi workspace, not Raden. A new
-rasterized Raden element needs bounded preparation, stable asset and placement
+Graphics protocol behavior belongs in the Urushi workspace, not Yomu. A new
+rasterized Yomu element needs bounded preparation, stable asset and placement
 keys, a readable fallback, and an `ImagePresentation` in the View.
+
+Release packaging and automation are described separately in
+[`release-automation.md`](release-automation.md).

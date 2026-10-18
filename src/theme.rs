@@ -2113,7 +2113,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should follow Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("raden-theme-{suffix}"));
+        let path = std::env::temp_dir().join(format!("yomu-theme-{suffix}"));
         fs::create_dir_all(&path).expect("theme fixture directory should be writable");
         path
     }

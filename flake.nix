@@ -1,5 +1,5 @@
 {
-  description = "Rust development environment for raden";
+  description = "Rust development environment for yomu";
 
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0";

@@ -275,7 +275,7 @@ impl ReaderApplication {
     ) -> Effect<Message> {
         let generation = model.generation;
         let cell_pixels = model.cell_pixels;
-        Effect::perform_latest("raden-rasterize", move || {
+        Effect::perform_latest("yomu-rasterize", move || {
             Message::Prepared(prepare_graphics_result(GraphicsPreparation {
                 document: &document,
                 images: &images,

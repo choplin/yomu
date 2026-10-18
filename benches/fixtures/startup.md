@@ -1,4 +1,4 @@
-# raden startup benchmark
+# yomu startup benchmark
 
 This fixed document measures the first complete terminal frame without image
 filesystem access or document-size-dependent parsing noise.

@@ -314,7 +314,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("raden-app-image-{suffix}"));
+        let root = std::env::temp_dir().join(format!("yomu-app-image-{suffix}"));
         fs::create_dir(&root).expect("fixture directory should be created");
         let image_path = root.join("image.png");
         ImageBuffer::<Rgba<u8>, _>::from_pixel(4, 4, Rgba([1, 2, 3, 255]))
@@ -374,7 +374,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("raden-app-image-exit-{suffix}"));
+        let root = std::env::temp_dir().join(format!("yomu-app-image-exit-{suffix}"));
         fs::create_dir(&root).expect("fixture directory should be created");
         let image_path = root.join("image.png");
         ImageBuffer::<Rgba<u8>, _>::from_pixel(4, 4, Rgba([1, 2, 3, 255]))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Raden first-frame latency in a deterministic pseudo-terminal."""
+"""Compare Yomu first-frame latency in a deterministic pseudo-terminal."""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ class Sample:
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Measure Raden's first complete terminal frame in a fixed PTY"
+        description="Measure Yomu's first complete terminal frame in a fixed PTY"
     )
     parser.add_argument(
         "--samples", type=positive_int, default=20, help="recorded runs per mode"
@@ -114,7 +114,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--binary",
         type=Path,
-        help="prebuilt raden executable to measure instead of building this checkout",
+        help="prebuilt yomu executable to measure instead of building this checkout",
     )
     args = parser.parse_args(argv)
     args.mode = args.mode or ["auto", "text"]
@@ -154,7 +154,7 @@ def checked_file(path: Path) -> Path:
 def build_current_binary(repository: Path) -> Target:
     try:
         subprocess.run(
-            ["cargo", "build", "--release", "--locked", "--bin", "raden"],
+            ["cargo", "build", "--release", "--locked", "--bin", "yomu"],
             cwd=repository,
             check=True,
         )
@@ -170,7 +170,7 @@ def build_current_binary(repository: Path) -> Target:
     except subprocess.CalledProcessError as error:
         raise BenchmarkError(f"cargo failed with status {error.returncode}") from error
     target_directory = Path(json.loads(metadata.stdout)["target_directory"])
-    binary = checked_file(target_directory / "release" / "raden")
+    binary = checked_file(target_directory / "release" / "yomu")
     return Target(binary, file_sha256(binary))
 
 
@@ -427,7 +427,7 @@ def display_stat(value: float | None) -> str:
 
 
 def print_summary(args: argparse.Namespace, target: Target, samples: Sequence[Sample]) -> None:
-    print("Raden startup benchmark")
+    print("Yomu startup benchmark")
     print(f"  document: {args.document}")
     print(f"  config: {args.config}")
     print(f"  PTY: {args.columns}x{args.rows}")
@@ -474,9 +474,9 @@ def run(args: argparse.Namespace) -> int:
     document = checked_file(args.document)
     config = checked_file(args.config)
 
-    with tempfile.TemporaryDirectory(prefix="raden-startup-benchmark-") as root:
+    with tempfile.TemporaryDirectory(prefix="yomu-startup-benchmark-") as root:
         config_root = Path(root)
-        config_directory = config_root / "raden"
+        config_directory = config_root / "yomu"
         config_directory.mkdir()
         shutil.copyfile(config, config_directory / "config.toml")
 

@@ -23,7 +23,7 @@ pub(crate) fn view(
     theme: &Theme,
 ) -> View {
     let [header, body, footer] = viewport_areas(surface, max_width);
-    let title = format!(" raden — {}", path.display());
+    let title = format!(" yomu — {}", path.display());
     let percent = app.viewport_percent(layout, body.height);
     let status =
         format!(" j/k scroll  d/u page  g/G ends  q quit  {graphics_status}{percent:>5}% ",);
@@ -156,7 +156,7 @@ fn layout_row_view(layout: &Layout, row: &LayoutRow, theme: &Theme) -> View {
             ),
             graphic.asset.rgba.clone(),
         )
-        .expect("raden raster assets contain checked RGBA pixels")
+        .expect("yomu raster assets contain checked RGBA pixels")
         .fallback(graphic.fallback.clone());
         children.push(
             ImagePresentation::new()
