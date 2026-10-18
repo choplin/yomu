@@ -64,12 +64,12 @@ commands build source directly and are useful before or between releases.
 ## Validate a release
 
 Install `cargo-release` 1.1.6 and `dist` 0.33.0, then run the package and both
-planning paths from a clean checkout with Rust 1.92.0:
+planning paths from a clean checkout with Rust 1.92.0 or newer:
 
 ```sh
-cargo +1.92.0 package --locked
+cargo package --locked
 VERSION=x.y.z
-cargo +1.92.0 release --dry-run "$VERSION"
+cargo release --dry-run "$VERSION"
 dist plan
 dist generate --check
 ```
@@ -101,7 +101,7 @@ were actually observed; do not turn an unrun matrix entry into a support claim.
 3. Publish the initial crate and create and push its release commit and tag:
 
    ```sh
-   cargo +1.92.0 release --execute --no-confirm 0.1.0
+   cargo release --execute --no-confirm 0.1.0
    ```
 
 4. Confirm crates.io contains `yomu 0.1.0`.
@@ -119,7 +119,7 @@ were actually observed; do not turn an unrun matrix entry into a support claim.
 
    ```sh
    VERSION=x.y.z
-   cargo +1.92.0 release --execute --no-confirm --no-publish "$VERSION"
+   cargo release --execute --no-confirm --no-publish "$VERSION"
    ```
 
 3. Confirm the `Publish crate` workflow publishes through OIDC, and the
