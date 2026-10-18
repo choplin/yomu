@@ -8,16 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
-### Changed
-
-- Release the initial crate locally and use crates.io Trusted Publishing for
-  later versions without long-lived crates.io or repository tokens.
-- Create each GitHub Release from the matching changelog section and append the
-  generated installation and artifact information.
-
 ### Added
 
-- Initial Yomu terminal Markdown reader with text, Kitty Graphics, and
-  experimental sixel presentation.
+- Yomu, a terminal Markdown reader for local files and standard input.
+- Source-aware navigation, responsive layout, syntax-highlighted code, tables,
+  local images, and rendered headings and math with readable text fallbacks.
+- Automatic Text, Kitty Graphics, and experimental sixel presentation with
+  explicit backend selection and actionable fallback diagnostics.
+- Built-in and user-defined Themes for terminal text and rasterized content.
 
 [Unreleased]: https://github.com/choplin/yomu/commits/main

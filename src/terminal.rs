@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use urushi::View;
+use urushi_graphics::{GraphicsSelection, select_graphics};
 use urushi_terminal::{TerminalQuery, backend::native::NativeTerminal};
 use urushi_tui_app::{
     Application, Effect, Input, KeyCode, KeyKind, Runtime, Subscription, Surface,
@@ -28,7 +29,8 @@ pub(crate) fn run(
     }
     let mut terminal = NativeTerminal::open().context("could not open the controlling terminal")?;
     let theme = resolve_theme(config, theme_name, &mut terminal)?;
-    let rasterize = preference != GraphicsPreference::Text && theme.uses_rasterization();
+    let graphics = resolve_graphics(preference, &mut terminal)?;
+    let rasterize = graphics != GraphicsSelection::Text && theme.uses_rasterization();
     let application = ReaderApplication {
         path: path.to_path_buf(),
         document: Arc::new(document.clone()),
@@ -37,7 +39,7 @@ pub(crate) fn run(
         latest_generation: Arc::new(AtomicU64::new(0)),
         max_width: config.body_max_width(),
         rasterize,
-        graphics_label: preference_label(preference),
+        graphics_label: selection_label(graphics),
         theme: Arc::new(theme),
     };
     Runtime::new(application)
@@ -66,6 +68,23 @@ fn resolve_theme(
     config.resolve_theme(theme_name, background)
 }
 
+fn resolve_graphics(
+    preference: GraphicsPreference,
+    terminal: &mut impl TerminalQuery,
+) -> Result<GraphicsSelection> {
+    if preference == GraphicsPreference::Text {
+        return Ok(GraphicsSelection::Text);
+    }
+    let window = terminal
+        .window_size()
+        .context("could not query terminal geometry for graphics selection")?;
+    let capabilities = terminal
+        .terminal_capabilities()
+        .context("could not query terminal graphics capabilities")?;
+    select_graphics(preference.into(), capabilities, window.cell_pixels())
+        .map_err(|error| anyhow!("{error}; try --graphics auto or --graphics text"))
+}
+
 struct ReaderApplication {
     path: PathBuf,
     document: Arc<Document>,
@@ -84,6 +103,7 @@ struct ReaderModel {
     surface: Surface,
     generation: u64,
     cell_pixels: PixelSize,
+    graphics_label: &'static str,
     terminal_diagnostic: Option<String>,
     graphics_diagnostic: Option<String>,
 }
@@ -108,6 +128,7 @@ impl Application for ReaderApplication {
                 surface,
                 generation: 0,
                 cell_pixels: PixelSize::FALLBACK,
+                graphics_label: self.graphics_label,
                 terminal_diagnostic: None,
                 graphics_diagnostic: None,
             },
@@ -143,6 +164,7 @@ impl Application for ReaderApplication {
             Message::Prepared(prepared) => self.apply_prepared(model, prepared),
             Message::TerminalError(error) => {
                 model.terminal_diagnostic = Some(error.to_string());
+                model.graphics_label = selection_label(GraphicsSelection::Text);
                 Effect::none()
             }
         }
@@ -293,7 +315,10 @@ impl ReaderApplication {
 
     fn graphics_status(&self, model: &ReaderModel) -> String {
         if let Some(error) = &model.terminal_diagnostic {
-            return format!("terminal warning ({error}); theme {}", self.theme.name);
+            return format!(
+                "graphics {}; terminal warning ({error}); theme {}",
+                model.graphics_label, self.theme.name
+            );
         }
         let warnings = self.images.diagnostics().len();
         let mut diagnostics = Vec::new();
@@ -306,12 +331,12 @@ impl ReaderApplication {
         if diagnostics.is_empty() {
             format!(
                 "graphics {}; theme {}",
-                self.graphics_label, self.theme.name
+                model.graphics_label, self.theme.name
             )
         } else {
             format!(
                 "graphics {} ({}); theme {}",
-                self.graphics_label,
+                model.graphics_label,
                 diagnostics.join("; "),
                 self.theme.name
             )
@@ -379,12 +404,11 @@ fn surface_cell_pixels(surface: Surface) -> Option<PixelSize> {
     })
 }
 
-const fn preference_label(preference: GraphicsPreference) -> &'static str {
-    match preference {
-        GraphicsPreference::Auto => "auto",
-        GraphicsPreference::Kitty => "kitty",
-        GraphicsPreference::Sixel => "sixel",
-        GraphicsPreference::Text => "text",
+const fn selection_label(selection: GraphicsSelection) -> &'static str {
+    match selection {
+        GraphicsSelection::Kitty => "kitty",
+        GraphicsSelection::Sixel => "sixel experimental",
+        GraphicsSelection::Text => "text",
     }
 }
 
@@ -394,6 +418,8 @@ mod tests {
 
     struct BackgroundTerminal {
         response: Option<urushi_terminal::TerminalBackground>,
+        capabilities: urushi_terminal::TerminalCapabilities,
+        window_pixels: Option<urushi_terminal::PixelSize>,
         query_count: usize,
     }
 
@@ -401,6 +427,8 @@ mod tests {
         const fn new(response: Option<urushi_terminal::TerminalBackground>) -> Self {
             Self {
                 response,
+                capabilities: urushi_terminal::TerminalCapabilities::none(),
+                window_pixels: None,
                 query_count: 0,
             }
         }
@@ -418,7 +446,7 @@ mod tests {
         fn window_size(&mut self) -> io::Result<urushi_terminal::WindowSize> {
             Ok(urushi_terminal::WindowSize::new(
                 urushi_terminal::TerminalSize::new(80, 24),
-                None,
+                self.window_pixels,
             ))
         }
 
@@ -431,6 +459,10 @@ mod tests {
         ) -> io::Result<Option<urushi_terminal::TerminalBackground>> {
             self.query_count += 1;
             Ok(self.response)
+        }
+
+        fn terminal_capabilities(&mut self) -> io::Result<urushi_terminal::TerminalCapabilities> {
+            Ok(self.capabilities)
         }
     }
 
@@ -460,9 +492,65 @@ mod tests {
             latest_generation: Arc::new(AtomicU64::new(0)),
             max_width: Some(80),
             rasterize,
-            graphics_label: preference_label(preference),
+            graphics_label: match preference {
+                GraphicsPreference::Kitty => selection_label(GraphicsSelection::Kitty),
+                GraphicsPreference::Sixel => selection_label(GraphicsSelection::Sixel),
+                GraphicsPreference::Auto | GraphicsPreference::Text => {
+                    selection_label(GraphicsSelection::Text)
+                }
+            },
             theme: Arc::new(theme),
         }
+    }
+
+    #[test]
+    fn automatic_graphics_reports_the_selected_backend() {
+        use urushi_terminal::TerminalGraphicsProtocols;
+
+        let cases = [
+            (
+                TerminalGraphicsProtocols::KITTY.union(TerminalGraphicsProtocols::SIXEL),
+                Some(urushi_terminal::PixelSize::new(800, 480)),
+                GraphicsSelection::Kitty,
+            ),
+            (
+                TerminalGraphicsProtocols::SIXEL,
+                Some(urushi_terminal::PixelSize::new(800, 480)),
+                GraphicsSelection::Sixel,
+            ),
+            (
+                TerminalGraphicsProtocols::empty(),
+                None,
+                GraphicsSelection::Text,
+            ),
+        ];
+
+        for (protocols, pixels, expected) in cases {
+            let mut terminal = BackgroundTerminal::new(None);
+            terminal.capabilities =
+                urushi_terminal::TerminalCapabilities::none().with_graphics_protocols(protocols);
+            terminal.window_pixels = pixels;
+
+            assert_eq!(
+                resolve_graphics(GraphicsPreference::Auto, &mut terminal)
+                    .expect("automatic graphics selection should succeed"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_explicit_graphics_suggests_safe_alternatives() {
+        let mut terminal = BackgroundTerminal::new(None);
+
+        let error = resolve_graphics(GraphicsPreference::Sixel, &mut terminal)
+            .expect_err("unsupported explicit Sixel should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("try --graphics auto or --graphics text")
+        );
     }
 
     #[test]
@@ -708,5 +796,20 @@ mod tests {
 
         assert!(status.contains("1 image warning(s)"));
         assert!(status.contains("configured heading fonts unavailable"));
+    }
+
+    #[test]
+    fn terminal_graphics_failure_reports_text_fallback() {
+        let application = application("Body", GraphicsPreference::Kitty);
+        let (mut model, _) = application.init();
+
+        let _ = application.update(
+            &mut model,
+            Message::TerminalError(io::Error::other("graphics write failed")),
+        );
+        let status = application.graphics_status(&model);
+
+        assert!(status.contains("graphics text"));
+        assert!(status.contains("terminal warning (graphics write failed)"));
     }
 }
