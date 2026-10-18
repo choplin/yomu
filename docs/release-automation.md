@@ -6,33 +6,35 @@ Yomu uses one release tag and two tools with non-overlapping ownership.
 | --- | --- |
 | Version and changelog update | `cargo-release` |
 | Release commit | `cargo-release` |
-| crates.io publication | `cargo-release` |
+| First crates.io publication | Local `cargo-release` |
+| Later crates.io publication | `Publish crate` workflow through Trusted Publishing |
 | `v<version>` tag and push | `cargo-release` |
 | Binary builds and archives | `dist` |
 | SHA-256 checksums | `dist` |
 | GitHub Release and artifact upload | `dist` |
 | Homebrew formula generation and tap publication | `dist` |
 
-The `Publish crate` GitHub Actions workflow is the only supported execution
-path for a release. It runs `cargo-release` from the default branch and accepts
-the SemVer release version as an explicit workflow input. The workflow reads
-the crates.io token from the `CARGO_REGISTRY_TOKEN` Actions secret. Never store
-a registry token in repository files or pass one as a workflow input.
+Run `cargo-release` locally. It owns the version and changelog update, release
+commit, `v<version>` tag, and push. For the first version it also publishes the
+crate with the credentials installed by `cargo login`. For later versions,
+pass `--no-publish` so the tag workflow owns crates.io publication.
 
-The workflow pushes its commit and tag with `RELEASE_GITHUB_TOKEN`. This secret
-must contain a service-account personal access token with repository contents
-write access because a push made with the built-in `GITHUB_TOKEN` does not
-trigger the tag-driven `Release` workflow. Restrict creation of matching
-release tags to this release principal: the generated workflow treats a
-matching tag and its commit as trusted release input.
+After the first version exists on crates.io, configure a Trusted Publisher for
+GitHub owner `choplin`, repository `yomu`, and workflow file
+`publish-crate.yml`, with no environment restriction. For later versions, the
+tag-triggered `Publish crate` workflow exchanges GitHub's OIDC identity for a
+short-lived crates.io token. It stores no long-lived crates.io or repository
+token. The workflow verifies that the tag matches `Cargo.toml`, and skips
+publication when that exact version already exists; this makes the first,
+locally published tag safe to push through the same workflow.
 
-`cargo-release` publishes the crate before it pushes the release commit and
-`v<version>` tag. The tag triggers the generated `Release` workflow, where
-`dist` builds and publishes the binary artifacts and updates
-`choplin/homebrew-tap`. The dist workflow does not publish to crates.io, update
-versions, or create commits or tags in the Yomu repository. It creates and
-pushes the formula commit in the Homebrew tap using a `HOMEBREW_TAP_TOKEN` with
-contents write access to that tap.
+The tag also triggers the generated `Release` workflow, where `dist` builds and
+publishes the binary artifacts and updates `choplin/homebrew-tap`. The dist
+workflow does not publish to crates.io, update versions, or create commits or
+tags in the Yomu repository. It creates and pushes the formula commit in the
+Homebrew tap using a `HOMEBREW_TAP_TOKEN` with contents write access to that
+tap. `RELEASE_GITHUB_TOKEN` and `CARGO_REGISTRY_TOKEN` repository secrets are
+not used.
 
 The generated `.github/workflows/release.yml` is derived from
 `dist-workspace.toml` by `dist` 0.33.0. Do not edit the workflow by hand;
@@ -91,23 +93,43 @@ repeat the Text, Kitty, and experimental sixel procedures in the README with
 `examples/showcase.md` and `examples/showcase-ja.md`. Record which terminals
 were actually observed; do not turn an unrun matrix entry into a support claim.
 
-## Publish a release
+## Publish the first release
 
 1. Confirm `main` is clean and all required checks pass.
-2. Confirm `CARGO_REGISTRY_TOKEN`, `RELEASE_GITHUB_TOKEN`, and
-   `HOMEBREW_TAP_TOKEN` exist as Actions secrets with the permissions described
-   above.
-3. Run the `Publish crate` workflow from `main` with the selected version.
-4. Confirm crates.io contains that `yomu` version.
-5. Confirm the tag-triggered `Release` workflow publishes archives and SHA-256
-   checksums for exactly the three supported targets and updates the `yomu`
-   formula in `choplin/homebrew-tap`.
-6. Install through Homebrew and cargo-binstall and verify `yomu --version`.
+2. Confirm `cargo login` has installed a valid crates.io token locally and the
+   `HOMEBREW_TAP_TOKEN` Actions secret can write to `choplin/homebrew-tap`.
+3. Publish the initial crate and create and push its release commit and tag:
 
-Do not run the workflow again for an already-published version. If crates.io
-publication succeeds but the release commit or tag push fails, inspect the
-repository, crates.io, and remote tags to determine the last completed
-`cargo-release` step. Resume only the missing commit, tag, or push operation
-for the same version; do not publish the crate again and do not use `dist` to
-recreate a `cargo-release` side effect. The `Release` workflow can be rerun
-after the tag exists because it only consumes that tag.
+   ```sh
+   cargo +1.92.0 release --execute --no-confirm 0.1.0
+   ```
+
+4. Confirm crates.io contains `yomu 0.1.0`.
+5. Confirm the `Publish crate` workflow skips the already-published version,
+   and the `Release` workflow publishes the three archives, SHA-256 checksums,
+   GitHub Release, and Homebrew formula.
+6. In the `yomu` crate settings on crates.io, add the Trusted Publisher
+   `choplin/yomu` with workflow filename `publish-crate.yml` and no environment.
+
+## Publish later releases
+
+1. Confirm `main` is clean, all required checks pass, the Trusted Publisher is
+   still configured, and `HOMEBREW_TAP_TOKEN` is available.
+2. Create and push the release commit and tag locally:
+
+   ```sh
+   VERSION=x.y.z
+   cargo +1.92.0 release --execute --no-confirm --no-publish "$VERSION"
+   ```
+
+3. Confirm the `Publish crate` workflow publishes through OIDC, and the
+   `Release` workflow publishes the expected binary and Homebrew outputs.
+4. Install through Homebrew and cargo-binstall and verify `yomu --version`.
+
+If the initial cargo-release publication succeeds but its release commit or tag
+push fails, do not publish the crate again. Inspect the local commit, local tag,
+remote branch, and remote tag, then resume only the missing step for the same
+version. For later releases, a failed Trusted Publishing job can be rerun
+against the existing tag; its exact-version check makes reruns safe after a
+successful upload. The dist workflow can likewise be rerun after the tag exists
+because it only consumes that tag.

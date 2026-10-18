@@ -8,6 +8,11 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Release the initial crate locally and use crates.io Trusted Publishing for
+  later versions without long-lived crates.io or repository tokens.
+
 ### Added
 
 - Initial Yomu terminal Markdown reader with text, Kitty Graphics, and
