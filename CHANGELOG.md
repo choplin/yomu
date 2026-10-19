@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Prebuilt ARM64 Linux archives in GitHub releases.
+
+### Changed
+
+- Nix exposes source builds as `yomu` and checksummed GitHub release binaries
+  as `yomu-bin`.
+
 ## [0.1.0] - 2026-10-18
 
 ### Added

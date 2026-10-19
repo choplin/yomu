@@ -50,8 +50,12 @@ every referenced GitHub Action to an audited commit. cargo-binstall reads the
 metadata in `Cargo.toml` and installs the `{name}-{target}.tar.xz` archive
 produced by `dist`, so it introduces no independent release side effect.
 
-The Nix flake is a development environment only. It has no package output,
-release-time publication step, or project binary cache.
+The Nix flake exposes the source build as `yomu` and the checksummed archives
+published by `dist` as `yomu-bin`; it intentionally defines no default
+package. After publishing a release, update the flake's release version and
+artifact hashes on the default branch. This separate update avoids requiring
+the release tag to refer to artifacts that do not exist until its workflow has
+completed.
 
 ## Installation paths
 
@@ -61,12 +65,15 @@ After a release, users can choose one of these equivalent distribution paths:
 cargo install yomu --locked
 brew install choplin/tap/yomu
 cargo binstall yomu
+nix profile install github:choplin/yomu#yomu-bin
+nix profile install github:choplin/yomu#yomu
 cargo install --git https://github.com/choplin/yomu --locked
 cargo install --path . --locked
 ```
 
-The first three consume published release outputs. The Git and local-checkout
-commands build source directly and are useful before or between releases.
+The prebuilt Nix package and first three commands consume published release
+outputs. The source Nix package, Git, and local-checkout commands build source
+directly and are useful before or between releases.
 
 ## Validate a release
 
@@ -88,6 +95,7 @@ and prints the planned release actions. The dist plan must contain only these
 targets and include the Homebrew installer and publisher:
 
 - `aarch64-apple-darwin`
+- `aarch64-unknown-linux-gnu`
 - `x86_64-apple-darwin`
 - `x86_64-unknown-linux-gnu`
 
@@ -113,7 +121,7 @@ were actually observed; do not turn an unrun matrix entry into a support claim.
 
 4. Confirm crates.io contains `yomu 0.1.0`.
 5. Confirm the `Publish crate` workflow skips the already-published version,
-   and the `Release` workflow publishes the three archives, SHA-256 checksums,
+   and the `Release` workflow publishes the four archives, SHA-256 checksums,
    GitHub Release, and Homebrew formula.
 6. In the `yomu` crate settings on crates.io, add the Trusted Publisher
    `choplin/yomu` with workflow filename `publish-crate.yml` and no environment.
@@ -131,7 +139,9 @@ were actually observed; do not turn an unrun matrix entry into a support claim.
 
 3. Confirm the `Publish crate` workflow publishes through OIDC, and the
    `Release` workflow publishes the expected binary and Homebrew outputs.
-4. Install through Homebrew and cargo-binstall and verify `yomu --version`.
+4. Update `releaseVersion` and the corresponding artifact hashes in `flake.nix`.
+5. Install through Homebrew, cargo-binstall, and Nix, then verify
+   `yomu --version`.
 
 If the initial cargo-release publication succeeds but its release commit or tag
 push fails, do not publish the crate again. Inspect the local commit, local tag,

@@ -35,6 +35,24 @@ brew install choplin/tap/yomu
 cargo binstall yomu
 ```
 
+### Nix
+
+Install the prebuilt binary from the latest packaged release:
+
+```console
+nix profile install github:choplin/yomu#yomu-bin
+```
+
+Prebuilt Nix packages are currently available for macOS on Apple Silicon and
+Intel, and for Linux on x86-64. The `yomu-bin` package will become available
+on Linux ARM64 when the next release publishes its first ARM64 Linux archive.
+To build the selected repository revision from source on any supported
+platform:
+
+```console
+nix profile install github:choplin/yomu#yomu
+```
+
 ### Cargo
 
 Building from source requires Rust 1.92 or newer.
