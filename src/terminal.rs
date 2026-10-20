@@ -8,7 +8,7 @@ use urushi::View;
 use urushi_graphics::{GraphicsSelection, select_graphics};
 use urushi_terminal::{TerminalQuery, backend::native::NativeTerminal};
 use urushi_tui_app::{
-    Application, Effect, Input, KeyCode, KeyKind, Runtime, Subscription, Surface,
+    Application, Effect, Input, KeyCode, KeyKind, Modifiers, Runtime, Subscription, Surface,
 };
 
 use crate::image::ImageCatalog;
@@ -38,6 +38,7 @@ pub(crate) fn run(
         raster_cache: Arc::new(Mutex::new(RasterCache::default())),
         latest_generation: Arc::new(AtomicU64::new(0)),
         max_width: config.body_max_width(),
+        search_case: config.search_case(),
         rasterize,
         graphics_label: selection_label(graphics),
         theme: Arc::new(theme),
@@ -92,6 +93,7 @@ struct ReaderApplication {
     raster_cache: Arc<Mutex<RasterCache>>,
     latest_generation: Arc<AtomicU64>,
     max_width: Option<u16>,
+    search_case: crate::app::SearchCase,
     rasterize: bool,
     graphics_label: &'static str,
     theme: Arc<crate::theme::Theme>,
@@ -99,6 +101,7 @@ struct ReaderApplication {
 
 struct ReaderModel {
     app: App,
+    search_input: Option<String>,
     prepared_graphics: Option<PreparedGraphics>,
     surface: Surface,
     generation: u64,
@@ -124,6 +127,7 @@ impl Application for ReaderApplication {
         (
             ReaderModel {
                 app: App::default(),
+                search_input: None,
                 prepared_graphics: None,
                 surface,
                 generation: 0,
@@ -139,8 +143,51 @@ impl Application for ReaderApplication {
     fn update(&self, model: &mut Self::Model, message: Self::Message) -> Effect<Self::Message> {
         match message {
             Message::Input(Input::Key(key)) if key.kind != KeyKind::Release => {
+                if let Some(query) = &mut model.search_input {
+                    match key.code {
+                        KeyCode::Escape => model.search_input = None,
+                        KeyCode::Enter => {
+                            let query = model.search_input.take().unwrap_or_default();
+                            if !query.is_empty() {
+                                model
+                                    .app
+                                    .search(self.document.source(), query, self.search_case);
+                                return self.after_navigation(model);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                        }
+                        KeyCode::Char(character)
+                            if !key.modifiers.contains(Modifiers::CONTROL)
+                                && !key.modifiers.contains(Modifiers::ALT)
+                                && !key.modifiers.contains(Modifiers::SUPER)
+                                && !key.modifiers.contains(Modifiers::HYPER)
+                                && !key.modifiers.contains(Modifiers::META) =>
+                        {
+                            query.push(character);
+                        }
+                        _ => {}
+                    }
+                    return Effect::none();
+                }
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Escape) {
                     return Effect::shutdown();
+                }
+                match key.code {
+                    KeyCode::Char('/') => {
+                        model.search_input = Some(String::new());
+                        return Effect::none();
+                    }
+                    KeyCode::Char('n') => {
+                        model.app.next_match();
+                        return self.after_navigation(model);
+                    }
+                    KeyCode::Char('N') => {
+                        model.app.previous_match();
+                        return self.after_navigation(model);
+                    }
+                    _ => {}
                 }
                 let command = Command::from_key(key);
                 if command == Command::None {
@@ -177,7 +224,7 @@ impl Application for ReaderApplication {
             &self.path,
             &model.app,
             &layout,
-            &status,
+            (&status, model.search_input.as_deref()),
             model.surface.size,
             self.max_width,
             &self.theme,
@@ -194,6 +241,14 @@ impl Application for ReaderApplication {
 }
 
 impl ReaderApplication {
+    fn after_navigation(&self, model: &mut ReaderModel) -> Effect<Message> {
+        let body = ui::viewport_areas(model.surface.size, self.max_width)[1];
+        let layout = self.layout(model);
+        model.app.clamp_viewport(&layout, body.height);
+        model.generation = model.generation.saturating_add(1);
+        self.prepare_graphics(model, body)
+    }
+
     fn apply_prepared(
         &self,
         model: &mut ReaderModel,
@@ -491,6 +546,7 @@ mod tests {
             raster_cache,
             latest_generation: Arc::new(AtomicU64::new(0)),
             max_width: Some(80),
+            search_case: crate::app::SearchCase::Smart,
             rasterize,
             graphics_label: match preference {
                 GraphicsPreference::Kitty => selection_label(GraphicsSelection::Kitty),
@@ -619,6 +675,53 @@ mod tests {
         assert!(model.prepared_graphics.is_none());
         assert!(layout.graphics.is_empty());
         assert_eq!(model.app.top_source(), 0);
+    }
+
+    #[test]
+    fn search_prompt_accepts_text_and_navigates_matches() {
+        let application = application_with_theme(
+            "first needle\n\nsecond needle",
+            GraphicsPreference::Text,
+            crate::theme::Theme::builtin_dark(),
+        );
+        let (mut model, _) = application.init();
+        let key = |code| Message::Input(Input::Key(urushi_tui_app::KeyEvent::new(code)));
+
+        let _ = application.update(&mut model, key(KeyCode::Char('/')));
+        for character in "needle".chars() {
+            let _ = application.update(&mut model, key(KeyCode::Char(character)));
+        }
+        assert_eq!(model.search_input.as_deref(), Some("needle"));
+
+        let _ = application.update(&mut model, key(KeyCode::Enter));
+        assert_eq!(model.search_input, None);
+        assert_eq!(model.app.search_status(), Some(("needle", Some((1, 2)))));
+
+        let _ = application.update(&mut model, key(KeyCode::Char('n')));
+        assert_eq!(model.app.search_status(), Some(("needle", Some((2, 2)))));
+    }
+
+    #[test]
+    fn escape_cancels_search_input_without_replacing_the_previous_search() {
+        let application = application_with_theme(
+            "needle",
+            GraphicsPreference::Text,
+            crate::theme::Theme::builtin_dark(),
+        );
+        let (mut model, _) = application.init();
+        let key = |code| Message::Input(Input::Key(urushi_tui_app::KeyEvent::new(code)));
+
+        let _ = application.update(&mut model, key(KeyCode::Char('/')));
+        for character in "needle".chars() {
+            let _ = application.update(&mut model, key(KeyCode::Char(character)));
+        }
+        let _ = application.update(&mut model, key(KeyCode::Enter));
+        let _ = application.update(&mut model, key(KeyCode::Char('/')));
+        let _ = application.update(&mut model, key(KeyCode::Char('x')));
+        let _ = application.update(&mut model, key(KeyCode::Escape));
+
+        assert_eq!(model.search_input, None);
+        assert_eq!(model.app.search_status(), Some(("needle", Some((1, 1)))));
     }
 
     #[test]

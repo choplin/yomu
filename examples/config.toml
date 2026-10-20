@@ -9,6 +9,11 @@ max_width = 100
 # One of: auto, kitty, sixel, text.
 renderer = "auto"
 
+[search]
+# Smartcase ignores case unless the query contains an uppercase letter.
+# One of: smart, sensitive, insensitive.
+case = "smart"
+
 [theme_overrides.palette]
 # Config-local overrides are applied after the selected Theme.
 accent = "#ff87d7"

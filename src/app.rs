@@ -1,6 +1,26 @@
 use urushi_tui_app::{KeyCode, KeyEvent};
 
-use crate::Layout;
+use crate::{Layout, SourceSpan};
+
+/// How a search query compares letter case.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SearchCase {
+    #[default]
+    Smart,
+    Sensitive,
+    Insensitive,
+}
+
+impl SearchCase {
+    fn is_sensitive(self, query: &str) -> bool {
+        match self {
+            Self::Smart => query.chars().any(char::is_uppercase),
+            Self::Sensitive => true,
+            Self::Insensitive => false,
+        }
+    }
+}
 
 /// A normalized action in the Reading state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +55,14 @@ pub struct App {
     top_source: usize,
     top_source_end: usize,
     top_row_offset: u16,
+    search: SearchState,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SearchState {
+    query: String,
+    matches: Vec<SourceSpan>,
+    current: Option<usize>,
 }
 
 impl App {
@@ -46,6 +74,57 @@ impl App {
     #[must_use]
     pub fn top_row_offset(&self) -> u16 {
         self.top_row_offset
+    }
+
+    #[must_use]
+    pub(crate) fn search_status(&self) -> Option<(&str, Option<(usize, usize)>)> {
+        (!self.search.query.is_empty()).then(|| {
+            (
+                self.search.query.as_str(),
+                self.search
+                    .current
+                    .map(|current| (current + 1, self.search.matches.len())),
+            )
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn current_match(&self) -> Option<&SourceSpan> {
+        self.search
+            .current
+            .and_then(|current| self.search.matches.get(current))
+    }
+
+    pub(crate) fn search(&mut self, source: &str, query: String, case: SearchCase) {
+        let matches = search_matches(source, &query, case);
+        let current = matches
+            .iter()
+            .position(|matched| matched.start >= self.top_source)
+            .or_else(|| (!matches.is_empty()).then_some(0));
+        self.search = SearchState {
+            query,
+            matches,
+            current,
+        };
+        self.jump_to_current_match();
+    }
+
+    pub(crate) fn next_match(&mut self) {
+        if let Some(current) = self.search.current {
+            self.search.current = Some((current + 1) % self.search.matches.len());
+            self.jump_to_current_match();
+        }
+    }
+
+    pub(crate) fn previous_match(&mut self) {
+        if let Some(current) = self.search.current {
+            self.search.current = Some(if current == 0 {
+                self.search.matches.len() - 1
+            } else {
+                current - 1
+            });
+            self.jump_to_current_match();
+        }
     }
 
     #[must_use]
@@ -113,6 +192,44 @@ impl App {
             self.top_row_offset = offset;
         }
     }
+
+    fn jump_to_current_match(&mut self) {
+        if let Some(matched) = self.current_match().cloned() {
+            self.top_source = matched.start;
+            self.top_source_end = matched.end;
+            self.top_row_offset = 0;
+        }
+    }
+}
+
+fn search_matches(source: &str, query: &str, case: SearchCase) -> Vec<SourceSpan> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    if case.is_sensitive(query) {
+        return source
+            .match_indices(query)
+            .map(|(start, matched)| start..start + matched.len())
+            .collect();
+    }
+
+    let source_chars = source.char_indices().collect::<Vec<_>>();
+    let query_chars = query.chars().collect::<Vec<_>>();
+    source_chars
+        .windows(query_chars.len())
+        .filter(|candidate| {
+            candidate
+                .iter()
+                .map(|(_, character)| character)
+                .zip(&query_chars)
+                .all(|(source, query)| source.to_lowercase().eq(query.to_lowercase()))
+        })
+        .map(|candidate| {
+            let start = candidate[0].0;
+            let (last_start, last_character) = candidate[candidate.len() - 1];
+            start..last_start + last_character.len_utf8()
+        })
+        .collect()
 }
 
 fn clamp_position(
@@ -250,6 +367,72 @@ mod tests {
         assert_eq!(key(KeyCode::PageUp), Command::PageUp);
         assert_eq!(key(KeyCode::PageDown), Command::PageDown);
         assert_eq!(key(KeyCode::Char(' ')), Command::PageDown);
+    }
+
+    #[test]
+    fn search_starts_at_the_next_match_and_wraps_in_both_directions() {
+        let source = "before needle middle needle after";
+        let mut app = App {
+            top_source: 14,
+            top_source_end: 14,
+            ..App::default()
+        };
+
+        app.search(source, "needle".to_owned(), SearchCase::Sensitive);
+        assert_eq!(app.current_match(), Some(&(21..27)));
+        assert_eq!(app.search_status(), Some(("needle", Some((2, 2)))));
+
+        app.next_match();
+        assert_eq!(app.current_match(), Some(&(7..13)));
+        app.previous_match();
+        assert_eq!(app.current_match(), Some(&(21..27)));
+    }
+
+    #[test]
+    fn missing_search_keeps_the_viewport_and_reports_no_match() {
+        let source = "one two three four five six";
+        let document = Document::parse(source.to_owned());
+        let layout = Layout::new(&document, 5);
+        let mut app = App::default();
+        app.apply(Command::Down, &layout, 2);
+        let position = app.viewport_position(&layout);
+
+        app.search(source, "absent".to_owned(), SearchCase::Smart);
+
+        assert_eq!(app.viewport_position(&layout), position);
+        assert_eq!(app.search_status(), Some(("absent", None)));
+        assert_eq!(app.current_match(), None);
+    }
+
+    #[test]
+    fn smart_case_folds_lowercase_queries_and_respects_uppercase_queries() {
+        let source = "Alpha ALPHA alpha Äpfel äPFEL";
+        assert_eq!(
+            search_matches(source, "alpha", SearchCase::Smart),
+            vec![0..5, 6..11, 12..17]
+        );
+        assert_eq!(
+            search_matches(source, "Alpha", SearchCase::Smart),
+            vec![0..5]
+        );
+        assert_eq!(
+            search_matches(source, "äpfel", SearchCase::Smart),
+            vec![18..24, 25..31]
+        );
+    }
+
+    #[test]
+    fn explicit_case_modes_override_smart_case() {
+        let source = "Needle needle";
+
+        assert_eq!(
+            search_matches(source, "Needle", SearchCase::Insensitive),
+            vec![0..6, 7..13]
+        );
+        assert_eq!(
+            search_matches(source, "needle", SearchCase::Sensitive),
+            vec![7..13]
+        );
     }
 
     #[test]

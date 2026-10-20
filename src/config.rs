@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use urushi_terminal::TerminalBackground;
 
-use crate::{GraphicsPreference, theme};
+use crate::{GraphicsPreference, app::SearchCase, theme};
 
 const APP_DIRECTORY: &str = "yomu";
 const CONFIG_FILE: &str = "config.toml";
@@ -24,6 +24,8 @@ pub(crate) struct Config {
     view: ViewConfig,
     #[serde(default)]
     graphics: GraphicsConfig,
+    #[serde(default)]
+    search: SearchConfig,
     #[serde(skip)]
     theme_directory: Option<PathBuf>,
 }
@@ -35,6 +37,7 @@ impl Default for Config {
             theme_overrides: theme::ThemeSettings::default(),
             view: ViewConfig::default(),
             graphics: GraphicsConfig::default(),
+            search: SearchConfig::default(),
             theme_directory: None,
         }
     }
@@ -62,6 +65,13 @@ struct GraphicsConfig {
     renderer: Option<GraphicsPreference>,
     #[serde(default)]
     experimental_sixel: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchConfig {
+    #[serde(default)]
+    case: SearchCase,
 }
 
 impl Config {
@@ -102,6 +112,10 @@ impl Config {
             None if self.graphics.experimental_sixel => GraphicsPreference::Sixel,
             None => GraphicsPreference::Auto,
         }
+    }
+
+    pub(crate) fn search_case(&self) -> SearchCase {
+        self.search.case
     }
 
     pub(crate) fn needs_terminal_background(&self, cli_theme: Option<&str>) -> bool {
@@ -226,6 +240,27 @@ mod tests {
         let config = toml::from_str::<Config>("").expect("empty config should parse");
 
         assert_eq!(config.graphics_preference(), GraphicsPreference::Auto);
+    }
+
+    #[test]
+    fn search_case_defaults_to_smart() {
+        let config = toml::from_str::<Config>("").expect("empty config should parse");
+
+        assert_eq!(config.search_case(), SearchCase::Smart);
+    }
+
+    #[test]
+    fn search_case_accepts_each_supported_mode() {
+        for (value, expected) in [
+            ("smart", SearchCase::Smart),
+            ("sensitive", SearchCase::Sensitive),
+            ("insensitive", SearchCase::Insensitive),
+        ] {
+            let config = toml::from_str::<Config>(&format!("[search]\ncase = \"{value}\"\n"))
+                .expect("documented search case should parse");
+
+            assert_eq!(config.search_case(), expected);
+        }
     }
 
     #[test]

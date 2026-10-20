@@ -100,7 +100,14 @@ Yomu uses a small set of reversible reading controls.
 | Scroll one row | `j` / `k` or ↓ / ↑ |
 | Scroll one page | `d` / `u`, Page Down / Page Up, or Space |
 | Jump to start or end | `g` / `G` or Home / End |
+| Search source text | `/`, then type a query and press Enter |
+| Next or previous match | `n` / `N` |
 | Exit | `q` or Escape |
+
+Escape cancels an active search prompt. Search wraps at the end of the document,
+keeps the current matching row highlighted, and reports the current match count
+in the footer. By default, lowercase queries ignore case while queries containing
+an uppercase letter are case-sensitive (smartcase).
 
 ## Choose a graphics backend
 
@@ -145,6 +152,10 @@ max_width = 100
 
 [graphics]
 renderer = "auto"
+
+[search]
+# One of: smart, sensitive, insensitive.
+case = "smart"
 ```
 
 The built-in Themes are `builtin:auto`, `builtin:dark`, `builtin:light`, and

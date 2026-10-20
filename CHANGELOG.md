@@ -11,6 +11,8 @@ and this project adheres to
 ### Added
 
 - Prebuilt ARM64 Linux archives in GitHub releases.
+- Interactive, source-aware document search with match navigation, status, and
+  configurable smart, sensitive, or insensitive case handling.
 
 ### Changed
 

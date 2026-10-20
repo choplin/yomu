@@ -17,21 +17,35 @@ pub(crate) fn view(
     path: &Path,
     app: &App,
     layout: &Layout,
-    graphics_status: &str,
+    status: (&str, Option<&str>),
     surface: SurfaceSize,
     max_width: Option<u16>,
     theme: &Theme,
 ) -> View {
+    let (graphics_status, search_input) = status;
     let [header, body, footer] = viewport_areas(surface, max_width);
     let title = format!(" yomu — {}", path.display());
     let percent = app.viewport_percent(layout, body.height);
-    let status =
-        format!(" j/k scroll  d/u page  g/G ends  q quit  {graphics_status}{percent:>5}% ",);
-    let status_style = if graphics_status.contains("warning") {
-        theme.app.diagnostic
+    let status = if let Some(query) = search_input {
+        format!(" /{query}_")
     } else {
-        theme.app.footer
+        let search = match app.search_status() {
+            Some((query, Some((current, total)))) => {
+                format!(" /{query} [{current}/{total}]  n/N matches ")
+            }
+            Some((query, None)) => format!(" pattern not found: {query} "),
+            None => String::new(),
+        };
+        format!(
+            " j/k scroll  d/u page  g/G ends  / search  q quit  {graphics_status}{search}{percent:>5}% "
+        )
     };
+    let status_style =
+        if graphics_status.contains("warning") || matches!(app.search_status(), Some((_, None))) {
+            theme.app.diagnostic
+        } else {
+            theme.app.footer
+        };
 
     View::column(
         Align::Center,
@@ -111,10 +125,12 @@ fn body_view(app: &App, layout: &Layout, _height: u16, theme: &Theme) -> View {
         });
     let document = View::column(
         Align::Left,
-        layout
-            .rows()
-            .iter()
-            .map(|row| layout_row_view(layout, row, theme)),
+        layout.rows().iter().map(|row| {
+            let highlighted = app.current_match().is_some_and(|matched| {
+                matched.start < row.source.end && row.source.start < matched.end
+            });
+            layout_row_view(layout, row, theme, highlighted)
+        }),
     );
     View::viewport(
         Viewport::vertical(Projection::new(
@@ -125,14 +141,14 @@ fn body_view(app: &App, layout: &Layout, _height: u16, theme: &Theme) -> View {
     )
 }
 
-fn layout_row_view(layout: &Layout, row: &LayoutRow, theme: &Theme) -> View {
+fn layout_row_view(layout: &Layout, row: &LayoutRow, theme: &Theme, highlighted: bool) -> View {
     let mut graphics = layout.graphics_for_row(row).collect::<Vec<_>>();
     graphics.sort_by_key(|graphic| graphic.column);
     if graphics.is_empty() {
         return fixed_block(
             u16::try_from(layout.width()).unwrap_or(u16::MAX),
             row.height,
-            row_text(row, 0, layout.width(), theme),
+            row_text(row, 0, layout.width(), theme, highlighted),
         );
     }
 
@@ -144,7 +160,7 @@ fn layout_row_view(layout: &Layout, row: &LayoutRow, theme: &Theme) -> View {
             children.push(fixed_block(
                 u16::try_from(graphic_column - column).unwrap_or(u16::MAX),
                 row.height,
-                row_text(row, column, graphic_column, theme),
+                row_text(row, column, graphic_column, theme, highlighted),
             ));
         }
         let image = Image::rgba(
@@ -169,7 +185,7 @@ fn layout_row_view(layout: &Layout, row: &LayoutRow, theme: &Theme) -> View {
         children.push(fixed_block(
             u16::try_from(layout.width() - column).unwrap_or(u16::MAX),
             row.height,
-            row_text(row, column, layout.width(), theme),
+            row_text(row, column, layout.width(), theme, highlighted),
         ));
     }
 
@@ -180,11 +196,14 @@ fn layout_row_view(layout: &Layout, row: &LayoutRow, theme: &Theme) -> View {
     )
 }
 
-fn row_text(row: &LayoutRow, start: usize, end: usize, theme: &Theme) -> View {
+fn row_text(row: &LayoutRow, start: usize, end: usize, theme: &Theme, highlighted: bool) -> View {
     let mut spans = Vec::new();
     let mut column = 0usize;
     for fragment in &row.fragments {
-        let style = urushi_style(fragment.style, theme);
+        let mut style = urushi_style(fragment.style, theme);
+        if highlighted {
+            style = style.add_attribute(TextAttribute::Reversed);
+        }
         let mut selected = String::new();
         for character in fragment.text.chars() {
             let width = character.width().unwrap_or(0);
