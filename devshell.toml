@@ -1,5 +1,5 @@
 [devshell]
-name = "yomu"
+name = "yomu-dev"
 packages = ["cargo-sweep"]
 
 [[env]]
