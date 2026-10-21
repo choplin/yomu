@@ -45,19 +45,19 @@
         }:
         let
           cargoManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-          releaseVersion = "0.1.0";
+          releaseVersion = "0.2.0";
           releaseArtifacts = {
             aarch64-darwin = {
               target = "aarch64-apple-darwin";
-              hash = "sha256-bFXHiFrQGjf+xx8/GmjHnCqHCxUF8VQ8wljcqSldc0w=";
+              hash = "sha256-AnW1NPyYs0a5P7eKtPZU/CV+sVuNGFhmq6OdIyuLoZI=";
             };
             x86_64-darwin = {
               target = "x86_64-apple-darwin";
-              hash = "sha256-MNcOJmvC89I8PDgZ7WaN3ingcIDU+8/xC97TVuVO3UY=";
+              hash = "sha256-7a15+fNjFZtFm9ISRxNKTWFLyPvt2HHBkzf+FuSaoJI=";
             };
             x86_64-linux = {
               target = "x86_64-unknown-linux-gnu";
-              hash = "sha256-OZHzae2xEVpnSBm8Wyy8JIB0fIU2N3Vwyfpj7qMVm1M=";
+              hash = "sha256-aOkgGPzFQn8EpkEgEbOgh5Fy0jjxJ80s9nxEdbMkkkc=";
             };
           };
           releaseArtifact = releaseArtifacts.${system} or null;
