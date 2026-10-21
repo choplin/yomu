@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-21
+
 ### Added
 
 - Prebuilt ARM64 Linux archives in GitHub releases.
