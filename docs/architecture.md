@@ -97,7 +97,7 @@ byte-bounded `RasterCache`. It confines paths to the Markdown directory,
 validates formats and resource limits, and prepares cell-aligned RGBA. The same
 cache coordinates:
 
-- [`src/heading.rs`](../src/heading.rs) for H1/H2 typography;
+- [`src/heading.rs`](../src/heading.rs) for rasterized heading typography;
 - [`src/table.rs`](../src/table.rs) for bounded Typst table rendering;
 - [`src/math.rs`](../src/math.rs) for TeX-to-Typst math rendering; and
 - ordinary local images decoded by `image`.

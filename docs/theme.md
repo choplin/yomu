@@ -61,11 +61,11 @@ competing with it. Body text remains the highest-contrast reading surface.
 | border | `#566373` | `#8a97a3` |
 | diagnostic | `#ff7a85` | `#c53b45` |
 
-Headings use the document text color instead of treating color as their primary
-hierarchy cue. H1 and H2 use compact rasterized type and quiet rules when
-graphics are available, while their different scales establish rank. H3
-through H5 stay bold terminal text, and H6 is muted. Text rendering and raster
-fallbacks retain the full hierarchy with visible Markdown heading prefixes.
+H1 through H3 use left-aligned rasterized type when graphics are available,
+with decreasing scale and weight; H1 and H2 also use quiet rules. H4 through H6
+stay aligned terminal text with monotonically decreasing emphasis: H4 is bold
+body text, H5 is regular secondary text, and H6 is italic muted text. Raster
+fallbacks and `builtin:plain` retain visible Markdown heading prefixes.
 Tables use body text, a bold header, and a quiet border in both rendering paths;
 quotes and destinations use muted text; code tokens use separate dark- and
 light-background palettes so neither built-in borrows contrast assumptions

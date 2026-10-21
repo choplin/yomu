@@ -1971,8 +1971,9 @@ mod tests {
         };
         let mut cache = RasterCache::default();
         let layout = Layout::with_graphics(&document, 24, 20, &catalog, &mut cache, cell, 0);
-        assert_eq!(layout.graphics.len(), 2);
+        assert_eq!(layout.graphics.len(), 3);
         assert_ne!(layout.graphics[0].asset.key, layout.graphics[1].asset.key);
+        assert_ne!(layout.graphics[1].asset.key, layout.graphics[2].asset.key);
 
         let text_layout = Layout::new(&document, 80);
         let rendered = text_layout

@@ -1745,9 +1745,23 @@ fn heading_text_projection(foreground: &str, level: usize) -> TextSettings {
     }
 }
 
-fn text_heading(foreground: &str, level: usize) -> Option<HeadingLevelSettings> {
+fn styled_text_heading(
+    foreground: &str,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+) -> Option<HeadingLevelSettings> {
     Some(HeadingLevelSettings::Text {
-        text: heading_text_projection(foreground, level),
+        text: TextSettings {
+            style: TextStyleSettings {
+                foreground: Some(foreground.to_owned()),
+                bold: Some(bold),
+                italic: Some(italic),
+                underline: Some(underline),
+                ..TextStyleSettings::default()
+            },
+            ..TextSettings::default()
+        },
     })
 }
 
@@ -1869,12 +1883,12 @@ fn builtin_dark() -> ThemeSettings {
                         },
                         ..TextSettings::default()
                     },
-                    h1: rasterized_heading("text", 1, 1.85, true, 2),
-                    h2: rasterized_heading("text", 2, 1.45, true, 1),
-                    h3: text_heading("text", 3),
-                    h4: text_heading("text", 4),
-                    h5: text_heading("text", 5),
-                    h6: text_heading("muted", 6),
+                    h1: rasterized_heading("text", 1, 2.15, true, 3),
+                    h2: rasterized_heading("text", 2, 1.65, true, 2),
+                    h3: rasterized_heading("text", 3, 1.25, false, 2),
+                    h4: styled_text_heading("text", true, false, false),
+                    h5: styled_text_heading("secondary", false, false, false),
+                    h6: styled_text_heading("muted", false, true, false),
                 },
                 emphasis: TextStyleSettings {
                     italic: Some(true),
@@ -2148,14 +2162,40 @@ mod tests {
         let HeadingStyle::Rasterized(rasterized) = dark.document.headings.level(1) else {
             panic!("built-in dark H1 should resolve directly to Rasterized");
         };
-        assert_eq!(rasterized.scale, 1.85);
+        assert_eq!(rasterized.scale, 2.15);
+        assert_eq!(rasterized.stroke_radius, 3);
         assert!(rasterized.underline);
         assert_eq!(rasterized.fallback.style.bold, AttributeChoice::Enabled);
         let HeadingStyle::Rasterized(rasterized) = dark.document.headings.level(2) else {
             panic!("built-in dark H2 should resolve directly to Rasterized");
         };
-        assert_eq!(rasterized.scale, 1.45);
+        assert_eq!(rasterized.scale, 1.65);
+        assert_eq!(rasterized.stroke_radius, 2);
         assert!(rasterized.underline);
+        let HeadingStyle::Rasterized(rasterized) = dark.document.headings.level(3) else {
+            panic!("built-in dark H3 should resolve directly to Rasterized");
+        };
+        assert_eq!(rasterized.scale, 1.25);
+        assert_eq!(rasterized.stroke_radius, 2);
+        assert!(!rasterized.underline);
+        let HeadingStyle::Text(text) = dark.document.headings.level(4) else {
+            panic!("built-in dark H4 should resolve directly to Text");
+        };
+        assert_eq!(text.style.bold, AttributeChoice::Enabled);
+        assert_eq!(text.style.underline, AttributeChoice::Disabled);
+        assert!(text.prefix.is_empty());
+        let HeadingStyle::Text(text) = dark.document.headings.level(5) else {
+            panic!("built-in dark H5 should resolve directly to Text");
+        };
+        assert_eq!(text.style.bold, AttributeChoice::Disabled);
+        assert_eq!(foreground_rgb(text.style), [0x82, 0xaa, 0xff]);
+        assert!(text.prefix.is_empty());
+        let HeadingStyle::Text(text) = dark.document.headings.level(6) else {
+            panic!("built-in dark H6 should resolve directly to Text");
+        };
+        assert_eq!(text.style.bold, AttributeChoice::Disabled);
+        assert_eq!(text.style.italic, AttributeChoice::Enabled);
+        assert!(text.prefix.is_empty());
         assert!(matches!(
             plain.document.headings.level(1),
             HeadingStyle::Text(_)
@@ -2190,13 +2230,18 @@ mod tests {
             [0xdc, 0xe3, 0xea],
             [0xdc, 0xe3, 0xea],
             [0xdc, 0xe3, 0xea],
-            [0xdc, 0xe3, 0xea],
+            [0x82, 0xaa, 0xff],
             [0x87, 0x93, 0xa1],
         ];
         for (level, expected) in (1..=6).zip(dark_heading_colors) {
             let heading = dark.document.headings.level(level).readable_text();
             assert_eq!(foreground_rgb(heading.style), expected);
-            assert_eq!(heading.prefix, format!("{} ", "#".repeat(level.into())));
+            let expected_prefix = if level <= 3 {
+                format!("{} ", "#".repeat(level.into()))
+            } else {
+                String::new()
+            };
+            assert_eq!(heading.prefix, expected_prefix);
         }
 
         let TableStyle::Rasterized(table) = &dark.document.table else {

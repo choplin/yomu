@@ -248,29 +248,21 @@ impl HeadingPlan {
         let scale = style.scale;
         let stroke_radius = style.stroke_radius;
         let font_pixels = (cell_pixels.height.max(1) as f32 * scale).max(16.0);
-        let horizontal_padding = if width > cell_pixels.width.max(1).saturating_mul(2) {
-            cell_pixels.width.max(1)
-        } else {
-            0
-        };
-        let vertical_padding = if heading.level == 1 {
-            cell_pixels.height.max(1) / 2
-        } else {
-            cell_pixels.height.max(1) / 4
+        let vertical_padding = match heading.level {
+            1 => cell_pixels.height.max(1) / 2,
+            2 | 3 => cell_pixels.height.max(1) / 4,
+            _ => cell_pixels.height.max(1) / 8,
         };
         let line_height = (font_pixels * 1.25).ceil() as u32;
-        let right = width
-            .saturating_sub(horizontal_padding)
-            .max(horizontal_padding + 1);
-        let mut x = horizontal_padding;
+        let mut x = 0;
         let mut baseline = vertical_padding.saturating_add(font_pixels.ceil() as u32);
         let mut glyphs = Vec::with_capacity(character_count.min(256));
         let mut lines = 1u32;
-        let mut max_line_x = horizontal_padding;
+        let mut max_line_x = 0;
 
         for character in heading.text.chars() {
             if character == '\n' {
-                x = horizontal_padding;
+                x = 0;
                 baseline = baseline.saturating_add(line_height);
                 lines = lines.saturating_add(1);
                 continue;
@@ -289,32 +281,44 @@ impl HeadingPlan {
                 ));
             }
             let advance = metrics.advance_width.ceil().max(1.0) as u32;
-            let glyph_left = i64::from(horizontal_padding) + metrics.xmin as i64;
-            let glyph_right = glyph_left
+            let leading_bearing = if metrics.xmin < 0 {
+                metrics.xmin.unsigned_abs()
+            } else {
+                0
+            };
+            let mut glyph_x = if x == 0 { leading_bearing } else { x };
+            let mut glyph_left = i64::from(glyph_x) + metrics.xmin as i64;
+            let mut glyph_right = glyph_left
                 .saturating_add(metrics.width as i64)
                 .saturating_add(i64::from(stroke_radius));
+            if x > 0 && (glyph_x.saturating_add(advance) > width || glyph_right > i64::from(width))
+            {
+                x = 0;
+                baseline = baseline.saturating_add(line_height);
+                lines = lines.saturating_add(1);
+                glyph_x = leading_bearing;
+                glyph_left = i64::from(glyph_x) + metrics.xmin as i64;
+                glyph_right = glyph_left
+                    .saturating_add(metrics.width as i64)
+                    .saturating_add(i64::from(stroke_radius));
+            }
             if glyph_left < 0
                 || glyph_right > i64::from(width)
-                || advance > right.saturating_sub(horizontal_padding)
+                || glyph_x.saturating_add(advance) > width
             {
                 return Err(format!(
                     "heading glyph U+{:04X} does not fit in {width} pixels",
                     u32::from(character),
                 ));
             }
-            if x > horizontal_padding && x.saturating_add(advance) > right {
-                x = horizontal_padding;
-                baseline = baseline.saturating_add(line_height);
-                lines = lines.saturating_add(1);
-            }
-            if !(character.is_whitespace() && x == horizontal_padding) {
+            if !(character.is_whitespace() && x == 0) {
                 glyphs.push(PositionedGlyph {
                     character,
                     font_index,
-                    x,
+                    x: glyph_x,
                     baseline,
                 });
-                x = x.saturating_add(advance);
+                x = glyph_x.saturating_add(advance);
                 max_line_x = max_line_x.max(x);
             }
             let projected_height = vertical_padding
@@ -346,10 +350,10 @@ impl HeadingPlan {
         }
 
         let pixels = PixelSize { width, height };
-        let underline_start = horizontal_padding;
+        let underline_start = 0_u32;
         let underline_end = max_line_x
-            .saturating_add(horizontal_padding)
-            .min(right)
+            .saturating_add(stroke_radius)
+            .min(width)
             .max(underline_start.saturating_add(1));
         let underline_thickness = if heading.level == 1 { 2 } else { 1 };
         let underline_y = content_height
@@ -531,6 +535,43 @@ mod tests {
         assert!(h1.rows > h2.rows);
         assert_eq!(h1.color, h2.color);
         assert_ne!(h1.key, h2.key);
+    }
+
+    #[test]
+    fn heading_ink_starts_at_the_content_edge_without_a_cell_gutter() {
+        let cell = PixelSize {
+            width: 11,
+            height: 22,
+        };
+        let fonts = HeadingFonts::default();
+        let plan = HeadingPlan::build_with_fonts(
+            0,
+            &heading(1, "j Heading"),
+            40,
+            cell,
+            &fonts,
+            crate::theme::Theme::builtin_dark()
+                .document
+                .headings
+                .h1
+                .rasterized()
+                .expect("built-in H1 should be rasterized"),
+            [0; 32],
+        )
+        .expect("heading with a negative bearing should align without clipping");
+        let first = plan.glyphs.first().expect("heading should contain a glyph");
+        let font = fonts
+            .get(first.font_index)
+            .expect("planned font should remain available");
+        let metrics = font.metrics(first.character, plan.font_pixels);
+        let expected_x = if metrics.xmin < 0 {
+            metrics.xmin.unsigned_abs()
+        } else {
+            0
+        };
+
+        assert_eq!(first.x, expected_x);
+        assert!(first.x < cell.width);
     }
 
     #[test]

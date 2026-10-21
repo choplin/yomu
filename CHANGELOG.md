@@ -18,6 +18,9 @@ and this project adheres to
 
 - Nix exposes source builds as `yomu` and checksummed GitHub release binaries
   as `yomu-bin`.
+- Built-in graphical Themes align every heading level, emphasize H1 through H3
+  with rasterized type, and distinguish H4 through H6 without variable-width
+  Markdown markers.
 
 ## [0.1.0] - 2026-10-18
 

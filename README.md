@@ -179,9 +179,10 @@ Yomu supports CommonMark with GitHub Flavored Markdown tables,
 strikethrough, and task lists. It also provides syntax-highlighted fenced code,
 local images, and an intentionally limited LaTeX math subset.
 
-- H1 and H2 headings, tables, and supported math can be rasterized by a
+- H1 through H3 headings, tables, and supported math can be rasterized by a
   graphics backend; all retain terminal-text projections.
-- H3 through H6 remain terminal text.
+- H4 through H6 use aligned terminal text with distinct weight, color, and
+  emphasis cues.
 - Supported math includes common symbols, relations, Greek letters,
   superscripts, subscripts, fractions, roots, sums, integrals, and arrows.
 - Unsupported or malformed math remains visible with its original delimiters

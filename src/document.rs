@@ -60,7 +60,7 @@ impl LinkElement {
     }
 }
 
-/// A level-one or level-two heading that can be projected as text or raster.
+/// A heading that can be projected as text or raster according to its Theme.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeadingElement {
     pub level: u8,
